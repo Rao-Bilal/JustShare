@@ -7,6 +7,7 @@ __pycache__/
 .coverage
 backend/.venv/
 backend/*.egg-info/
+*.db
 web/node_modules/
 web/dist/
 web/coverage/
