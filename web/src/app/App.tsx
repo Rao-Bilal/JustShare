@@ -14,6 +14,7 @@ export function App() {
   const [session, setSession] = useState<SessionInfo | null>(null);
   const [peerDevice, setPeerDevice] = useState<DeviceInfo | null>(null);
   const [pairingInput, setPairingInput] = useState('');
+  const [joining, setJoining] = useState(false);
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
   const [incomingFiles, setIncomingFiles] = useState<FileInfo[]>([]);
   const [incomingTotalSize, setIncomingTotalSize] = useState(0);
@@ -57,6 +58,7 @@ export function App() {
     setSession(null);
     setPeerDevice(null);
     setPairingInput('');
+    setJoining(false);
     setSelectedFiles([]);
     setIncomingFiles([]);
     setIncomingTotalSize(0);
@@ -215,73 +217,76 @@ export function App() {
     setScreen('receive');
   };
 
-  const handlePairingCodeChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const val = e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 6);
-    setPairingInput(val);
+  const submitPairingCode = async (codeToJoin: string) => {
+    if (codeToJoin.length !== 6 || joining) return;
+    setJoining(true);
     setError(null);
 
     let currentDevice = device;
     if (!currentDevice) {
       currentDevice = await handleAuthFailure();
-      if (!currentDevice) return;
+      if (!currentDevice) {
+        setJoining(false);
+        return;
+      }
     }
 
-    if (val.length === 6) {
+    try {
+      let res;
       try {
-        let res;
-        try {
-          res = await joinSession(currentDevice.token, val);
-        } catch (err: unknown) {
-          const msg = err instanceof Error ? err.message : '';
-          if (msg.includes('Authentication') || msg.includes('token') || msg.includes('401')) {
-            const fresh = await handleAuthFailure();
-            if (fresh) {
-              currentDevice = fresh;
-              res = await joinSession(fresh.token, val);
-            } else {
-              throw err;
-            }
+        res = await joinSession(currentDevice.token, codeToJoin);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : '';
+        if (msg.includes('Authentication') || msg.includes('token') || msg.includes('401')) {
+          const fresh = await handleAuthFailure();
+          if (fresh) {
+            currentDevice = fresh;
+            res = await joinSession(fresh.token, codeToJoin);
           } else {
             throw err;
           }
+        } else {
+          throw err;
         }
-
-        const sess: SessionInfo = {
-          session_id: res.session_id,
-          pairing_code: val,
-          expires_at: '',
-          state: res.state as SessionState,
-          sender: res.sender,
-        };
-        setSession(sess);
-        setPeerDevice(res.sender || null);
-
-        const sig = new SignalingClient();
-        sigRef.current = sig;
-
-        sig.on('file_metadata', (msg: unknown) => {
-          const payload = (msg as { payload: { files: FileInfo[]; total_size: number } }).payload;
-          setIncomingFiles(payload.files);
-          setIncomingTotalSize(payload.total_size);
-          updateSessionState(currentDevice!.token, sess.session_id, 'AWAITING_APPROVAL');
-        });
-
-        sig.on('signal', (msg: unknown) => {
-          const signalMsg = msg as { from: string; payload: { signal_type: string; data: unknown } };
-          if (signalMsg.from !== currentDevice?.device_id && rtcRef.current) {
-            rtcRef.current.handleSignal(signalMsg.payload);
-          }
-        });
-
-        sig.on('peer_left', () => {
-          setError('Peer disconnected');
-          goHome();
-        });
-
-        sig.connect(sess.session_id, currentDevice.token);
-      } catch (e: unknown) {
-        setError(e instanceof Error ? e.message : 'Join session error');
       }
+
+      const sess: SessionInfo = {
+        session_id: res.session_id,
+        pairing_code: codeToJoin,
+        expires_at: '',
+        state: res.state as SessionState,
+        sender: res.sender,
+      };
+      setSession(sess);
+      setPeerDevice(res.sender || null);
+
+      const sig = new SignalingClient();
+      sigRef.current = sig;
+
+      sig.on('file_metadata', (msg: unknown) => {
+        const payload = (msg as { payload: { files: FileInfo[]; total_size: number } }).payload;
+        setIncomingFiles(payload.files);
+        setIncomingTotalSize(payload.total_size);
+        updateSessionState(currentDevice!.token, sess.session_id, 'AWAITING_APPROVAL');
+      });
+
+      sig.on('signal', (msg: unknown) => {
+        const signalMsg = msg as { from: string; payload: { signal_type: string; data: unknown } };
+        if (signalMsg.from !== currentDevice?.device_id && rtcRef.current) {
+          rtcRef.current.handleSignal(signalMsg.payload);
+        }
+      });
+
+      sig.on('peer_left', () => {
+        setError('Peer disconnected');
+        goHome();
+      });
+
+      sig.connect(sess.session_id, currentDevice.token);
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : 'Join session error');
+    } finally {
+      setJoining(false);
     }
   };
 
@@ -441,13 +446,62 @@ export function App() {
           <h2>Receive Files</h2>
 
           {!session ? (
-            <div>
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                submitPairingCode(pairingInput);
+              }}
+            >
               <p className="status-msg">Enter the 6-digit pairing code from the sender:</p>
-              <div className="code-input">
-                <input type="text" maxLength={6} value={pairingInput} onChange={handlePairingCodeChange} autoFocus placeholder="000000" />
+              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '16px', margin: '1.5rem 0' }}>
+                <input
+                  type="text"
+                  maxLength={6}
+                  value={pairingInput}
+                  onChange={(e) => {
+                    const val = e.target.value.replace(/\D/g, '').slice(0, 6);
+                    setPairingInput(val);
+                    setError(null);
+                    if (val.length === 6) {
+                      submitPairingCode(val);
+                    }
+                  }}
+                  autoFocus
+                  placeholder="000000"
+                  style={{
+                    letterSpacing: '8px',
+                    textAlign: 'center',
+                    width: '240px',
+                    fontSize: '1.8rem',
+                    padding: '12px',
+                    borderRadius: '10px',
+                    background: '#1a2746',
+                    border: '2px solid #344263',
+                    color: '#eaf0ff',
+                    fontFamily: 'SF Mono, Consolas, monospace',
+                  }}
+                />
+                <button
+                  type="submit"
+                  className="btn btn-primary"
+                  disabled={pairingInput.length !== 6 || joining}
+                  style={{ width: '240px', display: 'flex', justifyContent: 'center', alignItems: 'center' }}
+                >
+                  {joining ? (
+                    <>
+                      <span className="spinner"></span> Joining...
+                    </>
+                  ) : (
+                    'Join Session'
+                  )}
+                </button>
               </div>
-              {pairingInput.length > 0 && pairingInput.length < 6 && <p className="note" style={{ textAlign: 'center' }}>Enter 6 digits</p>}
-            </div>
+              {pairingInput.length > 0 && pairingInput.length < 6 && (
+                <p className="note" style={{ textAlign: 'center' }}>
+                  Enter {6 - pairingInput.length} more digit(s)
+                </p>
+              )}
+            </form>
           ) : incomingFiles.length === 0 ? (
             <p className="status-msg">
               <span className="spinner"></span> Connected to {peerDevice?.display_name || 'sender'}. Waiting for file selection...
