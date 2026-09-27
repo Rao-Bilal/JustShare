@@ -163,10 +163,15 @@ async def update_session_state(
         raise HTTPException(status_code=403, detail="Not a participant")
         
     new_state = request.state
-    if new_state == "CANCELLED":
+    if new_state == session_obj.state:
+        pass
+    elif new_state == "CANCELLED":
         pass
     elif new_state not in VALID_TRANSITIONS.get(session_obj.state, set()):
-        raise HTTPException(status_code=400, detail="Invalid state transition")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid state transition from '{session_obj.state}' to '{new_state}'"
+        )
         
     session_obj.state = new_state
     await db.commit()

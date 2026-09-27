@@ -96,3 +96,20 @@ async def test_session_access_unauthorized(async_client: AsyncClient):
     
     get_res = await async_client.get(f"/api/v1/sessions/{sess_id}", headers={"Authorization": f"Bearer {tok2}"})
     assert get_res.status_code == 403
+
+@pytest.mark.asyncio
+async def test_idempotent_state_update(async_client: AsyncClient):
+    dev1 = await async_client.post("/api/v1/devices", json={"display_name": "Sender"})
+    tok1 = dev1.json()["token"]
+    sess_res = await async_client.post("/api/v1/sessions", json={}, headers={"Authorization": f"Bearer {tok1}"})
+    sess_id = sess_res.json()["session_id"]
+    
+    # State is WAITING_FOR_PEER
+    upd1 = await async_client.patch(
+        f"/api/v1/sessions/{sess_id}/state",
+        json={"state": "WAITING_FOR_PEER"},
+        headers={"Authorization": f"Bearer {tok1}"}
+    )
+    assert upd1.status_code == 200
+    assert upd1.json()["state"] == "WAITING_FOR_PEER"
+

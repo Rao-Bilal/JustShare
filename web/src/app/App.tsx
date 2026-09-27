@@ -174,7 +174,7 @@ export function App() {
   };
 
   const startWebRTCSender = () => {
-    if (!sigRef.current || !session) return;
+    if (!sigRef.current || !session || !device) return;
     const rtc = new WebRTCConnection(sigRef.current, true);
     rtcRef.current = rtc;
 
@@ -195,6 +195,7 @@ export function App() {
     const dc = rtc.getDataChannel();
     if (dc) {
       const runSender = () => {
+        updateSessionState(device.token, session.session_id, 'TRANSFERRING').catch(() => {});
         const sender = new FileSender(dc, selectedFiles);
         senderRef.current = sender;
         sender.onProgress = setTransferProgress;
@@ -210,6 +211,7 @@ export function App() {
         runSender();
       } else {
         dc.onopen = runSender;
+        dc.addEventListener('open', runSender);
       }
     }
 
@@ -273,7 +275,7 @@ export function App() {
         const payload = (msg as { payload: { files: FileInfo[]; total_size: number } }).payload;
         setIncomingFiles(payload.files);
         setIncomingTotalSize(payload.total_size);
-        updateSessionState(currentDevice!.token, sess.session_id, 'AWAITING_APPROVAL');
+        updateSessionState(currentDevice!.token, sess.session_id, 'AWAITING_APPROVAL').catch(() => {});
       });
 
       sig.on('signal', (msg: unknown) => {
@@ -302,7 +304,7 @@ export function App() {
       type: 'transfer_response',
       payload: { accepted: true },
     });
-    updateSessionState(device.token, session.session_id, 'CONNECTING');
+    updateSessionState(device.token, session.session_id, 'CONNECTING').catch(() => {});
 
     const rtc = new WebRTCConnection(sigRef.current, false);
     rtcRef.current = rtc;
@@ -310,11 +312,16 @@ export function App() {
     rtc.onDataChannel = (dc) => {
       const receiver = new FileReceiver(dc);
       receiverRef.current = receiver;
-      receiver.onProgress = setTransferProgress;
+      receiver.onProgress = (progress) => {
+        setTransferProgress(progress);
+        if (progress.state === 'verifying') {
+          updateSessionState(device.token, session.session_id, 'VERIFYING').catch(() => {});
+        }
+      };
       receiver.onComplete = (files) => {
         setCompletedFiles(files);
         setScreen('completed');
-        updateSessionState(device.token, session.session_id, 'COMPLETED');
+        updateSessionState(device.token, session.session_id, 'COMPLETED').catch(() => {});
       };
       receiver.onError = (err) => {
         setError(err);

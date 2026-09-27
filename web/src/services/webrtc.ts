@@ -21,6 +21,7 @@ export class WebRTCConnection {
 
     this.pc.onicecandidate = (event) => {
       if (event.candidate) {
+        console.log('[WEBRTC] Local ICE candidate gathered');
         this.signaling.send({
           type: 'signal',
           payload: {
@@ -32,9 +33,14 @@ export class WebRTCConnection {
     };
 
     this.pc.onconnectionstatechange = () => {
+      console.log(`[WEBRTC] connectionState changed to: ${this.pc.connectionState}`);
       if (this.onConnectionStateChange) {
         this.onConnectionStateChange(this.pc.connectionState);
       }
+    };
+
+    this.pc.oniceconnectionstatechange = () => {
+      console.log(`[WEBRTC] iceConnectionState changed to: ${this.pc.iceConnectionState}`);
     };
 
     if (isSender) {
@@ -42,10 +48,12 @@ export class WebRTCConnection {
         ordered: true,
       });
       this.dataChannel.binaryType = 'arraybuffer';
+      console.log('[WEBRTC] Sender DataChannel created');
     } else {
       this.pc.ondatachannel = (event) => {
         this.dataChannel = event.channel;
         this.dataChannel.binaryType = 'arraybuffer';
+        console.log('[WEBRTC] Receiver DataChannel received');
         if (this._onDataChannel) {
           this._onDataChannel(this.dataChannel);
         }
@@ -65,8 +73,10 @@ export class WebRTCConnection {
   }
 
   async createOffer(): Promise<void> {
+    console.log('[WEBRTC] Creating SDP offer');
     const offer = await this.pc.createOffer();
     await this.pc.setLocalDescription(offer);
+    console.log('[WEBRTC] Local description set (offer)');
     this.signaling.send({
       type: 'signal',
       payload: {
@@ -77,10 +87,13 @@ export class WebRTCConnection {
   }
 
   async handleSignal(signal: { signal_type: string; data: unknown }): Promise<void> {
+    console.log(`[WEBRTC] Handling signal: ${signal.signal_type}`);
     if (signal.signal_type === 'offer') {
       await this.pc.setRemoteDescription(new RTCSessionDescription(signal.data as RTCSessionDescriptionInit));
+      console.log('[WEBRTC] Remote description set (offer)');
       const answer = await this.pc.createAnswer();
       await this.pc.setLocalDescription(answer);
+      console.log('[WEBRTC] Local description set (answer)');
       this.signaling.send({
         type: 'signal',
         payload: {
@@ -91,6 +104,7 @@ export class WebRTCConnection {
       await this.flushPendingCandidates();
     } else if (signal.signal_type === 'answer') {
       await this.pc.setRemoteDescription(new RTCSessionDescription(signal.data as RTCSessionDescriptionInit));
+      console.log('[WEBRTC] Remote description set (answer)');
       await this.flushPendingCandidates();
     } else if (signal.signal_type === 'ice-candidate') {
       const candidate = signal.data as RTCIceCandidateInit;
@@ -100,16 +114,19 @@ export class WebRTCConnection {
       if (this.pc.remoteDescription && this.pc.remoteDescription.type) {
         try {
           await this.pc.addIceCandidate(candidate);
+          console.log('[WEBRTC] Remote ICE candidate added');
         } catch {
           // ignore candidate error
         }
       } else {
+        console.log('[WEBRTC] Remote ICE candidate queued');
         this.pendingCandidates.push(candidate);
       }
     }
   }
 
   private async flushPendingCandidates(): Promise<void> {
+    console.log(`[WEBRTC] Flushing ${this.pendingCandidates.length} pending ICE candidate(s)`);
     while (this.pendingCandidates.length > 0) {
       const candidate = this.pendingCandidates.shift();
       if (candidate) {
