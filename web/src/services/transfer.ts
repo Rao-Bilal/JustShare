@@ -109,21 +109,32 @@ export class FileSender {
 
       this.dc.send(JSON.stringify({ type: 'FILE_END', fileId }));
 
-      // Wait for FILE_ACK
+      // Wait for FILE_ACK with timeout
       await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          this.dc.removeEventListener('message', handler);
+          reject(new Error(`Timeout waiting for receiver ACK for file ${file.name}`));
+        }, 30000);
+
         const handler = (event: MessageEvent) => {
           if (typeof event.data === 'string') {
-            const msg = JSON.parse(event.data);
-            if (msg.type === 'FILE_ACK' && msg.fileId === fileId) {
-              this.dc.removeEventListener('message', handler);
-              if (!msg.sha256Match) {
-                reject(new Error('SHA-256 mismatch on receiver'));
-              } else {
-                resolve();
+            try {
+              const msg = JSON.parse(event.data);
+              if (msg.type === 'FILE_ACK' && msg.fileId === fileId) {
+                clearTimeout(timer);
+                this.dc.removeEventListener('message', handler);
+                if (!msg.sha256Match) {
+                  reject(new Error('SHA-256 mismatch on receiver'));
+                } else {
+                  resolve();
+                }
+              } else if (msg.type === 'CANCEL') {
+                clearTimeout(timer);
+                this.dc.removeEventListener('message', handler);
+                reject(new Error('Transfer cancelled by receiver: ' + msg.reason));
               }
-            } else if (msg.type === 'CANCEL') {
-              this.dc.removeEventListener('message', handler);
-              reject(new Error('Transfer cancelled by receiver: ' + msg.reason));
+            } catch {
+              // ignore JSON parse error
             }
           }
         };
@@ -262,26 +273,41 @@ export class FileReceiver {
 
     this.updateProgress('verifying');
     
-    // Assemble chunks
-    const hash = await sha256Chunks(fileInfo.chunks);
-    const verified = hash === fileInfo.sha256;
-    
-    this.dc.send(JSON.stringify({
-      type: 'FILE_ACK',
-      fileId,
-      sha256Match: verified
-    }));
+    try {
+      const missingChunk = fileInfo.chunks.some((c) => !(c instanceof Uint8Array));
+      let verified = false;
+      if (!missingChunk) {
+        const hash = await sha256Chunks(fileInfo.chunks);
+        verified = hash === fileInfo.sha256;
+      }
+      
+      this.dc.send(JSON.stringify({
+        type: 'FILE_ACK',
+        fileId,
+        sha256Match: verified
+      }));
 
-    const blob = new Blob(fileInfo.chunks as unknown as BlobPart[]);
-    this.assembledFiles.push({
-      name: fileInfo.name,
-      blob,
-      verified
-    });
-    
-    // Free up memory
-    this.files.delete(fileId);
-    this.currentFileIndex++;
+      const validChunks = fileInfo.chunks.filter((c): c is Uint8Array => c instanceof Uint8Array);
+      const blob = new Blob(validChunks as unknown as BlobPart[]);
+      this.assembledFiles.push({
+        name: fileInfo.name,
+        blob,
+        verified
+      });
+      
+      this.files.delete(fileId);
+      this.currentFileIndex++;
+    } catch (err: unknown) {
+      const errorMsg = err instanceof Error ? err.message : 'File verification error';
+      this.dc.send(JSON.stringify({
+        type: 'FILE_ACK',
+        fileId,
+        sha256Match: false
+      }));
+      if (this.onError) {
+        this.onError(errorMsg);
+      }
+    }
   }
 
   cancel(reason: string): void {

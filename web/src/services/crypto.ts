@@ -11,12 +11,12 @@ export async function sha256File(file: File): Promise<string> {
 }
 
 export async function sha256Chunks(chunks: Uint8Array[]): Promise<string> {
-  // Compute total size
-  const totalSize = chunks.reduce((acc, chunk) => acc + chunk.byteLength, 0);
+  const validChunks = chunks.filter((c): c is Uint8Array => c instanceof Uint8Array);
+  const totalSize = validChunks.reduce((acc, chunk) => acc + chunk.byteLength, 0);
   const combined = new Uint8Array(totalSize);
   
   let offset = 0;
-  for (const chunk of chunks) {
+  for (const chunk of validChunks) {
     combined.set(chunk, offset);
     offset += chunk.byteLength;
   }
