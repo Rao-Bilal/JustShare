@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { MemoryTransferStorage } from './storage/memory';
 import {
   FileReceiver,
   FileSender,
@@ -703,6 +704,46 @@ describe('Phase 2A - Transfer Protocol & Validation', () => {
 
       expect(receiverErr).toContain('SHA-256 mismatch');
       expect(senderErr).toContain('SHA-256 mismatch');
+    });
+
+    it('handles storage write failure gracefully and enters failed state', async () => {
+      const file = new File(['Storage Failure Test Content'], 'storage-fail.txt');
+      const [senderDc, receiverDc] = createConnectedPair();
+
+      const mockStorage = new MemoryTransferStorage();
+      mockStorage.writeChunk = async () => {
+        throw new Error('Disk quota exceeded (QuotaExceededError)');
+      };
+
+      const sender = new FileSender(senderDc as unknown as RTCDataChannel, [file], {
+        transferId: 'tx-storage-fail',
+        ackTimeoutMs: 500,
+      });
+      const receiver = new FileReceiver(receiverDc as unknown as RTCDataChannel, {
+        expectedTransferId: 'tx-storage-fail',
+        storage: mockStorage,
+      });
+
+      let receiverErr = '';
+      receiver.onError = (e) => {
+        receiverErr = e;
+      };
+
+      let senderErr = '';
+      sender.onError = (e) => {
+        senderErr = e;
+      };
+
+      receiver.start();
+      try {
+        await sender.start();
+      } catch {
+        // expected failure
+      }
+
+      expect(receiverErr).toContain('Disk quota exceeded');
+      expect(senderErr).toContain('Disk quota exceeded');
+      expect(receiver.getAssembledFiles().length).toBe(0);
     });
   });
 });

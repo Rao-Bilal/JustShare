@@ -848,6 +848,7 @@ export class FileReceiver {
         } catch (err: unknown) {
           const errorMsg = err instanceof Error ? err.message : 'Chunk processing error';
           console.error('[TRANSFER][RECEIVE] Chunk error:', errorMsg);
+          this.cancelled = true;
           this.sendError('CHUNK_ERROR', errorMsg);
           this.clearStallTimer();
           if (this.onError) this.onError(errorMsg);
