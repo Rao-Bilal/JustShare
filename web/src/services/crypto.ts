@@ -12,34 +12,6 @@ const K = new Uint32Array([
   0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
 ]);
 
-function rotr(x: number, n: number): number {
-  return (x >>> n) | (x << (32 - n));
-}
-
-function ch(x: number, y: number, z: number): number {
-  return (x & y) ^ (~x & z);
-}
-
-function maj(x: number, y: number, z: number): number {
-  return (x & y) ^ (x & z) ^ (y & z);
-}
-
-function sigma0(x: number): number {
-  return rotr(x, 2) ^ rotr(x, 13) ^ rotr(x, 22);
-}
-
-function sigma1(x: number): number {
-  return rotr(x, 6) ^ rotr(x, 11) ^ rotr(x, 25);
-}
-
-function gamma0(x: number): number {
-  return rotr(x, 7) ^ rotr(x, 18) ^ (x >>> 3);
-}
-
-function gamma1(x: number): number {
-  return rotr(x, 17) ^ rotr(x, 19) ^ (x >>> 10);
-}
-
 export class IncrementalSha256 {
   private h0 = 0x6a09e667;
   private h1 = 0xbb67ae85;
@@ -105,7 +77,11 @@ export class IncrementalSha256 {
       w[i] = (block[idx] << 24) | (block[idx + 1] << 16) | (block[idx + 2] << 8) | block[idx + 3];
     }
     for (let i = 16; i < 64; i++) {
-      w[i] = (gamma1(w[i - 2]) + w[i - 7] + gamma0(w[i - 15]) + w[i - 16]) >>> 0;
+      const w15 = w[i - 15];
+      const g0 = ((w15 >>> 7) | (w15 << 25)) ^ ((w15 >>> 18) | (w15 << 14)) ^ (w15 >>> 3);
+      const w2 = w[i - 2];
+      const g1 = ((w2 >>> 17) | (w2 << 15)) ^ ((w2 >>> 19) | (w2 << 13)) ^ (w2 >>> 10);
+      w[i] = (g1 + w[i - 7] + g0 + w[i - 16]) >>> 0;
     }
 
     let a = this.h0;
@@ -118,8 +94,12 @@ export class IncrementalSha256 {
     let h = this.h7;
 
     for (let i = 0; i < 64; i++) {
-      const t1 = (h + sigma1(e) + ch(e, f, g) + K[i] + w[i]) >>> 0;
-      const t2 = (sigma0(a) + maj(a, b, c)) >>> 0;
+      const s1 = ((e >>> 6) | (e << 26)) ^ ((e >>> 11) | (e << 21)) ^ ((e >>> 25) | (e << 7));
+      const chVal = (e & f) ^ (~e & g);
+      const t1 = (h + s1 + chVal + K[i] + w[i]) >>> 0;
+      const s0 = ((a >>> 2) | (a << 30)) ^ ((a >>> 13) | (a << 19)) ^ ((a >>> 22) | (a << 10));
+      const majVal = (a & b) ^ (a & c) ^ (b & c);
+      const t2 = (s0 + majVal) >>> 0;
       h = g;
       g = f;
       f = e;

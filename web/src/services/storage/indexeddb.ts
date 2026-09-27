@@ -318,6 +318,8 @@ export class IndexedDBTransferStorage implements TransferStorage {
     expectedSha256: string,
     onProgress?: (bytesProcessed: number, totalBytes: number) => void
   ): Promise<{ match: boolean; calculatedSha256: string; blob: Blob }> {
+    const t0 = performance.now();
+    console.log(`[TRANSFER][RECV][VERIFY] START fileId=${fileId}`);
     const db = await this.getDB();
     const transfer = await this.getTransfer(transferId);
     if (!transfer) throw new Error(`Transfer '${transferId}' not found`);
@@ -338,57 +340,66 @@ export class IndexedDBTransferStorage implements TransferStorage {
     const hasher = new IncrementalSha256();
     const chunkParts: Uint8Array[] = [];
     let bytesProcessed = 0;
+    let expectedIndex = 0;
 
-    // Read chunks sequentially in a single transaction
-    const chunks = await new Promise<Uint8Array[]>((resolve, reject) => {
+    console.log(`[TRANSFER][RECV][VERIFY] reading chunks`);
+    await new Promise<void>((resolve, reject) => {
       const tx = db.transaction(['chunks'], 'readonly');
       const store = tx.objectStore('chunks');
-      const readChunks: Uint8Array[] = [];
+      const index = store.index('by_file');
+      const range = IDBKeyRange.only([transferId, fileId]);
+      const request = index.openCursor(range);
 
-      let currentIndex = 0;
-
-      const fetchNext = () => {
-        if (currentIndex >= file.totalChunks) {
-          resolve(readChunks);
-          return;
-        }
-
-        const req = store.get([transferId, fileId, currentIndex]);
-        req.onsuccess = () => {
-          if (!req.result) {
-            reject(new Error(`Missing chunk ${currentIndex} for file '${file.name}'`));
+      request.onsuccess = () => {
+        const cursor = request.result;
+        if (cursor) {
+          const rec = cursor.value;
+          if (rec.index !== expectedIndex) {
+            reject(new Error(`Missing or out-of-order chunk: expected ${expectedIndex}, got ${rec.index}`));
             return;
           }
-          readChunks.push(req.result.data);
-          currentIndex++;
-          fetchNext();
-        };
-        req.onerror = () => reject(req.error);
+          const chunkData = rec.data as Uint8Array;
+          hasher.update(chunkData);
+          chunkParts.push(chunkData);
+          bytesProcessed += chunkData.byteLength;
+          expectedIndex++;
+
+          if (expectedIndex % 500 === 0 || expectedIndex === file.totalChunks) {
+            console.log(`[TRANSFER][RECV][VERIFY] processed chunk ${expectedIndex}/${file.totalChunks} (${(performance.now() - t0).toFixed(0)}ms)`);
+          }
+
+          if (onProgress) {
+            onProgress(bytesProcessed, file.size);
+          }
+
+          cursor.continue();
+        } else {
+          if (expectedIndex < file.totalChunks) {
+            reject(new Error(`Missing chunks: received ${expectedIndex} of ${file.totalChunks}`));
+            return;
+          }
+          resolve();
+        }
       };
 
-      fetchNext();
+      request.onerror = () => reject(request.error);
     });
-
-    for (let i = 0; i < chunks.length; i++) {
-      const chunk = chunks[i];
-      hasher.update(chunk);
-      chunkParts.push(chunk);
-      bytesProcessed += chunk.byteLength;
-      if (onProgress) {
-        onProgress(bytesProcessed, file.size);
-      }
-    }
 
     const calculatedSha256 = hasher.digest();
     const match = calculatedSha256.toLowerCase() === expectedSha256.toLowerCase();
+    const verifyDuration = performance.now() - t0;
+    console.log(`[TRANSFER][RECV][VERIFY] SHA256 complete match=${match} calculated=${calculatedSha256} elapsed=${verifyDuration.toFixed(0)}ms`);
 
     if (!match) {
       return { match: false, calculatedSha256, blob: new Blob() };
     }
 
+    const tFinalize = performance.now();
+    console.log(`[TRANSFER][RECV][FINALIZE] START fileId=${fileId}`);
     const blob = new Blob(chunkParts as unknown as BlobPart[], { type: file.mimeType });
     await this.storeFinalizedBlob(transferId, fileId, blob);
     await this.markFileComplete(transferId, fileId);
+    console.log(`[TRANSFER][RECV][FINALIZE] COMPLETE fileId=${fileId} elapsed=${(performance.now() - tFinalize).toFixed(0)}ms`);
 
     return { match: true, calculatedSha256, blob };
   }

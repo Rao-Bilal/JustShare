@@ -167,10 +167,13 @@ export class MemoryTransferStorage implements TransferStorage {
       return { match, calculatedSha256: emptyHash, blob };
     }
 
+    const t0 = performance.now();
+    console.log(`[TRANSFER][RECV][VERIFY] START fileId=${fileId}`);
     const hasher = new IncrementalSha256();
     const chunkParts: Uint8Array[] = [];
     let bytesProcessed = 0;
 
+    console.log(`[TRANSFER][RECV][VERIFY] reading chunks`);
     for (let i = 0; i < file.totalChunks; i++) {
       const key = this.makeChunkKey(transferId, fileId, i);
       const chunk = this.chunks.get(key);
@@ -180,6 +183,9 @@ export class MemoryTransferStorage implements TransferStorage {
       hasher.update(chunk);
       chunkParts.push(chunk);
       bytesProcessed += chunk.byteLength;
+      if (i % 500 === 0 || i === file.totalChunks - 1) {
+        console.log(`[TRANSFER][RECV][VERIFY] processed chunk ${i + 1}/${file.totalChunks} (${(performance.now() - t0).toFixed(0)}ms)`);
+      }
       if (onProgress) {
         onProgress(bytesProcessed, file.size);
       }
@@ -187,14 +193,19 @@ export class MemoryTransferStorage implements TransferStorage {
 
     const calculatedSha256 = hasher.digest();
     const match = calculatedSha256.toLowerCase() === expectedSha256.toLowerCase();
+    const verifyElapsed = performance.now() - t0;
+    console.log(`[TRANSFER][RECV][VERIFY] SHA256 complete match=${match} calculated=${calculatedSha256} elapsed=${verifyElapsed.toFixed(0)}ms`);
 
     if (!match) {
       return { match: false, calculatedSha256, blob: new Blob() };
     }
 
+    const tFinalize = performance.now();
+    console.log(`[TRANSFER][RECV][FINALIZE] START fileId=${fileId}`);
     file.completed = true;
     const blob = new Blob(chunkParts as unknown as BlobPart[], { type: file.mimeType });
     this.finalizedBlobs.set(this.makeBlobKey(transferId, fileId), blob);
+    console.log(`[TRANSFER][RECV][FINALIZE] COMPLETE fileId=${fileId} elapsed=${(performance.now() - tFinalize).toFixed(0)}ms`);
 
     // Check if all files in transfer are complete
     const allComplete = Array.from(transfer.files.values()).every((f) => f.completed);

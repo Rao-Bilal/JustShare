@@ -23,8 +23,8 @@ export const CHUNK_SIZE = 65536; // 64 KB
 export const MAX_FILE_SIZE = 100 * 1024 * 1024 * 1024; // 100 GB
 export const MAX_FILES_COUNT = 10000;
 export const MAX_FILENAME_LENGTH = 255;
-export const DEFAULT_ACK_TIMEOUT_MS = 30000; // 30s
-export const DEFAULT_STALL_TIMEOUT_MS = 30000; // 30s
+export const DEFAULT_ACK_TIMEOUT_MS = 60000; // 60s
+export const DEFAULT_STALL_TIMEOUT_MS = 60000; // 60s
 export const DEFAULT_RESUME_TIMEOUT_MS = 15000; // 15s
 export const BACKPRESSURE_HIGH_WATERMARK = 1024 * 1024; // 1 MB
 export const BACKPRESSURE_LOW_WATERMARK = 256 * 1024; // 256 KB
@@ -860,6 +860,10 @@ export class FileReceiver {
   }
 
   private async handleFileEnd(fileId: string) {
+    const tFileEndStart = performance.now();
+    console.log(`[TRANSFER][RECV][FILE_END] START fileId=${fileId}`);
+    this.clearStallTimer();
+
     if (!this.manifest || !this.activeTransferId) {
       throw new Error(`FILE_END received without active manifest`);
     }
@@ -867,6 +871,13 @@ export class FileReceiver {
     const manifestEntry = this.manifest.files.find((f) => f.id === fileId);
     if (!manifestEntry) {
       throw new Error(`FILE_END received for unknown file ID '${fileId}'`);
+    }
+
+    console.log(`[TRANSFER][RECV][FILE_END] checking missing chunks`);
+    const missingChunks = await this.storage.getMissingChunks(this.activeTransferId, fileId, manifestEntry.totalChunks);
+    console.log(`[TRANSFER][RECV][FILE_END] missing chunks count=${missingChunks.length}`);
+    if (missingChunks.length > 0) {
+      throw new Error(`Cannot verify file '${manifestEntry.name}': ${missingChunks.length} chunks missing`);
     }
 
     this.updateProgress('verifying');
@@ -889,6 +900,7 @@ export class FileReceiver {
         );
       }
 
+      console.log(`[TRANSFER][RECV][ACK] sending FILE_ACK`);
       const ackMsg: FileAckMessage = {
         type: 'FILE_ACK',
         transferId: this.activeTransferId,
@@ -896,6 +908,7 @@ export class FileReceiver {
         sha256Match: true,
       };
       this.dc.send(JSON.stringify(ackMsg));
+      console.log(`[TRANSFER][RECV][ACK] FILE_ACK sent`);
 
       this.assembledFiles.push({
         id: manifestEntry.id,
@@ -907,6 +920,8 @@ export class FileReceiver {
       });
 
       this.currentFileIndex++;
+      this.resetStallTimer();
+      console.log(`[TRANSFER][RECV][FILE_END] COMPLETE fileId=${fileId} elapsed=${(performance.now() - tFileEndStart).toFixed(0)}ms`);
     } catch (err: unknown) {
       const errorMsg = err instanceof Error ? err.message : 'File verification error';
       console.error('[TRANSFER][RECEIVE] Verification failed:', errorMsg);
@@ -917,7 +932,12 @@ export class FileReceiver {
         sha256Match: false,
         error: errorMsg,
       };
-      this.dc.send(JSON.stringify(ackMsg));
+      try {
+        this.dc.send(JSON.stringify(ackMsg));
+      } catch {
+        // ignore send error
+      }
+      this.clearStallTimer();
       if (this.onError) {
         this.onError(errorMsg);
       }
