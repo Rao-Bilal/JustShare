@@ -18,7 +18,7 @@ class Settings(BaseSettings):
     session_expiry_minutes: int = 30
     pairing_code_expiry_minutes: int = 5
     max_pairing_attempts: int = 5
-    use_sqlite: bool = False
+    use_sqlite: bool = True
     sqlite_path: str = "justshare_dev.db"
 
     @field_validator("cors_origins", mode="before")
