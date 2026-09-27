@@ -440,6 +440,10 @@ export class FileSender {
 
         this.bytesTransferred += chunkData.byteLength;
 
+        if (j % 500 === 0 || j === chunksToSend[chunksToSend.length - 1]) {
+          console.log(`[TRANSFER][SEND][CHUNK] sent index=${j + 1}/${totalChunks} bytes=${chunkData.byteLength}`);
+        }
+
         // Update progress every 10 chunks or on last chunk
         if (j % 10 === 0 || j === chunksToSend[chunksToSend.length - 1]) {
           this.updateProgress(i, 'sending');
@@ -582,6 +586,7 @@ export class FileReceiver {
   private stallTimeoutMs: number;
   private stallTimer: ReturnType<typeof setTimeout> | null = null;
   private messageListener: ((event: MessageEvent) => void) | null = null;
+  private messageQueue: Promise<void> = Promise.resolve();
 
   constructor(dc: RTCDataChannel, options?: ReceiverOptions) {
     this.dc = dc;
@@ -636,11 +641,24 @@ export class FileReceiver {
       this.dc.removeEventListener('message', this.messageListener);
     }
 
-    this.messageListener = async (event: MessageEvent) => {
+    this.messageListener = (event: MessageEvent) => {
       if (this.cancelled) return;
       this.resetStallTimer();
 
-      if (typeof event.data === 'string') {
+      this.messageQueue = this.messageQueue
+        .then(() => this.processMessage(event))
+        .catch((err) => {
+          console.error('[TRANSFER][RECEIVE] Message processing error:', err);
+        });
+    };
+
+    this.dc.addEventListener('message', this.messageListener);
+  }
+
+  private async processMessage(event: MessageEvent): Promise<void> {
+    if (this.cancelled) return;
+
+    if (typeof event.data === 'string') {
         try {
           const msg = JSON.parse(event.data);
           console.log(`[TRANSFER][RECEIVE] Control message received: ${msg.type}`);
@@ -841,6 +859,10 @@ export class FileReceiver {
             await this.storage.writeChunk(this.activeTransferId, header.fileId, header.index, chunkData);
             this.totalReceivedBytes += chunkData.byteLength;
 
+            if (header.index % 500 === 0 || header.index === manifestEntry.totalChunks - 1) {
+              console.log(`[TRANSFER][RECV][CHUNK] persisted index=${header.index + 1}/${manifestEntry.totalChunks}`);
+            }
+
             if (header.index % 10 === 0 || this.totalReceivedBytes >= this.totalBytes) {
               this.updateProgress('receiving');
             }
@@ -854,10 +876,7 @@ export class FileReceiver {
           if (this.onError) this.onError(errorMsg);
         }
       }
-    };
-
-    this.dc.addEventListener('message', this.messageListener);
-  }
+    }
 
   private async handleFileEnd(fileId: string) {
     const tFileEndStart = performance.now();
@@ -874,9 +893,13 @@ export class FileReceiver {
     }
 
     console.log(`[TRANSFER][RECV][FILE_END] checking missing chunks`);
+    console.log(`[TRANSFER][RECV][FILE_END] expectedChunks=${manifestEntry.totalChunks}`);
+    const receivedChunks = await this.storage.getReceivedChunks(this.activeTransferId, fileId);
+    console.log(`[TRANSFER][RECV][FILE_END] receivedChunks=${receivedChunks.length}`);
     const missingChunks = await this.storage.getMissingChunks(this.activeTransferId, fileId, manifestEntry.totalChunks);
-    console.log(`[TRANSFER][RECV][FILE_END] missing chunks count=${missingChunks.length}`);
+    console.log(`[TRANSFER][RECV][FILE_END] missingCount=${missingChunks.length}`);
     if (missingChunks.length > 0) {
+      console.log(`[TRANSFER][RECV][FILE_END] missingIndexes=${JSON.stringify(missingChunks.slice(0, 10))}`);
       throw new Error(`Cannot verify file '${manifestEntry.name}': ${missingChunks.length} chunks missing`);
     }
 

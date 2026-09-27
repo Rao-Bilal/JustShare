@@ -298,6 +298,7 @@ describe('Phase 2A - Transfer Protocol & Validation', () => {
       payload.set(headerBytes, 4);
 
       receiverDc.dispatchEvent('message', { data: payload.buffer });
+      await new Promise((r) => setTimeout(r, 10));
       expect(errorMsg).toContain('transfer ID mismatch');
     });
 
@@ -744,6 +745,52 @@ describe('Phase 2A - Transfer Protocol & Validation', () => {
       expect(receiverErr).toContain('Disk quota exceeded');
       expect(senderErr).toContain('Disk quota exceeded');
       expect(receiver.getAssembledFiles().length).toBe(0);
+    });
+
+    it('serializes async storage writes before FILE_END to prevent missing chunk race condition', async () => {
+      // 5 chunks
+      const data = new Uint8Array(5 * 65536);
+      for (let i = 0; i < data.length; i++) data[i] = i & 0xff;
+      const file = new File([data], 'async-race.bin');
+
+      const [senderDc, receiverDc] = createConnectedPair();
+
+      const baseStorage = new MemoryTransferStorage();
+      await baseStorage.init();
+
+      // Wrap writeChunk with an async delay simulating real disk/IndexedDB transaction latency
+      const originalWriteChunk = baseStorage.writeChunk.bind(baseStorage);
+      baseStorage.writeChunk = async (transferId, fileId, index, chunkData) => {
+        await new Promise((r) => setTimeout(r, 10));
+        return originalWriteChunk(transferId, fileId, index, chunkData);
+      };
+
+      const sender = new FileSender(senderDc as unknown as RTCDataChannel, [file], {
+        transferId: 'tx-async-race',
+        ackTimeoutMs: 2000,
+      });
+      const receiver = new FileReceiver(receiverDc as unknown as RTCDataChannel, {
+        expectedTransferId: 'tx-async-race',
+        storage: baseStorage,
+      });
+
+      const completePromise = new Promise<void>((resolve, reject) => {
+        receiver.onComplete = (files) => {
+          try {
+            expect(files.length).toBe(1);
+            expect(files[0].verified).toBe(true);
+            expect(files[0].size).toBe(5 * 65536);
+            resolve();
+          } catch (err) {
+            reject(err);
+          }
+        };
+        receiver.onError = (e) => reject(new Error(e));
+      });
+
+      receiver.start();
+      await sender.start();
+      await completePromise;
     });
   });
 });
