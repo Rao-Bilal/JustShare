@@ -15,7 +15,9 @@ import {
   TransferProgress,
   TransferStartMessage,
 } from '../types';
-import { sha256Chunks, sha256File } from './crypto';
+import { sha256File } from './crypto';
+import { MemoryTransferStorage } from './storage/memory';
+import { TransferStorage } from './storage/types';
 
 export const CHUNK_SIZE = 65536; // 64 KB
 export const MAX_FILE_SIZE = 100 * 1024 * 1024 * 1024; // 100 GB
@@ -554,27 +556,17 @@ export class FileSender {
   }
 }
 
-interface ActiveFileRecord {
-  id: string;
-  name: string;
-  size: number;
-  totalChunks: number;
-  sha256: string;
-  chunks: (Uint8Array | undefined)[];
-  receivedBytes: number;
-  completed: boolean;
-}
-
 export interface ReceiverOptions {
   expectedTransferId?: string;
   stallTimeoutMs?: number;
+  storage?: TransferStorage;
 }
 
 export class FileReceiver {
   private dc: RTCDataChannel;
+  private storage: TransferStorage;
   private manifest: TransferManifest | null = null;
   private activeTransferId: string | null = null;
-  private files: Map<string, ActiveFileRecord> = new Map();
   private assembledFiles: AssembledFile[] = [];
   public onProgress: ((progress: TransferProgress) => void) | null = null;
   public onComplete: ((files: AssembledFile[]) => void) | null = null;
@@ -596,6 +588,11 @@ export class FileReceiver {
     this.dc.binaryType = 'arraybuffer';
     this.activeTransferId = options?.expectedTransferId || null;
     this.stallTimeoutMs = options?.stallTimeoutMs || DEFAULT_STALL_TIMEOUT_MS;
+    this.storage = options?.storage || new MemoryTransferStorage();
+  }
+
+  getStorage(): TransferStorage {
+    return this.storage;
   }
 
   getTransferId(): string | null {
@@ -659,6 +656,9 @@ export class FileReceiver {
               this.totalFiles = manifest.totalFiles;
               this.totalBytes = manifest.totalSize;
               this.startTime = Date.now();
+
+              await this.storage.createTransfer(manifest);
+
               this.updateProgress('receiving');
               break;
             }
@@ -684,6 +684,7 @@ export class FileReceiver {
                 this.activeTransferId = this.manifest.transferId;
                 this.totalFiles = this.manifest.totalFiles;
                 this.totalBytes = this.manifest.totalSize;
+                await this.storage.createTransfer(this.manifest);
               }
 
               if (!this.activeTransferId) {
@@ -693,49 +694,22 @@ export class FileReceiver {
               const fileStatuses: ResumeFileStatus[] = [];
               if (this.manifest) {
                 for (const mFile of this.manifest.files) {
-                  const assembled = this.assembledFiles.find((af) => af.id === mFile.id);
-                  if (assembled && assembled.verified) {
-                    fileStatuses.push({
-                      fileId: mFile.id,
-                      completed: true,
-                      missingChunks: [],
-                    });
-                    continue;
-                  }
+                  const storedBlob = await this.storage.getFinalizedBlob(this.activeTransferId, mFile.id);
+                  const missingChunks = await this.storage.getMissingChunks(
+                    this.activeTransferId,
+                    mFile.id,
+                    mFile.totalChunks
+                  );
 
-                  const fileRecord = this.files.get(mFile.id);
-                  if (fileRecord && fileRecord.completed) {
-                    fileStatuses.push({
-                      fileId: mFile.id,
-                      completed: true,
-                      missingChunks: [],
-                    });
-                    continue;
-                  }
+                  const isComplete =
+                    storedBlob !== null ||
+                    (missingChunks.length === 0 && (mFile.totalChunks === 0 || mFile.size === 0));
 
-                  if (fileRecord) {
-                    const missing: number[] = [];
-                    for (let idx = 0; idx < fileRecord.totalChunks; idx++) {
-                      if (!(fileRecord.chunks[idx] instanceof Uint8Array)) {
-                        missing.push(idx);
-                      }
-                    }
-                    fileStatuses.push({
-                      fileId: mFile.id,
-                      completed: false,
-                      missingChunks: missing,
-                    });
-                  } else {
-                    const missing: number[] = [];
-                    for (let idx = 0; idx < mFile.totalChunks; idx++) {
-                      missing.push(idx);
-                    }
-                    fileStatuses.push({
-                      fileId: mFile.id,
-                      completed: false,
-                      missingChunks: missing,
-                    });
-                  }
+                  fileStatuses.push({
+                    fileId: mFile.id,
+                    completed: isComplete,
+                    missingChunks: isComplete ? [] : missingChunks,
+                  });
                 }
               }
 
@@ -767,18 +741,8 @@ export class FileReceiver {
                 throw new Error(`FILE_START metadata mismatch for file '${manifestEntry.name}'`);
               }
 
-              if (!this.files.has(msg.fileId)) {
-                this.files.set(msg.fileId, {
-                  id: msg.fileId,
-                  name: manifestEntry.name,
-                  size: manifestEntry.size,
-                  totalChunks: manifestEntry.totalChunks,
-                  sha256: manifestEntry.sha256,
-                  chunks: new Array(manifestEntry.totalChunks),
-                  receivedBytes: 0,
-                  completed: false,
-                });
-              }
+              await this.storage.initFile(this.activeTransferId, manifestEntry);
+
               this.currentFileName = manifestEntry.name;
               this.updateProgress('receiving');
               break;
@@ -852,18 +816,17 @@ export class FileReceiver {
             throw new Error(`Chunk rejected: transfer ID mismatch (${header.transferId} vs ${this.activeTransferId})`);
           }
 
-          const fileRecord = this.files.get(header.fileId);
-          if (!fileRecord) {
+          if (!this.manifest) {
+            throw new Error('Chunk received before manifest initialized');
+          }
+
+          const manifestEntry = this.manifest.files.find((f) => f.id === header.fileId);
+          if (!manifestEntry) {
             throw new Error(`Chunk rejected: unknown file ID '${header.fileId}'`);
           }
 
-          if (fileRecord.completed) {
-            console.log(`[TRANSFER][RECEIVE] Chunk received for already completed file ${fileRecord.name} - ignoring`);
-            return;
-          }
-
-          if (header.index < 0 || header.index >= fileRecord.totalChunks) {
-            throw new Error(`Chunk rejected: index ${header.index} out of bounds (totalChunks=${fileRecord.totalChunks})`);
+          if (header.index < 0 || header.index >= manifestEntry.totalChunks) {
+            throw new Error(`Chunk rejected: index ${header.index} out of bounds (totalChunks=${manifestEntry.totalChunks})`);
           }
 
           const chunkData = new Uint8Array(buffer, 4 + headerLen);
@@ -871,16 +834,14 @@ export class FileReceiver {
             throw new Error(`Chunk rejected: oversized chunk (${chunkData.byteLength} > ${CHUNK_SIZE})`);
           }
 
-          // Handle duplicate vs new chunk
-          const existingChunk = fileRecord.chunks[header.index];
-          if (existingChunk) {
-            console.log(`[TRANSFER][RECEIVE] Duplicate chunk ${header.index} received for file ${fileRecord.name} - ignoring`);
+          const alreadyHas = await this.storage.hasChunk(this.activeTransferId, header.fileId, header.index);
+          if (alreadyHas) {
+            console.log(`[TRANSFER][RECEIVE] Duplicate chunk ${header.index} received for file ${manifestEntry.name} - ignoring`);
           } else {
-            fileRecord.chunks[header.index] = chunkData;
-            fileRecord.receivedBytes += chunkData.byteLength;
+            await this.storage.writeChunk(this.activeTransferId, header.fileId, header.index, chunkData);
             this.totalReceivedBytes += chunkData.byteLength;
 
-            if (header.index % 10 === 0 || fileRecord.receivedBytes >= fileRecord.size) {
+            if (header.index % 10 === 0 || this.totalReceivedBytes >= this.totalBytes) {
               this.updateProgress('receiving');
             }
           }
@@ -898,67 +859,50 @@ export class FileReceiver {
   }
 
   private async handleFileEnd(fileId: string) {
-    const fileRecord = this.files.get(fileId);
-    if (!fileRecord) {
-      throw new Error(`FILE_END received for unknown file ID '${fileId}'`);
+    if (!this.manifest || !this.activeTransferId) {
+      throw new Error(`FILE_END received without active manifest`);
     }
 
-    if (fileRecord.completed) {
-      console.log(`[TRANSFER][RECEIVE] File '${fileRecord.name}' already completed, acknowledging`);
-      const ackMsg: FileAckMessage = {
-        type: 'FILE_ACK',
-        transferId: this.activeTransferId || '',
-        fileId,
-        sha256Match: true,
-      };
-      this.dc.send(JSON.stringify(ackMsg));
-      return;
+    const manifestEntry = this.manifest.files.find((f) => f.id === fileId);
+    if (!manifestEntry) {
+      throw new Error(`FILE_END received for unknown file ID '${fileId}'`);
     }
 
     this.updateProgress('verifying');
 
     try {
-      // Validate all chunks are present
-      let verified = false;
-      let hash = '';
-
-      if (fileRecord.totalChunks === 0 && fileRecord.size === 0) {
-        // Empty file handling
-        hash = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
-        verified = hash.toLowerCase() === fileRecord.sha256.toLowerCase();
-      } else {
-        const hasMissingChunk = fileRecord.chunks.some((c) => !(c instanceof Uint8Array));
-        if (hasMissingChunk) {
-          throw new Error(`Missing chunks detected in file '${fileRecord.name}'`);
+      const result = await this.storage.verifyAndFinalizeFile(
+        this.activeTransferId,
+        fileId,
+        manifestEntry.sha256,
+        (processed, total) => {
+          if (total > 0) {
+            this.updateProgress('verifying');
+          }
         }
-        const validChunks = fileRecord.chunks.filter((c): c is Uint8Array => c instanceof Uint8Array);
-        hash = await sha256Chunks(validChunks);
-        verified = hash.toLowerCase() === fileRecord.sha256.toLowerCase();
-      }
+      );
 
-      if (!verified) {
-        throw new Error(`SHA-256 mismatch for file '${fileRecord.name}' (calculated ${hash}, expected ${fileRecord.sha256})`);
+      if (!result.match) {
+        throw new Error(
+          `SHA-256 mismatch for file '${manifestEntry.name}' (calculated ${result.calculatedSha256}, expected ${manifestEntry.sha256})`
+        );
       }
-
-      fileRecord.completed = true;
 
       const ackMsg: FileAckMessage = {
         type: 'FILE_ACK',
-        transferId: this.activeTransferId || '',
+        transferId: this.activeTransferId,
         fileId,
         sha256Match: true,
       };
       this.dc.send(JSON.stringify(ackMsg));
 
-      const validChunks = fileRecord.chunks.filter((c): c is Uint8Array => c instanceof Uint8Array);
-      const blob = new Blob(validChunks as unknown as BlobPart[]);
       this.assembledFiles.push({
-        id: fileRecord.id,
-        name: fileRecord.name,
-        size: fileRecord.size,
-        blob,
+        id: manifestEntry.id,
+        name: manifestEntry.name,
+        size: manifestEntry.size,
+        blob: result.blob,
         verified: true,
-        sha256: hash,
+        sha256: result.calculatedSha256,
       });
 
       this.currentFileIndex++;
@@ -1054,4 +998,5 @@ export class FileReceiver {
     });
   }
 }
+
 

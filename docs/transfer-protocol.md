@@ -234,8 +234,10 @@ The Receiver is the sole authority regarding what data it possesses:
 
 ---
 
-## 5. Storage & Persistence Guarantees
+## 5. Storage & Persistence Guarantees (Phase 2C Storage Engine)
 
-- **In-Session Resume Guarantee**: Recovers seamlessly from temporary network drops, ICE restarts, WebRTC DataChannel re-connections, and peer reconnects as long as the browser tab remains open.
-- **Browser Reload Limitation**: In-memory chunk arrays exist in RAM. Closing or hard-refreshing the browser tab discards active memory buffers. Durable multi-gigabyte cross-session persistence across browser restarts will be provided in a future storage engine phase (using OPFS / IndexedDB).
+- **In-Session Resume Guarantee**: Recovers seamlessly from temporary network drops, ICE restarts, WebRTC DataChannel re-connections, and peer reconnects.
+- **Durable Cross-Reload Persistence**: The receiver utilizes `TransferStorage` (IndexedDB / OPFS) to persist received chunks and manifest metadata to browser storage. Transfer state and chunk records survive page reloads and browser restarts.
+- **Bounded Memory Streaming**: Chunks are written directly to persistent storage upon arrival over WebRTC. Hash computation is performed via `IncrementalSha256` streaming, keeping the browser memory footprint constant $O(1)$ regardless of total file size (e.g. 10 GB+).
+- **Automated Eviction**: Stale or orphaned transfer caches are automatically pruned via `cleanupStaleTransfers()`, respecting browser storage quotas.
 

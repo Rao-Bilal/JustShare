@@ -3,6 +3,7 @@ import { createSession, getSession, joinSession, updateSessionState } from '../s
 import { getOrCreateDevice, resetDevice } from '../services/device';
 import { formatBytes, formatEta, formatSpeed } from '../services/format';
 import { SignalingClient } from '../services/signaling';
+import { createTransferStorage, TransferStorage } from '../services/storage';
 import { FileReceiver, FileSender } from '../services/transfer';
 import { WebRTCConnection } from '../services/webrtc';
 import { AppScreen, DeviceInfo, FileInfo, SessionInfo, SessionState, TransferProgress } from '../types';
@@ -26,6 +27,7 @@ export function App() {
   const rtcRef = useRef<WebRTCConnection | null>(null);
   const senderRef = useRef<FileSender | null>(null);
   const receiverRef = useRef<FileReceiver | null>(null);
+  const storageRef = useRef<TransferStorage | null>(null);
 
   const sessionRef = useRef<SessionInfo | null>(null);
   const deviceRef = useRef<{ device_id: string; display_name: string; token: string } | null>(null);
@@ -53,6 +55,14 @@ export function App() {
   };
 
   useEffect(() => {
+    createTransferStorage()
+      .then((storage) => {
+        storageRef.current = storage;
+      })
+      .catch((err) => {
+        console.warn('Failed to initialize transfer storage:', err);
+      });
+
     getOrCreateDevice()
       .then(setDeviceState)
       .catch((e: unknown) => setError(e instanceof Error ? e.message : 'Device init error'));
@@ -535,7 +545,7 @@ export function App() {
 
     rtc.onDataChannel = (dc) => {
       console.log('[TRANSFER][RECEIVE] DataChannel received, starting FileReceiver');
-      const receiver = new FileReceiver(dc);
+      const receiver = new FileReceiver(dc, { storage: storageRef.current || undefined });
       receiverRef.current = receiver;
       receiver.onProgress = (progress) => {
         setTransferProgress(progress);
