@@ -7,9 +7,13 @@ export class WebRTCConnection {
   private pendingCandidates: RTCIceCandidateInit[] = [];
   private _onDataChannel: ((dc: RTCDataChannel) => void) | null = null;
   public onConnectionStateChange: ((state: string) => void) | null = null;
+  private roleTag: string;
 
   constructor(signaling: SignalingClient, isSender: boolean) {
     this.signaling = signaling;
+    this.roleTag = isSender ? 'SEND' : 'RECEIVE';
+    console.log(`[WEBRTC][${this.roleTag}] RTCPeerConnection created (isSender=${isSender})`);
+
     this.pc = new RTCPeerConnection({
       iceServers: [
         { urls: 'stun:stun.l.google.com:19302' },
@@ -21,7 +25,7 @@ export class WebRTCConnection {
 
     this.pc.onicecandidate = (event) => {
       if (event.candidate) {
-        console.log('[WEBRTC] Local ICE candidate gathered');
+        console.log(`[WEBRTC][${this.roleTag}] Local ICE candidate generated`);
         this.signaling.send({
           type: 'signal',
           payload: {
@@ -33,14 +37,18 @@ export class WebRTCConnection {
     };
 
     this.pc.onconnectionstatechange = () => {
-      console.log(`[WEBRTC] connectionState changed to: ${this.pc.connectionState}`);
+      console.log(`[WEBRTC][${this.roleTag}] connectionState changed to: ${this.pc.connectionState}`);
       if (this.onConnectionStateChange) {
         this.onConnectionStateChange(this.pc.connectionState);
       }
     };
 
     this.pc.oniceconnectionstatechange = () => {
-      console.log(`[WEBRTC] iceConnectionState changed to: ${this.pc.iceConnectionState}`);
+      console.log(`[WEBRTC][${this.roleTag}] iceConnectionState changed to: ${this.pc.iceConnectionState}`);
+    };
+
+    this.pc.onicegatheringstatechange = () => {
+      console.log(`[WEBRTC][${this.roleTag}] iceGatheringState changed to: ${this.pc.iceGatheringState}`);
     };
 
     if (isSender) {
@@ -48,17 +56,31 @@ export class WebRTCConnection {
         ordered: true,
       });
       this.dataChannel.binaryType = 'arraybuffer';
-      console.log('[WEBRTC] Sender DataChannel created');
+      console.log(`[WEBRTC][${this.roleTag}] DataChannel created: file-transfer`);
+      this.attachDataChannelListeners(this.dataChannel);
     } else {
       this.pc.ondatachannel = (event) => {
         this.dataChannel = event.channel;
         this.dataChannel.binaryType = 'arraybuffer';
-        console.log('[WEBRTC] Receiver DataChannel received');
+        console.log(`[WEBRTC][${this.roleTag}] DataChannel received: ${event.channel.label}`);
+        this.attachDataChannelListeners(this.dataChannel);
         if (this._onDataChannel) {
           this._onDataChannel(this.dataChannel);
         }
       };
     }
+  }
+
+  private attachDataChannelListeners(dc: RTCDataChannel) {
+    dc.onopen = () => {
+      console.log(`[WEBRTC][${this.roleTag}] DataChannel state=open`);
+    };
+    dc.onclose = () => {
+      console.log(`[WEBRTC][${this.roleTag}] DataChannel state=closed`);
+    };
+    dc.onerror = (event) => {
+      console.error(`[WEBRTC][${this.roleTag}] DataChannel error`, event);
+    };
   }
 
   set onDataChannel(cb: ((dc: RTCDataChannel) => void) | null) {
@@ -73,39 +95,53 @@ export class WebRTCConnection {
   }
 
   async createOffer(): Promise<void> {
-    console.log('[WEBRTC] Creating SDP offer');
-    const offer = await this.pc.createOffer();
-    await this.pc.setLocalDescription(offer);
-    console.log('[WEBRTC] Local description set (offer)');
-    this.signaling.send({
-      type: 'signal',
-      payload: {
-        signal_type: 'offer',
-        data: offer,
-      },
-    });
-  }
-
-  async handleSignal(signal: { signal_type: string; data: unknown }): Promise<void> {
-    console.log(`[WEBRTC] Handling signal: ${signal.signal_type}`);
-    if (signal.signal_type === 'offer') {
-      await this.pc.setRemoteDescription(new RTCSessionDescription(signal.data as RTCSessionDescriptionInit));
-      console.log('[WEBRTC] Remote description set (offer)');
-      const answer = await this.pc.createAnswer();
-      await this.pc.setLocalDescription(answer);
-      console.log('[WEBRTC] Local description set (answer)');
+    try {
+      console.log(`[WEBRTC][${this.roleTag}] createOffer() starting`);
+      const offer = await this.pc.createOffer();
+      await this.pc.setLocalDescription(offer);
+      console.log(`[WEBRTC][${this.roleTag}] setLocalDescription(offer) succeeded`);
       this.signaling.send({
         type: 'signal',
         payload: {
-          signal_type: 'answer',
-          data: answer,
+          signal_type: 'offer',
+          data: offer,
         },
       });
-      await this.flushPendingCandidates();
+      console.log(`[SIGNAL][${this.roleTag}] OFFER sent over signaling`);
+    } catch (err) {
+      console.error(`[WEBRTC][${this.roleTag}] createOffer failed`, err);
+    }
+  }
+
+  async handleSignal(signal: { signal_type: string; data: unknown }): Promise<void> {
+    console.log(`[WEBRTC][${this.roleTag}] handleSignal received: ${signal.signal_type}`);
+    if (signal.signal_type === 'offer') {
+      try {
+        await this.pc.setRemoteDescription(new RTCSessionDescription(signal.data as RTCSessionDescriptionInit));
+        console.log(`[WEBRTC][${this.roleTag}] setRemoteDescription(offer) succeeded`);
+        const answer = await this.pc.createAnswer();
+        await this.pc.setLocalDescription(answer);
+        console.log(`[WEBRTC][${this.roleTag}] setLocalDescription(answer) succeeded`);
+        this.signaling.send({
+          type: 'signal',
+          payload: {
+            signal_type: 'answer',
+            data: answer,
+          },
+        });
+        console.log(`[SIGNAL][${this.roleTag}] ANSWER sent over signaling`);
+        await this.flushPendingCandidates();
+      } catch (err) {
+        console.error(`[WEBRTC][${this.roleTag}] Processing OFFER failed`, err);
+      }
     } else if (signal.signal_type === 'answer') {
-      await this.pc.setRemoteDescription(new RTCSessionDescription(signal.data as RTCSessionDescriptionInit));
-      console.log('[WEBRTC] Remote description set (answer)');
-      await this.flushPendingCandidates();
+      try {
+        await this.pc.setRemoteDescription(new RTCSessionDescription(signal.data as RTCSessionDescriptionInit));
+        console.log(`[WEBRTC][${this.roleTag}] setRemoteDescription(answer) succeeded`);
+        await this.flushPendingCandidates();
+      } catch (err) {
+        console.error(`[WEBRTC][${this.roleTag}] Processing ANSWER failed`, err);
+      }
     } else if (signal.signal_type === 'ice-candidate') {
       const candidate = signal.data as RTCIceCandidateInit;
       if (!candidate || (!candidate.candidate && candidate.sdpMid === undefined)) {
@@ -113,27 +149,28 @@ export class WebRTCConnection {
       }
       if (this.pc.remoteDescription && this.pc.remoteDescription.type) {
         try {
-          await this.pc.addIceCandidate(candidate);
-          console.log('[WEBRTC] Remote ICE candidate added');
-        } catch {
-          // ignore candidate error
+          await this.pc.addIceCandidate(new RTCIceCandidate(candidate));
+          console.log(`[WEBRTC][${this.roleTag}] Remote ICE candidate added successfully`);
+        } catch (err) {
+          console.error(`[WEBRTC][${this.roleTag}] Failed to add remote ICE candidate`, err);
         }
       } else {
-        console.log('[WEBRTC] Remote ICE candidate queued');
+        console.log(`[WEBRTC][${this.roleTag}] Remote ICE candidate queued (remoteDescription not ready)`);
         this.pendingCandidates.push(candidate);
       }
     }
   }
 
   private async flushPendingCandidates(): Promise<void> {
-    console.log(`[WEBRTC] Flushing ${this.pendingCandidates.length} pending ICE candidate(s)`);
+    console.log(`[WEBRTC][${this.roleTag}] Flushing ${this.pendingCandidates.length} pending ICE candidate(s)`);
     while (this.pendingCandidates.length > 0) {
       const candidate = this.pendingCandidates.shift();
       if (candidate) {
         try {
-          await this.pc.addIceCandidate(candidate);
-        } catch {
-          // ignore candidate error
+          await this.pc.addIceCandidate(new RTCIceCandidate(candidate));
+          console.log(`[WEBRTC][${this.roleTag}] Flushed ICE candidate added successfully`);
+        } catch (err) {
+          console.error(`[WEBRTC][${this.roleTag}] Failed to add flushed ICE candidate`, err);
         }
       }
     }

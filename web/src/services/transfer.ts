@@ -36,6 +36,7 @@ export class FileSender {
 
   async start(): Promise<void> {
     this.startTime = Date.now();
+    console.log('[TRANSFER][SEND] Calculating hashes before transfer start');
     
     // Calculate hashes
     for (let i = 0; i < this.files.length; i++) {
@@ -47,6 +48,7 @@ export class FileSender {
 
     if (this.cancelled) return;
 
+    console.log('[TRANSFER][SEND] Sending TRANSFER_START');
     // Send TRANSFER_START
     this.dc.send(JSON.stringify({
       type: 'TRANSFER_START',
@@ -64,6 +66,7 @@ export class FileSender {
 
       this.updateProgress(i, 'sending');
 
+      console.log(`[TRANSFER][SEND] Sending FILE_START for file ${i + 1}/${this.files.length}`);
       this.dc.send(JSON.stringify({
         type: 'FILE_START',
         fileId,
@@ -107,6 +110,7 @@ export class FileSender {
         }
       }
 
+      console.log(`[TRANSFER][SEND] Sending FILE_END for file ${i + 1}`);
       this.dc.send(JSON.stringify({ type: 'FILE_END', fileId }));
 
       // Wait for FILE_ACK with timeout
@@ -121,6 +125,7 @@ export class FileSender {
             try {
               const msg = JSON.parse(event.data);
               if (msg.type === 'FILE_ACK' && msg.fileId === fileId) {
+                console.log(`[TRANSFER][SEND] Received FILE_ACK (match=${msg.sha256Match})`);
                 clearTimeout(timer);
                 this.dc.removeEventListener('message', handler);
                 if (!msg.sha256Match) {
@@ -129,6 +134,7 @@ export class FileSender {
                   resolve();
                 }
               } else if (msg.type === 'CANCEL') {
+                console.log('[TRANSFER][SEND] Received CANCEL signal');
                 clearTimeout(timer);
                 this.dc.removeEventListener('message', handler);
                 reject(new Error('Transfer cancelled by receiver: ' + msg.reason));
@@ -143,11 +149,13 @@ export class FileSender {
     }
 
     if (this.cancelled) return;
+    console.log('[TRANSFER][SEND] Sending TRANSFER_END');
     this.dc.send(JSON.stringify({ type: 'TRANSFER_END' }));
     if (this.onComplete) this.onComplete();
   }
 
   cancel(reason: string): void {
+    console.log(`[TRANSFER][SEND] Transfer cancelled: ${reason}`);
     this.cancelled = true;
     if (this.dc.readyState === 'open') {
       this.dc.send(JSON.stringify({ type: 'CANCEL', reason }));
@@ -205,6 +213,7 @@ export class FileReceiver {
 
       if (typeof event.data === 'string') {
         const msg = JSON.parse(event.data);
+        console.log(`[TRANSFER][RECEIVE] Control message received: ${msg.type}`);
         
         switch (msg.type) {
           case 'TRANSFER_START':
@@ -231,12 +240,14 @@ export class FileReceiver {
             break;
             
           case 'TRANSFER_END':
+            console.log('[TRANSFER][RECEIVE] TRANSFER_END received');
             if (this.onComplete) {
               this.onComplete(this.assembledFiles);
             }
             break;
 
           case 'CANCEL':
+            console.log('[TRANSFER][RECEIVE] CANCEL received');
             this.cancelled = true;
             if (this.onError) this.onError(msg.reason);
             break;

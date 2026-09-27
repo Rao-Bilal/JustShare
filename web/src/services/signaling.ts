@@ -14,16 +14,27 @@ export class SignalingClient {
     this.ws.onmessage = (event) => {
       try {
         const msg = JSON.parse(event.data);
+        if (msg.type === 'signal' && msg.payload && msg.payload.signal_type) {
+          console.log(`[SIGNAL] Received message type: ${msg.type} (${msg.payload.signal_type})`);
+        } else {
+          console.log(`[SIGNAL] Received message type: ${msg.type}`);
+        }
         const callbacks = this.listeners.get(msg.type) || [];
         callbacks.forEach((cb) => cb(msg));
-      } catch {
-        // Ignore malformed messages
+      } catch (err) {
+        console.error('[SIGNAL] Failed to parse WebSocket message', err);
       }
     };
   }
 
   send(message: object): void {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      const msgObj = message as { type?: string; payload?: { signal_type?: string } };
+      if (msgObj.type === 'signal' && msgObj.payload && msgObj.payload.signal_type) {
+        console.log(`[SIGNAL] Sending message type: ${msgObj.type} (${msgObj.payload.signal_type})`);
+      } else {
+        console.log(`[SIGNAL] Sending message type: ${msgObj.type}`);
+      }
       this.ws.send(JSON.stringify(message));
     }
   }
