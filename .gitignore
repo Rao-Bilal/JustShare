@@ -1,0 +1,14 @@
+.env
+.env.*
+!.env.example
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.coverage
+backend/.venv/
+backend/*.egg-info/
+web/node_modules/
+web/dist/
+web/coverage/
+web/*.tsbuildinfo
+*.log

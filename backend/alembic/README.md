@@ -1,0 +1,1 @@
+Alembic owns the durable schema. Phase 0 includes the minimal `devices` foundation migration; do not use `create_all` in application startup. Run `alembic upgrade head` before running the service outside Docker.
