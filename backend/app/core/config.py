@@ -1,3 +1,4 @@
+import secrets
 from functools import lru_cache
 
 from pydantic import AnyHttpUrl, Field, field_validator
@@ -12,6 +13,13 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+asyncpg://justshare:change-me@localhost:5432/justshare"
     redis_url: str = "redis://localhost:6379/0"
     cors_origins: list[AnyHttpUrl] = Field(default_factory=lambda: ["http://localhost:5173"])
+
+    jwt_secret: str = Field(default_factory=lambda: secrets.token_hex(32))
+    session_expiry_minutes: int = 30
+    pairing_code_expiry_minutes: int = 5
+    max_pairing_attempts: int = 5
+    use_sqlite: bool = False
+    sqlite_path: str = "justshare_dev.db"
 
     @field_validator("cors_origins", mode="before")
     @classmethod

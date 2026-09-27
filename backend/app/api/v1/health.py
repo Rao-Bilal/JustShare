@@ -1,33 +1,27 @@
-from fastapi import APIRouter, HTTPException, status
-from redis.asyncio import Redis
+import logging
+
+from fastapi import APIRouter, Response
 from sqlalchemy import text
-from sqlalchemy.exc import SQLAlchemyError
 
-from app.core.config import get_settings
-from app.db.session import get_engine
+from app.db.session import get_db_session
 
-router = APIRouter(tags=["system"])
+logger = logging.getLogger(__name__)
+router = APIRouter()
 
-
-@router.get("/health")
-async def health() -> dict[str, str]:
+@router.get("/health", status_code=200)
+async def health():
     return {"status": "ok"}
 
-
-@router.get("/ready")
-async def readiness() -> dict[str, str]:
-    settings = get_settings()
+@router.get("/ready", status_code=200)
+async def readiness(response: Response):
+    # Check DB
     try:
-        async with get_engine().connect() as connection:
-            await connection.execute(text("SELECT 1"))
-        redis = Redis.from_url(settings.redis_url)
-        try:
-            await redis.ping()
-        finally:
-            await redis.aclose()
-    except (ModuleNotFoundError, SQLAlchemyError, OSError, ConnectionError) as exc:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Dependencies are unavailable.",
-        ) from exc
-    return {"status": "ready"}
+        async for session in get_db_session():
+            await session.execute(text("SELECT 1"))
+            break
+    except Exception as e:
+        logger.error(f"DB health check failed: {e}")
+        response.status_code = 503
+        return {"status": "error", "message": "Database unavailable"}
+        
+    return {"status": "ok"}
