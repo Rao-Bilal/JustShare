@@ -18,6 +18,11 @@ export async function getOrCreateDevice(): Promise<StoredDevice> {
     }
   }
 
+  return resetDevice();
+}
+
+export async function resetDevice(): Promise<StoredDevice> {
+  localStorage.removeItem(DEVICE_KEY);
   const randomSuffix = Math.floor(Math.random() * 65536)
     .toString(16)
     .padStart(4, '0');

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { createSession, getSession, joinSession, updateSessionState } from '../services/api';
-import { getOrCreateDevice } from '../services/device';
+import { getOrCreateDevice, resetDevice } from '../services/device';
 import { formatBytes, formatEta, formatSpeed } from '../services/format';
 import { SignalingClient } from '../services/signaling';
 import { FileReceiver, FileSender } from '../services/transfer';
@@ -64,13 +64,45 @@ export function App() {
     setError(null);
   };
 
+  const handleAuthFailure = async () => {
+    try {
+      const freshDevice = await resetDevice();
+      setDevice(freshDevice);
+      return freshDevice;
+    } catch {
+      return null;
+    }
+  };
+
   // Sender flow
   const startSending = async () => {
-    if (!device) return;
+    let currentDevice = device;
+    if (!currentDevice) {
+      currentDevice = await handleAuthFailure();
+      if (!currentDevice) return;
+    }
+
     try {
       setError(null);
       setRole('sender');
-      const res = await createSession(device.token);
+      let res;
+      try {
+        res = await createSession(currentDevice.token);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : '';
+        if (msg.includes('Authentication') || msg.includes('token') || msg.includes('401')) {
+          const fresh = await handleAuthFailure();
+          if (fresh) {
+            currentDevice = fresh;
+            res = await createSession(fresh.token);
+          } else {
+            throw err;
+          }
+        } else {
+          throw err;
+        }
+      }
+
       const sess: SessionInfo = {
         session_id: res.session_id,
         pairing_code: res.pairing_code,
@@ -106,7 +138,7 @@ export function App() {
         setError(payload?.message || 'Signaling error');
       });
 
-      sig.connect(sess.session_id, device.token);
+      sig.connect(sess.session_id, currentDevice.token);
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : 'Session creation error');
       goHome();
@@ -188,9 +220,32 @@ export function App() {
     setPairingInput(val);
     setError(null);
 
-    if (val.length === 6 && device) {
+    let currentDevice = device;
+    if (!currentDevice) {
+      currentDevice = await handleAuthFailure();
+      if (!currentDevice) return;
+    }
+
+    if (val.length === 6) {
       try {
-        const res = await joinSession(device.token, val);
+        let res;
+        try {
+          res = await joinSession(currentDevice.token, val);
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : '';
+          if (msg.includes('Authentication') || msg.includes('token') || msg.includes('401')) {
+            const fresh = await handleAuthFailure();
+            if (fresh) {
+              currentDevice = fresh;
+              res = await joinSession(fresh.token, val);
+            } else {
+              throw err;
+            }
+          } else {
+            throw err;
+          }
+        }
+
         const sess: SessionInfo = {
           session_id: res.session_id,
           pairing_code: val,
@@ -208,12 +263,12 @@ export function App() {
           const payload = (msg as { payload: { files: FileInfo[]; total_size: number } }).payload;
           setIncomingFiles(payload.files);
           setIncomingTotalSize(payload.total_size);
-          updateSessionState(device.token, sess.session_id, 'AWAITING_APPROVAL');
+          updateSessionState(currentDevice!.token, sess.session_id, 'AWAITING_APPROVAL');
         });
 
         sig.on('signal', (msg: unknown) => {
           const signalMsg = msg as { from: string; payload: { signal_type: string; data: unknown } };
-          if (signalMsg.from !== device?.device_id && rtcRef.current) {
+          if (signalMsg.from !== currentDevice?.device_id && rtcRef.current) {
             rtcRef.current.handleSignal(signalMsg.payload);
           }
         });
@@ -223,7 +278,7 @@ export function App() {
           goHome();
         });
 
-        sig.connect(sess.session_id, device.token);
+        sig.connect(sess.session_id, currentDevice.token);
       } catch (e: unknown) {
         setError(e instanceof Error ? e.message : 'Join session error');
       }
