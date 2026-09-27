@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { createSession, joinSession, updateSessionState } from '../services/api';
+import { createSession, getSession, joinSession, updateSessionState } from '../services/api';
 import { getOrCreateDevice } from '../services/device';
 import { formatBytes, formatEta, formatSpeed } from '../services/format';
 import { SignalingClient } from '../services/signaling';
@@ -32,6 +32,23 @@ export function App() {
       .catch((e: unknown) => setError(e instanceof Error ? e.message : 'Device init error'));
   }, []);
 
+  // Poll for peer info if waiting on send screen
+  useEffect(() => {
+    if (screen === 'send' && session && device && !peerDevice) {
+      const interval = setInterval(async () => {
+        try {
+          const details = await getSession(device.token, session.session_id);
+          if (details.receiver) {
+            setPeerDevice(details.receiver);
+          }
+        } catch {
+          // ignore polling errors
+        }
+      }, 1500);
+      return () => clearInterval(interval);
+    }
+  }, [screen, session, device, peerDevice]);
+
   const goHome = () => {
     if (sigRef.current) sigRef.current.disconnect();
     if (rtcRef.current) rtcRef.current.close();
@@ -51,6 +68,7 @@ export function App() {
   const startSending = async () => {
     if (!device) return;
     try {
+      setError(null);
       setRole('sender');
       const res = await createSession(device.token);
       const sess: SessionInfo = {
@@ -160,6 +178,7 @@ export function App() {
 
   // Receiver flow
   const startReceiving = () => {
+    setError(null);
     setRole('receiver');
     setScreen('receive');
   };
@@ -167,6 +186,7 @@ export function App() {
   const handlePairingCodeChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const val = e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 6);
     setPairingInput(val);
+    setError(null);
 
     if (val.length === 6 && device) {
       try {

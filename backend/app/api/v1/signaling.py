@@ -47,17 +47,22 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str, token: str =
         
     active_connections[session_id][device_id] = websocket
     
-    # Notify peer if present
-    for other_device_id, other_ws in active_connections[session_id].items():
+    # Notify peer and self if existing peers are present
+    for other_device_id, other_ws in list(active_connections[session_id].items()):
         if other_device_id != device_id:
             try:
-                # get my display name to notify peer
                 async for db in get_db_session():
                     my_stmt = select(Device).where(Device.id == uuid.UUID(device_id))
                     me = (await db.execute(my_stmt)).scalars().first()
                     display_name = me.display_name if me else "Peer"
+
+                    other_stmt = select(Device).where(Device.id == uuid.UUID(other_device_id))
+                    other = (await db.execute(other_stmt)).scalars().first()
+                    other_display_name = other.display_name if other else "Peer"
                     break
+
                 await other_ws.send_json({"type": "peer_joined", "payload": {"device_id": device_id, "display_name": display_name}})
+                await websocket.send_json({"type": "peer_joined", "payload": {"device_id": other_device_id, "display_name": other_display_name}})
             except Exception:
                 pass
     
