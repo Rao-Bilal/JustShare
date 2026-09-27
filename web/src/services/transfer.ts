@@ -200,6 +200,7 @@ export class FileReceiver {
             this.totalFiles = msg.totalFiles;
             this.totalBytes = msg.totalSize;
             this.startTime = Date.now();
+            this.updateProgress('receiving');
             break;
             
           case 'FILE_START':
@@ -211,6 +212,7 @@ export class FileReceiver {
               received: 0
             });
             this.currentFileName = msg.name;
+            this.updateProgress('receiving');
             break;
             
           case 'FILE_END':
@@ -246,7 +248,7 @@ export class FileReceiver {
           fileInfo.received += chunkData.byteLength;
           this.totalReceived += chunkData.byteLength;
           
-          if (header.index % 10 === 0) {
+          if (header.index % 10 === 0 || fileInfo.received >= fileInfo.size) {
             this.updateProgress('receiving');
           }
         }

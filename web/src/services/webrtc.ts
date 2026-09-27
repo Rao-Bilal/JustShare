@@ -4,7 +4,8 @@ export class WebRTCConnection {
   private pc: RTCPeerConnection;
   private dataChannel: RTCDataChannel | null = null;
   private signaling: SignalingClient;
-  public onDataChannel: ((dc: RTCDataChannel) => void) | null = null;
+  private pendingCandidates: RTCIceCandidateInit[] = [];
+  private _onDataChannel: ((dc: RTCDataChannel) => void) | null = null;
   public onConnectionStateChange: ((state: string) => void) | null = null;
 
   constructor(signaling: SignalingClient, isSender: boolean) {
@@ -13,6 +14,8 @@ export class WebRTCConnection {
       iceServers: [
         { urls: 'stun:stun.l.google.com:19302' },
         { urls: 'stun:stun1.l.google.com:19302' },
+        { urls: 'stun:stun2.l.google.com:19302' },
+        { urls: 'stun:stun.services.mozilla.com' },
       ],
     });
 
@@ -38,17 +41,27 @@ export class WebRTCConnection {
       this.dataChannel = this.pc.createDataChannel('file-transfer', {
         ordered: true,
       });
-      if (this.onDataChannel) {
-        this.onDataChannel(this.dataChannel);
-      }
+      this.dataChannel.binaryType = 'arraybuffer';
     } else {
       this.pc.ondatachannel = (event) => {
         this.dataChannel = event.channel;
-        if (this.onDataChannel) {
-          this.onDataChannel(this.dataChannel);
+        this.dataChannel.binaryType = 'arraybuffer';
+        if (this._onDataChannel) {
+          this._onDataChannel(this.dataChannel);
         }
       };
     }
+  }
+
+  set onDataChannel(cb: ((dc: RTCDataChannel) => void) | null) {
+    this._onDataChannel = cb;
+    if (cb && this.dataChannel) {
+      cb(this.dataChannel);
+    }
+  }
+
+  get onDataChannel(): ((dc: RTCDataChannel) => void) | null {
+    return this._onDataChannel;
   }
 
   async createOffer(): Promise<void> {
@@ -75,10 +88,37 @@ export class WebRTCConnection {
           data: answer,
         },
       });
+      await this.flushPendingCandidates();
     } else if (signal.signal_type === 'answer') {
       await this.pc.setRemoteDescription(new RTCSessionDescription(signal.data as RTCSessionDescriptionInit));
+      await this.flushPendingCandidates();
     } else if (signal.signal_type === 'ice-candidate') {
-      await this.pc.addIceCandidate(new RTCIceCandidate(signal.data as RTCIceCandidateInit));
+      const candidate = signal.data as RTCIceCandidateInit;
+      if (!candidate || (!candidate.candidate && candidate.sdpMid === undefined)) {
+        return;
+      }
+      if (this.pc.remoteDescription && this.pc.remoteDescription.type) {
+        try {
+          await this.pc.addIceCandidate(candidate);
+        } catch {
+          // ignore candidate error
+        }
+      } else {
+        this.pendingCandidates.push(candidate);
+      }
+    }
+  }
+
+  private async flushPendingCandidates(): Promise<void> {
+    while (this.pendingCandidates.length > 0) {
+      const candidate = this.pendingCandidates.shift();
+      if (candidate) {
+        try {
+          await this.pc.addIceCandidate(candidate);
+        } catch {
+          // ignore candidate error
+        }
+      }
     }
   }
 

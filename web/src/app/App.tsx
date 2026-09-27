@@ -194,7 +194,7 @@ export function App() {
 
     const dc = rtc.getDataChannel();
     if (dc) {
-      dc.onopen = () => {
+      const runSender = () => {
         const sender = new FileSender(dc, selectedFiles);
         senderRef.current = sender;
         sender.onProgress = setTransferProgress;
@@ -205,6 +205,12 @@ export function App() {
         };
         sender.start();
       };
+
+      if (dc.readyState === 'open') {
+        runSender();
+      } else {
+        dc.onopen = runSender;
+      }
     }
 
     rtc.createOffer();
