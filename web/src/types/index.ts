@@ -23,6 +23,98 @@ export interface SessionInfo {
   receiver?: DeviceInfo;
 }
 
+export interface ManifestFileEntry {
+  id: string;
+  name: string;
+  size: number;
+  mimeType: string;
+  relativePath?: string;
+  totalChunks: number;
+  sha256: string;
+}
+
+export interface TransferManifest {
+  transferId: string;
+  totalFiles: number;
+  totalSize: number;
+  files: ManifestFileEntry[];
+}
+
+export type TransferMessageType =
+  | 'TRANSFER_START'
+  | 'FILE_START'
+  | 'FILE_END'
+  | 'FILE_ACK'
+  | 'TRANSFER_END'
+  | 'CANCEL'
+  | 'ERROR';
+
+export interface TransferStartMessage {
+  type: 'TRANSFER_START';
+  transferId: string;
+  manifest: TransferManifest;
+}
+
+export interface FileStartMessage {
+  type: 'FILE_START';
+  transferId: string;
+  fileId: string;
+  name: string;
+  size: number;
+  chunkSize: number;
+  totalChunks: number;
+  sha256: string;
+}
+
+export interface FileEndMessage {
+  type: 'FILE_END';
+  transferId: string;
+  fileId: string;
+}
+
+export interface FileAckMessage {
+  type: 'FILE_ACK';
+  transferId: string;
+  fileId: string;
+  sha256Match: boolean;
+  error?: string;
+}
+
+export interface TransferEndMessage {
+  type: 'TRANSFER_END';
+  transferId: string;
+}
+
+export interface TransferCancelMessage {
+  type: 'CANCEL';
+  transferId?: string;
+  reason: string;
+}
+
+export interface TransferErrorMessage {
+  type: 'ERROR';
+  transferId?: string;
+  code: string;
+  message: string;
+}
+
+export interface ChunkHeader {
+  transferId: string;
+  fileId: string;
+  index: number;
+  totalChunks: number;
+  byteLength: number;
+}
+
+export interface AssembledFile {
+  id: string;
+  name: string;
+  size: number;
+  blob: Blob;
+  verified: boolean;
+  sha256: string;
+}
+
 export interface TransferProgress {
   currentFile: string;
   currentFileIndex: number;
