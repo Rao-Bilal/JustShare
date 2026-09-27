@@ -283,7 +283,10 @@ export function App() {
 
         const dc = rtc.getDataChannel();
         if (dc) {
+          let recoveryStarted = false;
           const onDcOpen = async () => {
+            if (recoveryStarted) return;
+            recoveryStarted = true;
             console.log('[RECOVERY][SEND] Reconnected DataChannel open, resuming FileSender');
             isReconnectingRef.current = false;
             reconnectAttemptsRef.current = 0;
@@ -296,8 +299,7 @@ export function App() {
           if (dc.readyState === 'open') {
             onDcOpen();
           } else {
-            dc.onopen = onDcOpen;
-            dc.addEventListener('open', onDcOpen);
+            dc.addEventListener('open', onDcOpen, { once: true });
           }
         }
 
@@ -381,7 +383,10 @@ export function App() {
 
       const dc = rtc.getDataChannel();
       if (dc) {
+        let senderStarted = false;
         const runSender = () => {
+          if (senderStarted) return;
+          senderStarted = true;
           console.log('[TRANSFER][SEND] DataChannel open, starting FileSender');
           updateSessionState(curDevice.token, curSession.session_id, 'TRANSFERRING').catch((err) => {
             console.error('[TRANSFER][SEND] Failed to update state to TRANSFERRING', err);
@@ -404,8 +409,7 @@ export function App() {
         if (dc.readyState === 'open') {
           runSender();
         } else {
-          dc.onopen = runSender;
-          dc.addEventListener('open', runSender);
+          dc.addEventListener('open', runSender, { once: true });
         }
       }
 
