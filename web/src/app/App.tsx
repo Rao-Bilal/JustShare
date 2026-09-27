@@ -210,6 +210,125 @@ export function App() {
     setScreen('send');
   };
 
+  const reconnectAttemptsRef = useRef<number>(0);
+  const isReconnectingRef = useRef<boolean>(false);
+  const MAX_RECONNECT_ATTEMPTS = 5;
+
+  const handleConnectionDrop = async () => {
+    const curSession = sessionRef.current;
+    const curDevice = deviceRef.current;
+    const curSig = sigRef.current;
+
+    if (!curSession || !curDevice || !curSig || screen !== 'transfer') {
+      return;
+    }
+
+    if (isReconnectingRef.current) {
+      console.log('[RECOVERY] Reconnection already in progress');
+      return;
+    }
+
+    if (reconnectAttemptsRef.current >= MAX_RECONNECT_ATTEMPTS) {
+      console.error('[RECOVERY] Max reconnect attempts exceeded');
+      setError('Connection lost: could not recover after maximum retries');
+      setScreen('failed');
+      if (curDevice && curSession) {
+        updateSessionState(curDevice.token, curSession.session_id, 'FAILED').catch(() => {});
+      }
+      return;
+    }
+
+    isReconnectingRef.current = true;
+    reconnectAttemptsRef.current += 1;
+    console.log(`[RECOVERY] Attempting reconnection (${reconnectAttemptsRef.current}/${MAX_RECONNECT_ATTEMPTS})`);
+
+    setTransferProgress((prev) =>
+      prev ? { ...prev, state: 'reconnecting' } : null
+    );
+
+    try {
+      if (senderRef.current) {
+        senderRef.current.pause();
+        await updateSessionState(curDevice.token, curSession.session_id, 'PAUSED').catch(() => {});
+
+        // Recreate WebRTC Sender
+        if (rtcRef.current) {
+          rtcRef.current.close();
+        }
+        const rtc = new WebRTCConnection(curSig, true);
+        rtcRef.current = rtc;
+
+        curSig.on('signal', (msg: unknown) => {
+          const signalMsg = msg as { from: string; payload: { signal_type: string; data: unknown } };
+          if (signalMsg.from !== curDevice.device_id) {
+            rtc.handleSignal(signalMsg.payload);
+          }
+        });
+
+        rtc.onConnectionStateChange = (state) => {
+          if (state === 'failed' || state === 'disconnected') {
+            handleConnectionDrop();
+          }
+        };
+
+        const dc = rtc.getDataChannel();
+        if (dc) {
+          const onDcOpen = async () => {
+            console.log('[RECOVERY][SEND] Reconnected DataChannel open, resuming FileSender');
+            isReconnectingRef.current = false;
+            reconnectAttemptsRef.current = 0;
+            await updateSessionState(curDevice.token, curSession.session_id, 'TRANSFERRING').catch(() => {});
+            if (senderRef.current) {
+              senderRef.current.resume(dc);
+            }
+          };
+
+          if (dc.readyState === 'open') {
+            onDcOpen();
+          } else {
+            dc.onopen = onDcOpen;
+            dc.addEventListener('open', onDcOpen);
+          }
+        }
+
+        await rtc.createOffer();
+      } else if (receiverRef.current) {
+        // Receiver waiting for new DataChannel
+        if (rtcRef.current) {
+          rtcRef.current.close();
+        }
+        const rtc = new WebRTCConnection(curSig, false);
+        rtcRef.current = rtc;
+
+        curSig.on('signal', (msg: unknown) => {
+          const signalMsg = msg as { from: string; payload: { signal_type: string; data: unknown } };
+          if (signalMsg.from !== curDevice.device_id) {
+            rtc.handleSignal(signalMsg.payload);
+          }
+        });
+
+        rtc.onConnectionStateChange = (state) => {
+          if (state === 'failed' || state === 'disconnected') {
+            handleConnectionDrop();
+          }
+        };
+
+        rtc.onDataChannel = (dc) => {
+          console.log('[RECOVERY][RECEIVE] Reconnected DataChannel received, resuming FileReceiver');
+          isReconnectingRef.current = false;
+          reconnectAttemptsRef.current = 0;
+          if (receiverRef.current) {
+            receiverRef.current.resume(dc);
+          }
+        };
+      }
+    } catch (err) {
+      console.error('[RECOVERY] Reconnection attempt failed:', err);
+      isReconnectingRef.current = false;
+      setTimeout(() => handleConnectionDrop(), 2000);
+    }
+  };
+
   const startWebRTCSender = () => {
     const curSig = sigRef.current;
     const curSession = sessionRef.current;
@@ -245,8 +364,8 @@ export function App() {
 
       rtc.onConnectionStateChange = (state) => {
         if (state === 'failed' || state === 'disconnected') {
-          setError('Connection lost');
-          setScreen('failed');
+          console.warn(`[WEBRTC][SEND] Connection state ${state}, triggering recovery`);
+          handleConnectionDrop();
         }
       };
 
@@ -406,6 +525,13 @@ export function App() {
     const rtc = new WebRTCConnection(curSig, false);
     rtcRef.current = rtc;
     console.log('[TRANSFER][RECEIVE] WebRTC receiver connection created');
+
+    rtc.onConnectionStateChange = (state) => {
+      if (state === 'failed' || state === 'disconnected') {
+        console.warn(`[WEBRTC][RECEIVE] Connection state ${state}, triggering recovery`);
+        handleConnectionDrop();
+      }
+    };
 
     rtc.onDataChannel = (dc) => {
       console.log('[TRANSFER][RECEIVE] DataChannel received, starting FileReceiver');
@@ -663,7 +789,17 @@ export function App() {
       {/* Screen 4: Transfer (Progress) */}
       {screen === 'transfer' && (
         <section className="screen">
-          <h2>Transferring Files</h2>
+          <h2>
+            {transferProgress?.state === 'reconnecting'
+              ? 'Connection Interrupted — Reconnecting...'
+              : transferProgress?.state === 'resuming'
+              ? 'Resuming Transfer...'
+              : transferProgress?.state === 'paused'
+              ? 'Transfer Paused'
+              : transferProgress?.state === 'verifying'
+              ? 'Verifying File Integrity...'
+              : 'Transferring Files'}
+          </h2>
           <div className="progress-container">
             {transferProgress ? (
               <div>

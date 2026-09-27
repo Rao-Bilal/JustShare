@@ -390,4 +390,319 @@ describe('Phase 2A - Transfer Protocol & Validation', () => {
       expect(senderError).toContain('Timeout waiting for receiver ACK');
     });
   });
+
+  describe('Phase 2B - Resumable Transfer & Interruption Recovery', () => {
+    it('handles interruption and resume of a partially completed file', async () => {
+      // Create a 200 KB file (4 chunks of 64KB)
+      const data = new Uint8Array(200 * 1024);
+      for (let i = 0; i < data.length; i++) data[i] = (i * 7) % 256;
+      const file = new File([data], 'resume-single.bin');
+
+      const [senderDc1, receiverDc1] = createConnectedPair();
+      const sender = new FileSender(senderDc1 as unknown as RTCDataChannel, [file], {
+        transferId: 'tx-resume-1',
+        ackTimeoutMs: 500,
+        resumeTimeoutMs: 1000,
+      });
+      const receiver = new FileReceiver(receiverDc1 as unknown as RTCDataChannel, {
+        expectedTransferId: 'tx-resume-1',
+        stallTimeoutMs: 1000,
+      });
+
+      let chunksSent = 0;
+      // Drop connection after 2 chunks
+      const origSend = senderDc1.send.bind(senderDc1);
+      senderDc1.send = (d: string | ArrayBuffer) => {
+        origSend(d);
+        if (typeof d !== 'string') {
+          chunksSent++;
+          if (chunksSent === 2) {
+            // Close connection mid-transfer
+            senderDc1.close();
+            receiverDc1.close();
+          }
+        }
+      };
+
+      receiver.start();
+      try {
+        await sender.start();
+      } catch {
+        // Interrupted
+      }
+
+      // Reconnect with new DataChannels
+      const [senderDc2, receiverDc2] = createConnectedPair();
+      receiver.resume(receiverDc2 as unknown as RTCDataChannel);
+
+      const completePromise = new Promise<void>((resolve, reject) => {
+        receiver.onComplete = async (files) => {
+          try {
+            expect(files.length).toBe(1);
+            expect(files[0].verified).toBe(true);
+            const receivedBuffer = await files[0].blob.arrayBuffer();
+            expect(receivedBuffer.byteLength).toBe(200 * 1024);
+            resolve();
+          } catch (err) {
+            reject(err);
+          }
+        };
+        receiver.onError = (e) => reject(new Error(e));
+      });
+
+      await sender.resume(senderDc2 as unknown as RTCDataChannel);
+      await completePromise;
+    });
+
+    it('multi-file resume: skips completed files and resumes partially transferred files', async () => {
+      // File 1: small file (1 chunk), File 2: 200 KB (4 chunks), File 3: small file (1 chunk)
+      const file1 = new File(['Completed File 1 Content'], 'file1.txt');
+      const data2 = new Uint8Array(200 * 1024);
+      for (let i = 0; i < data2.length; i++) data2[i] = i % 256;
+      const file2 = new File([data2], 'file2.bin');
+      const file3 = new File(['Remaining File 3 Content'], 'file3.txt');
+
+      const [senderDc1, receiverDc1] = createConnectedPair();
+      const sender = new FileSender(senderDc1 as unknown as RTCDataChannel, [file1, file2, file3], {
+        transferId: 'tx-multi-resume',
+        ackTimeoutMs: 500,
+        resumeTimeoutMs: 1000,
+      });
+      const receiver = new FileReceiver(receiverDc1 as unknown as RTCDataChannel, {
+        expectedTransferId: 'tx-multi-resume',
+        stallTimeoutMs: 1000,
+      });
+
+      // Interrupt during file 2 after 1 chunk of file 2
+      let file2ChunksSent = 0;
+      const origSend = senderDc1.send.bind(senderDc1);
+      senderDc1.send = (d: string | ArrayBuffer) => {
+        origSend(d);
+        if (typeof d === 'string' && d.includes('FILE_START') && d.includes('file2.bin')) {
+          // File 2 started
+        } else if (typeof d !== 'string' && receiver.getAssembledFiles().length === 1) {
+          // Chunk of file 2
+          file2ChunksSent++;
+          if (file2ChunksSent === 1) {
+            senderDc1.close();
+            receiverDc1.close();
+          }
+        }
+      };
+
+      receiver.start();
+      try {
+        await sender.start();
+      } catch {
+        // Interrupted
+      }
+
+      expect(receiver.getAssembledFiles().length).toBe(1);
+      expect(receiver.getAssembledFiles()[0].name).toBe('file1.txt');
+
+      // Reconnect and resume
+      const [senderDc2, receiverDc2] = createConnectedPair();
+      receiver.resume(receiverDc2 as unknown as RTCDataChannel);
+
+      const completePromise = new Promise<void>((resolve, reject) => {
+        receiver.onComplete = async (files) => {
+          try {
+            expect(files.length).toBe(3);
+            expect(files[0].name).toBe('file1.txt');
+            expect(files[1].name).toBe('file2.bin');
+            expect(files[2].name).toBe('file3.txt');
+            expect(files.every((f) => f.verified)).toBe(true);
+            expect(await files[0].blob.text()).toBe('Completed File 1 Content');
+            expect(await files[2].blob.text()).toBe('Remaining File 3 Content');
+            resolve();
+          } catch (err) {
+            reject(err);
+          }
+        };
+        receiver.onError = (e) => reject(new Error(e));
+      });
+
+      await sender.resume(senderDc2 as unknown as RTCDataChannel);
+      await completePromise;
+    });
+
+    it('rejects resume when transfer ID mismatches (Fail Closed)', async () => {
+      const [senderDc1] = createConnectedPair();
+      const file = new File(['Content'], 'test.txt');
+      const sender = new FileSender(senderDc1 as unknown as RTCDataChannel, [file], {
+        transferId: 'tx-legit',
+        resumeTimeoutMs: 200,
+      });
+
+      // Start sender to compute manifest
+      const [sDc1, rDc1] = createConnectedPair();
+      const dummyReceiver = new FileReceiver(rDc1 as unknown as RTCDataChannel);
+      dummyReceiver.start();
+      sender.attachDataChannel(sDc1 as unknown as RTCDataChannel);
+      // calculate hashes
+      await sender.start();
+
+      // Attempt resume against receiver expecting different transfer ID
+      const [senderDc2, receiverDc2] = createConnectedPair();
+      const receiverWithDiffId = new FileReceiver(receiverDc2 as unknown as RTCDataChannel, {
+        expectedTransferId: 'tx-other-id',
+      });
+      receiverWithDiffId.start();
+
+      let senderError = '';
+      sender.onError = (e) => {
+        senderError = e;
+      };
+
+      await sender.resume(senderDc2 as unknown as RTCDataChannel);
+      expect(senderError).toContain('Resume rejected');
+    });
+
+    it('times out when resume response is never received', async () => {
+      const file = new File(['Content'], 'test.txt');
+      const [senderDc, receiverDc] = createConnectedPair();
+      const sender = new FileSender(senderDc as unknown as RTCDataChannel, [file], {
+        transferId: 'tx-timeout',
+        resumeTimeoutMs: 100,
+      });
+
+      // Initialize manifest
+      const dummyRec = new FileReceiver(receiverDc as unknown as RTCDataChannel);
+      dummyRec.start();
+      await sender.start();
+
+      // Resume on silent channel that drops RESUME_REQUEST
+      const [sDcSilent, rDcSilent] = createConnectedPair();
+      rDcSilent.send = () => {}; // do not respond
+
+      let senderError = '';
+      sender.onError = (e) => {
+        senderError = e;
+      };
+
+      await sender.resume(sDcSilent as unknown as RTCDataChannel);
+      expect(senderError).toContain('Timeout waiting for RESUME_RESPONSE');
+    });
+
+    it('handles duplicate chunks during retransmission without errors', async () => {
+      const data = new Uint8Array(150 * 1024); // 3 chunks
+      const file = new File([data], 'dup-resume.bin');
+
+      const [senderDc1, receiverDc1] = createConnectedPair();
+      const sender = new FileSender(senderDc1 as unknown as RTCDataChannel, [file], {
+        transferId: 'tx-dup-resume',
+        ackTimeoutMs: 500,
+        resumeTimeoutMs: 1000,
+      });
+      const receiver = new FileReceiver(receiverDc1 as unknown as RTCDataChannel, {
+        expectedTransferId: 'tx-dup-resume',
+        stallTimeoutMs: 1000,
+      });
+
+      let chunksSent = 0;
+      const origSend1 = senderDc1.send.bind(senderDc1);
+      senderDc1.send = (d: string | ArrayBuffer) => {
+        origSend1(d);
+        if (typeof d !== 'string') {
+          chunksSent++;
+          if (chunksSent === 1) {
+            senderDc1.close();
+            receiverDc1.close();
+          }
+        }
+      };
+
+      receiver.start();
+      try {
+        await sender.start();
+      } catch {
+        // expected interruption
+      }
+
+      // Intercept and duplicate retransmitted chunks on channel 2
+      const [senderDc2, receiverDc2] = createConnectedPair();
+      const origSend2 = senderDc2.send.bind(senderDc2);
+      senderDc2.send = (d: string | ArrayBuffer) => {
+        origSend2(d);
+        if (typeof d !== 'string') {
+          // Send duplicate chunk
+          origSend2(d);
+        }
+      };
+
+      const completePromise = new Promise<void>((resolve, reject) => {
+        receiver.onComplete = async (files) => {
+          try {
+            expect(files.length).toBe(1);
+            expect(files[0].verified).toBe(true);
+            resolve();
+          } catch (err) {
+            reject(err);
+          }
+        };
+        receiver.onError = (e) => reject(new Error(e));
+      });
+
+      receiver.resume(receiverDc2 as unknown as RTCDataChannel);
+      await sender.resume(senderDc2 as unknown as RTCDataChannel);
+      await completePromise;
+    });
+
+    it('fails integrity check if corrupted data is received during resume', async () => {
+      const file = new File(['Corrupted Resume Test Content with sufficient length for testing'], 'corrupt-resume.txt');
+      const [senderDc1, receiverDc1] = createConnectedPair();
+      const sender = new FileSender(senderDc1 as unknown as RTCDataChannel, [file], {
+        transferId: 'tx-corrupt-resume',
+        ackTimeoutMs: 500,
+        resumeTimeoutMs: 1000,
+      });
+      const receiver = new FileReceiver(receiverDc1 as unknown as RTCDataChannel, {
+        expectedTransferId: 'tx-corrupt-resume',
+        stallTimeoutMs: 1000,
+      });
+
+      // Interrupt immediately on channel 1
+      senderDc1.send = () => {
+        senderDc1.close();
+        receiverDc1.close();
+      };
+
+      receiver.start();
+      try {
+        await sender.start();
+      } catch {
+        // expected interruption
+      }
+
+      // Reconnect and corrupt binary chunks during resume
+      const [senderDc2, receiverDc2] = createConnectedPair();
+      receiver.resume(receiverDc2 as unknown as RTCDataChannel);
+
+      const origSend = senderDc2.send.bind(senderDc2);
+      senderDc2.send = (d: string | ArrayBuffer) => {
+        if (typeof d !== 'string') {
+          const u8 = new Uint8Array(d);
+          u8[u8.length - 1] ^= 0xff; // corrupt byte
+          origSend(u8.buffer);
+        } else {
+          origSend(d);
+        }
+      };
+
+      let receiverErr = '';
+      receiver.onError = (e) => {
+        receiverErr = e;
+      };
+
+      let senderErr = '';
+      sender.onError = (e) => {
+        senderErr = e;
+      };
+
+      await sender.resume(senderDc2 as unknown as RTCDataChannel);
+
+      expect(receiverErr).toContain('SHA-256 mismatch');
+      expect(senderErr).toContain('SHA-256 mismatch');
+    });
+  });
 });

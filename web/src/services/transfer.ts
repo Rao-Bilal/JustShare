@@ -5,6 +5,9 @@ import {
   FileEndMessage,
   FileStartMessage,
   ManifestFileEntry,
+  ResumeFileStatus,
+  ResumeRequestMessage,
+  ResumeResponseMessage,
   TransferCancelMessage,
   TransferEndMessage,
   TransferErrorMessage,
@@ -20,6 +23,7 @@ export const MAX_FILES_COUNT = 10000;
 export const MAX_FILENAME_LENGTH = 255;
 export const DEFAULT_ACK_TIMEOUT_MS = 30000; // 30s
 export const DEFAULT_STALL_TIMEOUT_MS = 30000; // 30s
+export const DEFAULT_RESUME_TIMEOUT_MS = 15000; // 15s
 export const BACKPRESSURE_HIGH_WATERMARK = 1024 * 1024; // 1 MB
 export const BACKPRESSURE_LOW_WATERMARK = 256 * 1024; // 256 KB
 
@@ -114,15 +118,30 @@ export function validateManifest(manifest: unknown): TransferManifest {
 }
 
 async function sendChunkWithBackpressure(dc: RTCDataChannel, data: ArrayBuffer): Promise<void> {
+  if (dc.readyState !== 'open') {
+    throw new Error('DataChannel is not open');
+  }
   if (dc.bufferedAmount > BACKPRESSURE_HIGH_WATERMARK) {
     dc.bufferedAmountLowThreshold = BACKPRESSURE_LOW_WATERMARK;
-    await new Promise<void>((resolve) => {
+    await new Promise<void>((resolve, reject) => {
       const onLow = () => {
-        dc.removeEventListener('bufferedamountlow', onLow);
+        cleanup();
         resolve();
       };
+      const onClose = () => {
+        cleanup();
+        reject(new Error('DataChannel closed while waiting for buffer drain'));
+      };
+      const cleanup = () => {
+        dc.removeEventListener('bufferedamountlow', onLow);
+        dc.removeEventListener('close', onClose);
+      };
       dc.addEventListener('bufferedamountlow', onLow);
+      dc.addEventListener('close', onClose);
     });
+  }
+  if (dc.readyState !== 'open') {
+    throw new Error('DataChannel closed before sending');
   }
   dc.send(data);
 }
@@ -131,6 +150,7 @@ export interface SenderOptions {
   transferId?: string;
   chunkSize?: number;
   ackTimeoutMs?: number;
+  resumeTimeoutMs?: number;
 }
 
 export class FileSender {
@@ -138,12 +158,14 @@ export class FileSender {
   private files: File[];
   private transferId: string;
   private ackTimeoutMs: number;
+  private resumeTimeoutMs: number;
   private hashes: Map<string, string> = new Map();
   private manifest: TransferManifest | null = null;
   public onProgress: ((progress: TransferProgress) => void) | null = null;
   public onComplete: (() => void) | null = null;
   public onError: ((error: string) => void) | null = null;
   private cancelled = false;
+  private isPaused = false;
 
   private totalBytes = 0;
   private bytesTransferred = 0;
@@ -154,21 +176,44 @@ export class FileSender {
     this.files = files;
     this.transferId = options?.transferId || (typeof crypto.randomUUID === 'function' ? crypto.randomUUID() : `tx_${Date.now()}`);
     this.ackTimeoutMs = options?.ackTimeoutMs || DEFAULT_ACK_TIMEOUT_MS;
+    this.resumeTimeoutMs = options?.resumeTimeoutMs || DEFAULT_RESUME_TIMEOUT_MS;
 
     for (const f of files) {
       this.totalBytes += f.size;
     }
   }
 
+  getTransferId(): string {
+    return this.transferId;
+  }
+
+  getManifest(): TransferManifest | null {
+    return this.manifest;
+  }
+
+  attachDataChannel(newDc: RTCDataChannel): void {
+    console.log('[TRANSFER][SEND] Attaching new DataChannel to FileSender');
+    this.dc = newDc;
+  }
+
+  pause(): void {
+    console.log('[TRANSFER][SEND] Transfer paused');
+    this.isPaused = true;
+    if (this.onProgress && this.files.length > 0) {
+      this.updateProgress(0, 'paused');
+    }
+  }
+
   async start(): Promise<void> {
     this.startTime = Date.now();
+    this.isPaused = false;
     console.log('[TRANSFER][SEND] Calculating hashes before transfer start');
 
     try {
       const manifestFiles: ManifestFileEntry[] = [];
 
       for (let i = 0; i < this.files.length; i++) {
-        if (this.cancelled) return;
+        if (this.cancelled || this.isPaused) return;
         const file = this.files[i];
         this.updateProgress(i, 'verifying');
 
@@ -187,7 +232,7 @@ export class FileSender {
         });
       }
 
-      if (this.cancelled) return;
+      if (this.cancelled || this.isPaused) return;
 
       this.manifest = validateManifest({
         transferId: this.transferId,
@@ -204,136 +249,267 @@ export class FileSender {
       };
       this.dc.send(JSON.stringify(startMsg));
 
-      for (let i = 0; i < this.files.length; i++) {
-        if (this.cancelled) return;
-
-        const file = this.files[i];
-        const manifestEntry = this.manifest.files[i];
-        const fileId = manifestEntry.id;
-        const hash = manifestEntry.sha256;
-        const totalChunks = manifestEntry.totalChunks;
-
-        this.updateProgress(i, 'sending');
-
-        console.log(`[TRANSFER][SEND] Sending FILE_START for file ${i + 1}/${this.files.length} (${file.name})`);
-        const fileStartMsg: FileStartMessage = {
-          type: 'FILE_START',
-          transferId: this.transferId,
-          fileId,
-          name: file.name,
-          size: file.size,
-          chunkSize: CHUNK_SIZE,
-          totalChunks,
-          sha256: hash,
-        };
-        this.dc.send(JSON.stringify(fileStartMsg));
-
-        // If file is empty (0 bytes), no chunks to send
-        if (totalChunks > 0) {
-          // Send chunks
-          for (let j = 0; j < totalChunks; j++) {
-            if (this.cancelled) return;
-
-            const start = j * CHUNK_SIZE;
-            const end = Math.min(start + CHUNK_SIZE, file.size);
-            const chunkBlob = file.slice(start, end);
-            const chunkData = await chunkBlob.arrayBuffer();
-
-            const header: ChunkHeader = {
-              transferId: this.transferId,
-              fileId,
-              index: j,
-              totalChunks,
-              byteLength: chunkData.byteLength,
-            };
-            const headerStr = JSON.stringify(header);
-            const headerBytes = new TextEncoder().encode(headerStr);
-
-            const payload = new Uint8Array(4 + headerBytes.length + chunkData.byteLength);
-
-            // 4 bytes uint32 BE header length
-            const view = new DataView(payload.buffer);
-            view.setUint32(0, headerBytes.length, false);
-
-            // header bytes
-            payload.set(headerBytes, 4);
-            // chunk data
-            payload.set(new Uint8Array(chunkData), 4 + headerBytes.length);
-
-            await sendChunkWithBackpressure(this.dc, payload.buffer);
-
-            this.bytesTransferred += chunkData.byteLength;
-
-            // Update progress every 10 chunks or on last chunk
-            if (j % 10 === 0 || j === totalChunks - 1) {
-              this.updateProgress(i, 'sending');
-            }
-          }
-        }
-
-        console.log(`[TRANSFER][SEND] Sending FILE_END for file ${i + 1} (${file.name})`);
-        const fileEndMsg: FileEndMessage = {
-          type: 'FILE_END',
-          transferId: this.transferId,
-          fileId,
-        };
-        this.dc.send(JSON.stringify(fileEndMsg));
-
-        // Wait for FILE_ACK with timeout
-        await new Promise<void>((resolve, reject) => {
-          const timer = setTimeout(() => {
-            this.dc.removeEventListener('message', handler);
-            reject(new Error(`Timeout waiting for receiver ACK for file ${file.name}`));
-          }, this.ackTimeoutMs);
-
-          const handler = (event: MessageEvent) => {
-            if (typeof event.data === 'string') {
-              try {
-                const msg = JSON.parse(event.data);
-                if (msg.type === 'FILE_ACK' && msg.fileId === fileId && msg.transferId === this.transferId) {
-                  console.log(`[TRANSFER][SEND] Received FILE_ACK (fileId=${fileId}, match=${msg.sha256Match})`);
-                  clearTimeout(timer);
-                  this.dc.removeEventListener('message', handler);
-                  if (!msg.sha256Match) {
-                    reject(new Error(`SHA-256 mismatch on receiver for file '${file.name}': ${msg.error || 'integrity check failed'}`));
-                  } else {
-                    resolve();
-                  }
-                } else if (msg.type === 'CANCEL') {
-                  console.log('[TRANSFER][SEND] Received CANCEL signal');
-                  clearTimeout(timer);
-                  this.dc.removeEventListener('message', handler);
-                  reject(new Error(`Transfer cancelled by receiver: ${msg.reason}`));
-                } else if (msg.type === 'ERROR') {
-                  console.error('[TRANSFER][SEND] Received ERROR signal', msg);
-                  clearTimeout(timer);
-                  this.dc.removeEventListener('message', handler);
-                  reject(new Error(`Transfer error from receiver: ${msg.message || msg.code}`));
-                }
-              } catch {
-                // ignore JSON parse errors on malformed messages
-              }
-            }
-          };
-          this.dc.addEventListener('message', handler);
-        });
-      }
-
-      if (this.cancelled) return;
-      console.log('[TRANSFER][SEND] Sending TRANSFER_END');
-      const transferEndMsg: TransferEndMessage = {
-        type: 'TRANSFER_END',
-        transferId: this.transferId,
-      };
-      this.dc.send(JSON.stringify(transferEndMsg));
-      if (this.onComplete) this.onComplete();
+      await this.transferFiles();
     } catch (err: unknown) {
       const errorMsg = err instanceof Error ? err.message : 'Unknown transfer error';
       console.error('[TRANSFER][SEND] Transfer failed:', errorMsg);
-      if (this.onError && !this.cancelled) {
+      if (this.onError && !this.cancelled && !this.isPaused) {
         this.onError(errorMsg);
       }
     }
+  }
+
+  async resume(newDc?: RTCDataChannel): Promise<void> {
+    if (newDc) {
+      this.attachDataChannel(newDc);
+    }
+    if (this.cancelled) return;
+    this.isPaused = false;
+
+    console.log(`[TRANSFER][SEND] Initiating resume handshake for transfer ${this.transferId}`);
+    if (this.onProgress && this.files.length > 0) {
+      this.updateProgress(0, 'resuming');
+    }
+
+    try {
+      if (!this.manifest) {
+        // If manifest was never computed, run fresh start
+        await this.start();
+        return;
+      }
+
+      const resumeReq: ResumeRequestMessage = {
+        type: 'RESUME_REQUEST',
+        transferId: this.transferId,
+        manifest: this.manifest,
+      };
+
+      this.dc.send(JSON.stringify(resumeReq));
+
+      const resumeResponse = await new Promise<ResumeResponseMessage>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          cleanup();
+          reject(new Error('Timeout waiting for RESUME_RESPONSE from receiver'));
+        }, this.resumeTimeoutMs);
+
+        const cleanup = () => {
+          clearTimeout(timer);
+          this.dc.removeEventListener('message', handler);
+          this.dc.removeEventListener('close', closeHandler);
+        };
+
+        const closeHandler = () => {
+          cleanup();
+          reject(new Error('DataChannel closed while waiting for RESUME_RESPONSE'));
+        };
+
+        const handler = (event: MessageEvent) => {
+          if (typeof event.data === 'string') {
+            try {
+              const msg = JSON.parse(event.data);
+              if (msg.type === 'RESUME_RESPONSE' && msg.transferId === this.transferId) {
+                console.log('[TRANSFER][SEND] Received RESUME_RESPONSE:', msg);
+                cleanup();
+                resolve(msg as ResumeResponseMessage);
+              } else if (msg.type === 'CANCEL') {
+                cleanup();
+                reject(new Error(`Transfer cancelled by receiver: ${msg.reason}`));
+              } else if (msg.type === 'ERROR') {
+                cleanup();
+                reject(new Error(`Receiver error: ${msg.message || msg.code}`));
+              }
+            } catch {
+              // ignore parse errors
+            }
+          }
+        };
+
+        this.dc.addEventListener('message', handler);
+        this.dc.addEventListener('close', closeHandler);
+      });
+
+      if (!resumeResponse.accepted) {
+        throw new Error(`Resume rejected by receiver: ${resumeResponse.error || 'unauthorized or mismatched transfer'}`);
+      }
+
+      const fileStatusMap = new Map<string, ResumeFileStatus>();
+      if (resumeResponse.files) {
+        for (const fileStatus of resumeResponse.files) {
+          fileStatusMap.set(fileStatus.fileId, fileStatus);
+        }
+      }
+
+      // Recalculate accurately bytesTransferred already acknowledged
+      let recomputedBytes = 0;
+      for (let i = 0; i < this.manifest.files.length; i++) {
+        const mFile = this.manifest.files[i];
+        const status = fileStatusMap.get(mFile.id);
+        if (status?.completed) {
+          recomputedBytes += mFile.size;
+        } else if (status) {
+          const missingCount = status.missingChunks.length;
+          const receivedCount = Math.max(0, mFile.totalChunks - missingCount);
+          const receivedBytesForFile = Math.min(mFile.size, receivedCount * CHUNK_SIZE);
+          recomputedBytes += receivedBytesForFile;
+        }
+      }
+      this.bytesTransferred = recomputedBytes;
+      console.log(`[TRANSFER][SEND] Resuming transfer at ${this.bytesTransferred}/${this.totalBytes} bytes`);
+
+      await this.transferFiles(fileStatusMap);
+    } catch (err: unknown) {
+      const errorMsg = err instanceof Error ? err.message : 'Resume failed';
+      console.error('[TRANSFER][SEND] Resume failed:', errorMsg);
+      if (this.onError && !this.cancelled && !this.isPaused) {
+        this.onError(errorMsg);
+      }
+    }
+  }
+
+  private async transferFiles(fileStatusMap?: Map<string, ResumeFileStatus>): Promise<void> {
+    if (!this.manifest) return;
+
+    for (let i = 0; i < this.files.length; i++) {
+      if (this.cancelled || this.isPaused) return;
+
+      const file = this.files[i];
+      const manifestEntry = this.manifest.files[i];
+      const fileId = manifestEntry.id;
+      const hash = manifestEntry.sha256;
+      const totalChunks = manifestEntry.totalChunks;
+
+      const fileStatus = fileStatusMap?.get(fileId);
+      if (fileStatus?.completed) {
+        console.log(`[TRANSFER][SEND] File '${file.name}' (${fileId}) already completed on receiver, skipping transmission`);
+        continue;
+      }
+
+      this.updateProgress(i, 'sending');
+
+      console.log(`[TRANSFER][SEND] Sending FILE_START for file ${i + 1}/${this.files.length} (${file.name})`);
+      const fileStartMsg: FileStartMessage = {
+        type: 'FILE_START',
+        transferId: this.transferId,
+        fileId,
+        name: file.name,
+        size: file.size,
+        chunkSize: CHUNK_SIZE,
+        totalChunks,
+        sha256: hash,
+      };
+      this.dc.send(JSON.stringify(fileStartMsg));
+
+      const chunksToSend = fileStatus
+        ? fileStatus.missingChunks
+        : Array.from({ length: totalChunks }, (_, idx) => idx);
+
+      console.log(`[TRANSFER][SEND] Transmitting ${chunksToSend.length}/${totalChunks} chunks for '${file.name}'`);
+
+      for (const j of chunksToSend) {
+        if (this.cancelled || this.isPaused) return;
+
+        const start = j * CHUNK_SIZE;
+        const end = Math.min(start + CHUNK_SIZE, file.size);
+        const chunkBlob = file.slice(start, end);
+        const chunkData = await chunkBlob.arrayBuffer();
+
+        const header: ChunkHeader = {
+          transferId: this.transferId,
+          fileId,
+          index: j,
+          totalChunks,
+          byteLength: chunkData.byteLength,
+        };
+        const headerStr = JSON.stringify(header);
+        const headerBytes = new TextEncoder().encode(headerStr);
+
+        const payload = new Uint8Array(4 + headerBytes.length + chunkData.byteLength);
+
+        // 4 bytes uint32 BE header length
+        const view = new DataView(payload.buffer);
+        view.setUint32(0, headerBytes.length, false);
+
+        // header bytes
+        payload.set(headerBytes, 4);
+        // chunk data
+        payload.set(new Uint8Array(chunkData), 4 + headerBytes.length);
+
+        await sendChunkWithBackpressure(this.dc, payload.buffer);
+
+        this.bytesTransferred += chunkData.byteLength;
+
+        // Update progress every 10 chunks or on last chunk
+        if (j % 10 === 0 || j === chunksToSend[chunksToSend.length - 1]) {
+          this.updateProgress(i, 'sending');
+        }
+      }
+
+      console.log(`[TRANSFER][SEND] Sending FILE_END for file ${i + 1} (${file.name})`);
+      const fileEndMsg: FileEndMessage = {
+        type: 'FILE_END',
+        transferId: this.transferId,
+        fileId,
+      };
+      this.dc.send(JSON.stringify(fileEndMsg));
+
+      // Wait for FILE_ACK with timeout
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          cleanup();
+          reject(new Error(`Timeout waiting for receiver ACK for file ${file.name}`));
+        }, this.ackTimeoutMs);
+
+        const cleanup = () => {
+          clearTimeout(timer);
+          this.dc.removeEventListener('message', handler);
+          this.dc.removeEventListener('close', closeHandler);
+        };
+
+        const closeHandler = () => {
+          cleanup();
+          reject(new Error(`DataChannel closed while waiting for receiver ACK for file ${file.name}`));
+        };
+
+        const handler = (event: MessageEvent) => {
+          if (typeof event.data === 'string') {
+            try {
+              const msg = JSON.parse(event.data);
+              if (msg.type === 'FILE_ACK' && msg.fileId === fileId && msg.transferId === this.transferId) {
+                console.log(`[TRANSFER][SEND] Received FILE_ACK (fileId=${fileId}, match=${msg.sha256Match})`);
+                cleanup();
+                if (!msg.sha256Match) {
+                  reject(new Error(`SHA-256 mismatch on receiver for file '${file.name}': ${msg.error || 'integrity check failed'}`));
+                } else {
+                  resolve();
+                }
+              } else if (msg.type === 'CANCEL') {
+                console.log('[TRANSFER][SEND] Received CANCEL signal');
+                cleanup();
+                reject(new Error(`Transfer cancelled by receiver: ${msg.reason}`));
+              } else if (msg.type === 'ERROR') {
+                console.error('[TRANSFER][SEND] Received ERROR signal', msg);
+                cleanup();
+                reject(new Error(`Transfer error from receiver: ${msg.message || msg.code}`));
+              }
+            } catch {
+              // ignore JSON parse errors on malformed messages
+            }
+          }
+        };
+
+        this.dc.addEventListener('message', handler);
+        this.dc.addEventListener('close', closeHandler);
+      });
+    }
+
+    if (this.cancelled || this.isPaused) return;
+    console.log('[TRANSFER][SEND] Sending TRANSFER_END');
+    const transferEndMsg: TransferEndMessage = {
+      type: 'TRANSFER_END',
+      transferId: this.transferId,
+    };
+    this.dc.send(JSON.stringify(transferEndMsg));
+    if (this.onComplete) this.onComplete();
   }
 
   cancel(reason: string): void {
@@ -356,15 +532,16 @@ export class FileSender {
   private updateProgress(fileIndex: number, state: TransferProgress['state']) {
     if (!this.onProgress) return;
 
-    const currentFile = this.files[fileIndex];
-    const percentage = this.totalBytes === 0 ? 100 : (this.bytesTransferred / this.totalBytes) * 100;
+    const currentFile = this.files[fileIndex] || this.files[0];
+    const currentName = currentFile ? currentFile.name : '';
+    const percentage = this.totalBytes === 0 ? 100 : Math.min(100, (this.bytesTransferred / this.totalBytes) * 100);
 
     const elapsed = (Date.now() - this.startTime) / 1000;
     const speed = elapsed > 0 ? this.bytesTransferred / elapsed : 0;
-    const eta = speed > 0 ? (this.totalBytes - this.bytesTransferred) / speed : 0;
+    const eta = speed > 0 ? Math.max(0, (this.totalBytes - this.bytesTransferred) / speed) : 0;
 
     this.onProgress({
-      currentFile: currentFile.name,
+      currentFile: currentName,
       currentFileIndex: fileIndex,
       totalFiles: this.files.length,
       bytesTransferred: this.bytesTransferred,
@@ -412,6 +589,7 @@ export class FileReceiver {
   private startTime = 0;
   private stallTimeoutMs: number;
   private stallTimer: ReturnType<typeof setTimeout> | null = null;
+  private messageListener: ((event: MessageEvent) => void) | null = null;
 
   constructor(dc: RTCDataChannel, options?: ReceiverOptions) {
     this.dc = dc;
@@ -420,10 +598,48 @@ export class FileReceiver {
     this.stallTimeoutMs = options?.stallTimeoutMs || DEFAULT_STALL_TIMEOUT_MS;
   }
 
-  start(): void {
-    this.resetStallTimer();
+  getTransferId(): string | null {
+    return this.activeTransferId;
+  }
 
-    this.dc.addEventListener('message', async (event) => {
+  getManifest(): TransferManifest | null {
+    return this.manifest;
+  }
+
+  getAssembledFiles(): AssembledFile[] {
+    return this.assembledFiles;
+  }
+
+  attachDataChannel(newDc: RTCDataChannel): void {
+    console.log('[TRANSFER][RECEIVE] Attaching new DataChannel to FileReceiver');
+    if (this.messageListener && this.dc) {
+      this.dc.removeEventListener('message', this.messageListener);
+    }
+    this.dc = newDc;
+    this.dc.binaryType = 'arraybuffer';
+    this.bindDataChannelEvents();
+  }
+
+  resume(newDc?: RTCDataChannel): void {
+    console.log('[TRANSFER][RECEIVE] FileReceiver resuming');
+    if (newDc) {
+      this.attachDataChannel(newDc);
+    }
+    this.resetStallTimer();
+    this.updateProgress('resuming');
+  }
+
+  start(): void {
+    this.bindDataChannelEvents();
+    this.resetStallTimer();
+  }
+
+  private bindDataChannelEvents(): void {
+    if (this.messageListener && this.dc) {
+      this.dc.removeEventListener('message', this.messageListener);
+    }
+
+    this.messageListener = async (event: MessageEvent) => {
       if (this.cancelled) return;
       this.resetStallTimer();
 
@@ -447,9 +663,98 @@ export class FileReceiver {
               break;
             }
 
+            case 'RESUME_REQUEST': {
+              const req = msg as ResumeRequestMessage;
+              console.log(`[TRANSFER][RECEIVE] Received RESUME_REQUEST for transfer ${req.transferId}`);
+
+              if (this.activeTransferId && req.transferId !== this.activeTransferId) {
+                console.warn(`[TRANSFER][RECEIVE] RESUME_REQUEST transferId mismatch (${req.transferId} vs ${this.activeTransferId})`);
+                const rejectResp: ResumeResponseMessage = {
+                  type: 'RESUME_RESPONSE',
+                  transferId: req.transferId,
+                  accepted: false,
+                  error: `Transfer ID mismatch: active is ${this.activeTransferId}`,
+                };
+                this.dc.send(JSON.stringify(rejectResp));
+                return;
+              }
+
+              if (!this.manifest && req.manifest) {
+                this.manifest = validateManifest(req.manifest);
+                this.activeTransferId = this.manifest.transferId;
+                this.totalFiles = this.manifest.totalFiles;
+                this.totalBytes = this.manifest.totalSize;
+              }
+
+              if (!this.activeTransferId) {
+                this.activeTransferId = req.transferId;
+              }
+
+              const fileStatuses: ResumeFileStatus[] = [];
+              if (this.manifest) {
+                for (const mFile of this.manifest.files) {
+                  const assembled = this.assembledFiles.find((af) => af.id === mFile.id);
+                  if (assembled && assembled.verified) {
+                    fileStatuses.push({
+                      fileId: mFile.id,
+                      completed: true,
+                      missingChunks: [],
+                    });
+                    continue;
+                  }
+
+                  const fileRecord = this.files.get(mFile.id);
+                  if (fileRecord && fileRecord.completed) {
+                    fileStatuses.push({
+                      fileId: mFile.id,
+                      completed: true,
+                      missingChunks: [],
+                    });
+                    continue;
+                  }
+
+                  if (fileRecord) {
+                    const missing: number[] = [];
+                    for (let idx = 0; idx < fileRecord.totalChunks; idx++) {
+                      if (!(fileRecord.chunks[idx] instanceof Uint8Array)) {
+                        missing.push(idx);
+                      }
+                    }
+                    fileStatuses.push({
+                      fileId: mFile.id,
+                      completed: false,
+                      missingChunks: missing,
+                    });
+                  } else {
+                    const missing: number[] = [];
+                    for (let idx = 0; idx < mFile.totalChunks; idx++) {
+                      missing.push(idx);
+                    }
+                    fileStatuses.push({
+                      fileId: mFile.id,
+                      completed: false,
+                      missingChunks: missing,
+                    });
+                  }
+                }
+              }
+
+              const acceptResp: ResumeResponseMessage = {
+                type: 'RESUME_RESPONSE',
+                transferId: this.activeTransferId,
+                accepted: true,
+                files: fileStatuses,
+              };
+
+              console.log('[TRANSFER][RECEIVE] Sending RESUME_RESPONSE:', acceptResp);
+              this.dc.send(JSON.stringify(acceptResp));
+              this.updateProgress('resuming');
+              break;
+            }
+
             case 'FILE_START': {
               if (!this.manifest || !this.activeTransferId) {
-                throw new Error('Received FILE_START before TRANSFER_START manifest');
+                throw new Error('Received FILE_START before TRANSFER_START manifest or RESUME_REQUEST');
               }
               if (msg.transferId !== this.activeTransferId) {
                 throw new Error(`FILE_START transferId mismatch (${msg.transferId} vs ${this.activeTransferId})`);
@@ -462,16 +767,18 @@ export class FileReceiver {
                 throw new Error(`FILE_START metadata mismatch for file '${manifestEntry.name}'`);
               }
 
-              this.files.set(msg.fileId, {
-                id: msg.fileId,
-                name: manifestEntry.name,
-                size: manifestEntry.size,
-                totalChunks: manifestEntry.totalChunks,
-                sha256: manifestEntry.sha256,
-                chunks: new Array(manifestEntry.totalChunks),
-                receivedBytes: 0,
-                completed: false,
-              });
+              if (!this.files.has(msg.fileId)) {
+                this.files.set(msg.fileId, {
+                  id: msg.fileId,
+                  name: manifestEntry.name,
+                  size: manifestEntry.size,
+                  totalChunks: manifestEntry.totalChunks,
+                  sha256: manifestEntry.sha256,
+                  chunks: new Array(manifestEntry.totalChunks),
+                  receivedBytes: 0,
+                  completed: false,
+                });
+              }
               this.currentFileName = manifestEntry.name;
               this.updateProgress('receiving');
               break;
@@ -551,7 +858,8 @@ export class FileReceiver {
           }
 
           if (fileRecord.completed) {
-            throw new Error(`Chunk rejected: file '${fileRecord.name}' already completed`);
+            console.log(`[TRANSFER][RECEIVE] Chunk received for already completed file ${fileRecord.name} - ignoring`);
+            return;
           }
 
           if (header.index < 0 || header.index >= fileRecord.totalChunks) {
@@ -584,13 +892,27 @@ export class FileReceiver {
           if (this.onError) this.onError(errorMsg);
         }
       }
-    });
+    };
+
+    this.dc.addEventListener('message', this.messageListener);
   }
 
   private async handleFileEnd(fileId: string) {
     const fileRecord = this.files.get(fileId);
     if (!fileRecord) {
       throw new Error(`FILE_END received for unknown file ID '${fileId}'`);
+    }
+
+    if (fileRecord.completed) {
+      console.log(`[TRANSFER][RECEIVE] File '${fileRecord.name}' already completed, acknowledging`);
+      const ackMsg: FileAckMessage = {
+        type: 'FILE_ACK',
+        transferId: this.activeTransferId || '',
+        fileId,
+        sha256Match: true,
+      };
+      this.dc.send(JSON.stringify(ackMsg));
+      return;
     }
 
     this.updateProgress('verifying');
@@ -713,11 +1035,11 @@ export class FileReceiver {
   private updateProgress(state: TransferProgress['state']) {
     if (!this.onProgress) return;
 
-    const percentage = this.totalBytes === 0 ? 100 : (this.totalReceivedBytes / this.totalBytes) * 100;
+    const percentage = this.totalBytes === 0 ? 100 : Math.min(100, (this.totalReceivedBytes / this.totalBytes) * 100);
 
     const elapsed = (Date.now() - this.startTime) / 1000;
     const speed = elapsed > 0 ? this.totalReceivedBytes / elapsed : 0;
-    const eta = speed > 0 ? (this.totalBytes - this.totalReceivedBytes) / speed : 0;
+    const eta = speed > 0 ? Math.max(0, (this.totalBytes - this.totalReceivedBytes) / speed) : 0;
 
     this.onProgress({
       currentFile: this.currentFileName,
@@ -732,3 +1054,4 @@ export class FileReceiver {
     });
   }
 }
+

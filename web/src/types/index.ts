@@ -1,6 +1,19 @@
 export type AppScreen = 'home' | 'send' | 'receive' | 'transfer' | 'completed' | 'failed' | 'cancelled';
 
-export type SessionState = 'WAITING_FOR_PEER' | 'PAIRED' | 'AWAITING_APPROVAL' | 'CONNECTING' | 'TRANSFERRING' | 'VERIFYING' | 'COMPLETED' | 'REJECTED' | 'CANCELLED' | 'FAILED' | 'EXPIRED';
+export type SessionState =
+  | 'WAITING_FOR_PEER'
+  | 'PAIRED'
+  | 'AWAITING_APPROVAL'
+  | 'CONNECTING'
+  | 'TRANSFERRING'
+  | 'PAUSED'
+  | 'RESUMING'
+  | 'VERIFYING'
+  | 'COMPLETED'
+  | 'REJECTED'
+  | 'CANCELLED'
+  | 'FAILED'
+  | 'EXPIRED';
 
 export interface DeviceInfo {
   device_id: string;
@@ -47,7 +60,9 @@ export type TransferMessageType =
   | 'FILE_ACK'
   | 'TRANSFER_END'
   | 'CANCEL'
-  | 'ERROR';
+  | 'ERROR'
+  | 'RESUME_REQUEST'
+  | 'RESUME_RESPONSE';
 
 export interface TransferStartMessage {
   type: 'TRANSFER_START';
@@ -98,6 +113,26 @@ export interface TransferErrorMessage {
   message: string;
 }
 
+export interface ResumeFileStatus {
+  fileId: string;
+  completed: boolean;
+  missingChunks: number[];
+}
+
+export interface ResumeRequestMessage {
+  type: 'RESUME_REQUEST';
+  transferId: string;
+  manifest?: TransferManifest;
+}
+
+export interface ResumeResponseMessage {
+  type: 'RESUME_RESPONSE';
+  transferId: string;
+  accepted: boolean;
+  error?: string;
+  files?: ResumeFileStatus[];
+}
+
 export interface ChunkHeader {
   transferId: string;
   fileId: string;
@@ -124,5 +159,5 @@ export interface TransferProgress {
   percentage: number;
   speed: number; // bytes per second
   eta: number; // seconds remaining
-  state: 'sending' | 'receiving' | 'verifying' | 'completed' | 'failed' | 'cancelled';
+  state: 'sending' | 'receiving' | 'paused' | 'reconnecting' | 'resuming' | 'verifying' | 'completed' | 'failed' | 'cancelled';
 }

@@ -1,15 +1,15 @@
-# JustShare Transfer Protocol (Phase 2A Specification)
+# JustShare Transfer Protocol (Phase 2A & 2B Specification)
 
 ## Overview
 
-The JustShare Transfer Protocol is a binary-and-JSON framing protocol designed for secure, verifiable, high-throughput peer-to-peer file transfer over WebRTC `RTCDataChannel`.
+The JustShare Transfer Protocol is a binary-and-JSON framing protocol designed for secure, verifiable, high-throughput, and interrupt-resilient peer-to-peer file transfer over WebRTC `RTCDataChannel`.
 
 ---
 
 ## 1. Protocol Message Framing
 
 The protocol utilizes two types of transmissions over the data channel:
-1. **Control Messages (JSON UTF-8 strings)**: Used for transfer orchestration, manifests, per-file handshakes, acknowledgments, errors, and cancellation.
+1. **Control Messages (JSON UTF-8 strings)**: Used for transfer orchestration, manifests, per-file handshakes, acknowledgments, errors, cancellation, and resume negotiation.
 2. **Chunk Packets (Binary ArrayBuffer)**: Used for streaming raw payload data with framing metadata.
 
 ### Chunk Packet Binary Layout
@@ -62,7 +62,7 @@ Sent by the Sender to initialize a transfer session and deliver the validated `T
 ```
 
 ### 2.2 `FILE_START`
-Sent by the Sender prior to streaming chunks for a specific file.
+Sent by the Sender prior to streaming chunks for a specific file (both in initial transfer and during resume).
 
 ```json
 {
@@ -78,7 +78,7 @@ Sent by the Sender prior to streaming chunks for a specific file.
 ```
 
 ### 2.3 `FILE_END`
-Sent by the Sender after all chunks for the file have been transmitted.
+Sent by the Sender after all planned chunks for the file have been transmitted.
 
 ```json
 {
@@ -89,7 +89,7 @@ Sent by the Sender after all chunks for the file have been transmitted.
 ```
 
 ### 2.4 `FILE_ACK`
-Sent by the Receiver after computing SHA-256 over all received chunks and validating against the manifest hash.
+Sent by the Receiver after computing SHA-256 over all assembled chunks and validating against the manifest hash.
 
 ```json
 {
@@ -100,7 +100,46 @@ Sent by the Receiver after computing SHA-256 over all received chunks and valida
 }
 ```
 
-### 2.5 `TRANSFER_END`
+### 2.5 `RESUME_REQUEST` (Phase 2B)
+Sent by the Sender across a re-established DataChannel to initiate the resume handshake.
+
+```json
+{
+  "type": "RESUME_REQUEST",
+  "transferId": "550e8400-e29b-41d4-a716-446655440000",
+  "manifest": {
+    "transferId": "550e8400-e29b-41d4-a716-446655440000",
+    "totalFiles": 2,
+    "totalSize": 1048576,
+    "files": [...]
+  }
+}
+```
+
+### 2.6 `RESUME_RESPONSE` (Phase 2B)
+Sent by the Receiver in response to `RESUME_REQUEST`, authoritatively reporting the verification status and missing chunk indexes for every file in the manifest.
+
+```json
+{
+  "type": "RESUME_RESPONSE",
+  "transferId": "550e8400-e29b-41d4-a716-446655440000",
+  "accepted": true,
+  "files": [
+    {
+      "fileId": "file_0_1790535152388_0ifw0",
+      "completed": true,
+      "missingChunks": []
+    },
+    {
+      "fileId": "file_1_1790535152388_1abc0",
+      "completed": false,
+      "missingChunks": [10, 11, 15]
+    }
+  ]
+}
+```
+
+### 2.7 `TRANSFER_END`
 Sent by the Sender once all files in the manifest have been acknowledged by the Receiver.
 
 ```json
@@ -110,7 +149,7 @@ Sent by the Sender once all files in the manifest have been acknowledged by the 
 }
 ```
 
-### 2.6 `CANCEL`
+### 2.8 `CANCEL`
 Sent by either peer to immediately abort the transfer.
 
 ```json
@@ -121,7 +160,7 @@ Sent by either peer to immediately abort the transfer.
 }
 ```
 
-### 2.7 `ERROR`
+### 2.9 `ERROR`
 Sent by either peer upon encountering a protocol, manifest, or chunk error.
 
 ```json
@@ -135,33 +174,68 @@ Sent by either peer upon encountering a protocol, manifest, or chunk error.
 
 ---
 
-## 3. Validation Rules
+## 3. Resume & Interruption Protocol (Phase 2B)
 
-### 3.1 Filename & Path Traversal Protection
-- Filenames cannot exceed 255 characters.
-- Must not contain `..`, `/`, `\`, null bytes `\0`, or control characters.
+### 3.1 Resume Handshake Lifecycle
 
-### 3.2 Manifest Validation
-- `transferId`: Non-empty string.
-- `totalFiles`: Matches `files.length` and must be between 1 and 10,000.
-- `totalSize`: Exactly matches the sum of all `file.size` values.
-- `file.id`: Unique across all files in the manifest.
-- `file.totalChunks`: Must match $\lceil \text{size} / 65536 \rceil$ (0 for 0-byte files).
-- `file.sha256`: 64-character hexadecimal SHA-256 string.
+```
+Sender                                              Receiver
+  |                                                     |
+  |--- [Connection Dropped / WebRTC Reconnected] ------>|
+  |                                                     |
+  |--- RESUME_REQUEST (transferId, manifest) ---------->|
+  |                                                     |
+  |                                        [Receiver Checks Status]
+  |                                        - completed files: verified
+  |                                        - in-progress: inspect chunks[]
+  |                                        - not started: all missing
+  |                                                     |
+  |<-- RESUME_RESPONSE (accepted, files: missingChunks)-|
+  |                                                     |
+  |[Sender Skips Completed Files]                       |
+  |[Sender Iterates Incomplete Files]                   |
+  |--- FILE_START (file metadata) --------------------->|
+  |--- Chunk Packets (ONLY missing chunks) ------------>|
+  |--- FILE_END --------------------------------------->|
+  |                                                     |
+  |                                        [Receiver Validates All Chunks]
+  |                                        [Receiver Computes SHA-256 Hash]
+  |<-- FILE_ACK (sha256Match: true) --------------------|
+  |                                                     |
+  |--- TRANSFER_END ----------------------------------->|
+  |                                                     |
+```
 
-### 3.3 Chunk Validation
-- `transferId` must match the active session.
-- `fileId` must exist in the active manifest.
-- `index` must satisfy $0 \le \text{index} < \text{totalChunks}$.
-- Payload bytes must not exceed 65,536 bytes.
+### 3.2 Authoritative Receiver Progress
+The Receiver is the sole authority regarding what data it possesses:
+- **Completed Files**: Files already verified with SHA-256 are stored in `assembledFiles` and reported as `completed: true, missingChunks: []`.
+- **In-Progress Files**: The receiver iterates the pre-allocated `chunks` array (`chunks[idx] instanceof Uint8Array`), collecting all unset indices into `missingChunks: number[]`.
+- **Unstarted Files**: All chunk indices `0 .. totalChunks - 1` are marked missing.
+
+### 3.3 Missing Chunk Retransmission
+- The Sender skips any file with `completed: true`.
+- For incomplete files, the Sender only slices and transmits chunks whose indices appear in `missingChunks`.
+- The Receiver places retransmitted chunks directly into their indexed slots.
+- Duplicate chunks received during retransmission are safely and idempotently ignored.
+
+### 3.4 Strict Integrity Enforcement
+- No file is acknowledged or assembled without passing full cryptographic SHA-256 verification over all assembled chunks.
+- If corrupted data is received during resume, verification fails (`FILE_ACK` with `sha256Match: false`), the transfer fails closed, and no unverified data is presented to the user.
 
 ---
 
-## 4. Reliability & Edge Cases
+## 4. Reconnect & Timeout Policies
 
-1. **Duplicate Chunks**: Idempotently ignored without double-counting received bytes.
-2. **Out-of-Order Chunks**: Placed in indexed slots in a pre-allocated chunk array bounded by `totalChunks`.
-3. **Empty (0-Byte) Files**: Handled with `totalChunks: 0`, expected SHA-256 hash `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`.
-4. **Backpressure**: Monitored with `bufferedAmountLowThreshold` (256 KB) and high watermark (1 MB) to prevent browser memory exhaustion.
-5. **Timeouts**: 30-second ACK timeout on `FILE_ACK` and 30-second stall timeout between chunk activity.
-6. **Cancellation**: Deterministic state teardown, timer clearing, and peer notification.
+1. **Reconnection Limits**: Up to 5 consecutive reconnection attempts are permitted before failing permanently.
+2. **Resume Handshake Timeout**: `DEFAULT_RESUME_TIMEOUT_MS = 15000` (15s). If unacknowledged, the attempt is aborted.
+3. **ACK Timeout**: `DEFAULT_ACK_TIMEOUT_MS = 30000` (30s) per file.
+4. **Stall Timeout**: `DEFAULT_STALL_TIMEOUT_MS = 30000` (30s) of silence on the Receiver triggers timeout error.
+5. **Fail-Closed Authorization**: If a peer presents an unknown `transferId` or mismatched manifest during resume, the request is immediately rejected (`accepted: false`) without leaking existing session data.
+
+---
+
+## 5. Storage & Persistence Guarantees
+
+- **In-Session Resume Guarantee**: Recovers seamlessly from temporary network drops, ICE restarts, WebRTC DataChannel re-connections, and peer reconnects as long as the browser tab remains open.
+- **Browser Reload Limitation**: In-memory chunk arrays exist in RAM. Closing or hard-refreshing the browser tab discards active memory buffers. Durable multi-gigabyte cross-session persistence across browser restarts will be provided in a future storage engine phase (using OPFS / IndexedDB).
+
