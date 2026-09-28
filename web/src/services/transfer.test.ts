@@ -792,5 +792,179 @@ describe('Phase 2A - Transfer Protocol & Validation', () => {
       await sender.start();
       await completePromise;
     });
+
+    it('receiver does not time out while waiting for slow sender manifest calculation (manifestTimeout)', async () => {
+      const file = new File(['Manifest wait content'], 'manifest-wait.txt');
+      const [senderDc, receiverDc] = createConnectedPair();
+
+      // Receiver configured with short data stall timeout (100ms) but longer manifest timeout (400ms)
+      const receiver = new FileReceiver(receiverDc as unknown as RTCDataChannel, {
+        stallTimeoutMs: 100,
+        manifestTimeoutMs: 400,
+      });
+
+      const sender = new FileSender(senderDc as unknown as RTCDataChannel, [file], {
+        ackTimeoutMs: 500,
+      });
+
+      let receiverError = '';
+      receiver.onError = (e) => {
+        receiverError = e;
+      };
+
+      receiver.start();
+      expect(receiver.getState()).toBe('waiting_for_manifest');
+
+      // Wait 150ms (longer than 100ms stallTimeoutMs, but less than 400ms manifestTimeoutMs)
+      await new Promise((r) => setTimeout(r, 150));
+      expect(receiverError).toBe('');
+      expect(receiver.getState()).toBe('waiting_for_manifest');
+
+      // Now start sender
+      const completePromise = new Promise<void>((resolve, reject) => {
+        receiver.onComplete = (files) => {
+          try {
+            expect(files.length).toBe(1);
+            expect(files[0].verified).toBe(true);
+            resolve();
+          } catch (err) {
+            reject(err);
+          }
+        };
+        receiver.onError = (e) => reject(new Error(e));
+      });
+
+      await sender.start();
+      await completePromise;
+      expect(receiver.getState()).toBe('completed');
+    });
+
+    it('receiver does not time out during slow/delayed verification and finalization', async () => {
+      const file = new File(['Slow verification file'], 'slow-verify.txt');
+      const [senderDc, receiverDc] = createConnectedPair();
+
+      const customStorage = new MemoryTransferStorage();
+      await customStorage.init();
+
+      // Wrap verifyAndFinalizeFile with a simulated delay exceeding receiver stallTimeoutMs
+      const origVerify = customStorage.verifyAndFinalizeFile.bind(customStorage);
+      customStorage.verifyAndFinalizeFile = async (transferId, fileId, expectedSha256, onProgress) => {
+        // Wait 200ms during verification (longer than 100ms stallTimeoutMs)
+        await new Promise((r) => setTimeout(r, 200));
+        return origVerify(transferId, fileId, expectedSha256, onProgress);
+      };
+
+      const receiver = new FileReceiver(receiverDc as unknown as RTCDataChannel, {
+        stallTimeoutMs: 100,
+        storage: customStorage,
+      });
+
+      const sender = new FileSender(senderDc as unknown as RTCDataChannel, [file], {
+        ackTimeoutMs: 1000,
+      });
+
+      const completePromise = new Promise<void>((resolve, reject) => {
+        receiver.onComplete = (files) => {
+          try {
+            expect(files.length).toBe(1);
+            expect(files[0].verified).toBe(true);
+            resolve();
+          } catch (err) {
+            reject(err);
+          }
+        };
+        receiver.onError = (e) => reject(new Error(e));
+      });
+
+      receiver.start();
+      await sender.start();
+      await completePromise;
+      expect(receiver.getState()).toBe('completed');
+    });
+
+    it('receiver times out when sender genuinely stalls and disconnects during file reception', async () => {
+      // 5 chunks
+      const data = new Uint8Array(5 * 65536);
+      const file = new File([data], 'stall-test.bin');
+      const [senderDc, receiverDc] = createConnectedPair();
+
+      const receiver = new FileReceiver(receiverDc as unknown as RTCDataChannel, {
+        stallTimeoutMs: 150,
+      });
+
+      let receiverErr = '';
+      const errorPromise = new Promise<void>((resolve) => {
+        receiver.onError = (e) => {
+          receiverErr = e;
+          resolve();
+        };
+      });
+
+      // Override sender dc to send TRANSFER_START, FILE_START, and only 2 chunks, then stop/stall completely
+      let chunkCount = 0;
+      const origSend = senderDc.send.bind(senderDc);
+      senderDc.send = (d: string | ArrayBuffer) => {
+        if (typeof d !== 'string') {
+          chunkCount++;
+          if (chunkCount <= 2) {
+            origSend(d);
+          }
+          // stall subsequent chunks and don't send anything else
+        } else {
+          try {
+            const parsed = JSON.parse(d);
+            if (parsed.type === 'TRANSFER_START' || parsed.type === 'FILE_START') {
+              origSend(d);
+            }
+            // drop FILE_END / TRANSFER_END to simulate network stall during transmission
+          } catch {
+            origSend(d);
+          }
+        }
+      };
+
+      const sender = new FileSender(senderDc as unknown as RTCDataChannel, [file], {
+        ackTimeoutMs: 2000,
+      });
+
+      receiver.start();
+      sender.start().catch(() => {});
+
+      await errorPromise;
+      expect(receiverErr).toContain('Transfer timed out due to inactivity');
+      expect(receiver.getState()).toBe('failed');
+    });
+
+    it('successfully handles multi-file transfer with state transitions across each file', async () => {
+      const file1 = new File(['File 1 contents'], 'f1.txt');
+      const file2 = new File(['File 2 contents with more text'], 'f2.txt');
+      const [senderDc, receiverDc] = createConnectedPair();
+
+      const receiver = new FileReceiver(receiverDc as unknown as RTCDataChannel, {
+        stallTimeoutMs: 500,
+      });
+      const sender = new FileSender(senderDc as unknown as RTCDataChannel, [file1, file2], {
+        ackTimeoutMs: 1000,
+      });
+
+      const completePromise = new Promise<void>((resolve, reject) => {
+        receiver.onComplete = (files) => {
+          try {
+            expect(files.length).toBe(2);
+            expect(files[0].verified).toBe(true);
+            expect(files[1].verified).toBe(true);
+            resolve();
+          } catch (err) {
+            reject(err);
+          }
+        };
+        receiver.onError = (e) => reject(new Error(e));
+      });
+
+      receiver.start();
+      await sender.start();
+      await completePromise;
+      expect(receiver.getState()).toBe('completed');
+    });
   });
 });

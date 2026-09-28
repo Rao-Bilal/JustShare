@@ -563,8 +563,21 @@ export class FileSender {
 export interface ReceiverOptions {
   expectedTransferId?: string;
   stallTimeoutMs?: number;
+  manifestTimeoutMs?: number;
   storage?: TransferStorage;
 }
+
+export type ReceiverLifecycleState =
+  | 'idle'
+  | 'waiting_for_manifest'
+  | 'receiving_file'
+  | 'verifying'
+  | 'acknowledging'
+  | 'completed'
+  | 'failed'
+  | 'cancelled';
+
+export const DEFAULT_MANIFEST_TIMEOUT_MS = 120000; // 120s for sender pre-transfer hashing
 
 export class FileReceiver {
   private dc: RTCDataChannel;
@@ -584,15 +597,18 @@ export class FileReceiver {
   private cancelled = false;
   private startTime = 0;
   private stallTimeoutMs: number;
+  private manifestTimeoutMs: number;
   private stallTimer: ReturnType<typeof setTimeout> | null = null;
   private messageListener: ((event: MessageEvent) => void) | null = null;
   private messageQueue: Promise<void> = Promise.resolve();
+  private state: ReceiverLifecycleState = 'idle';
 
   constructor(dc: RTCDataChannel, options?: ReceiverOptions) {
     this.dc = dc;
     this.dc.binaryType = 'arraybuffer';
     this.activeTransferId = options?.expectedTransferId || null;
     this.stallTimeoutMs = options?.stallTimeoutMs || DEFAULT_STALL_TIMEOUT_MS;
+    this.manifestTimeoutMs = options?.manifestTimeoutMs || DEFAULT_MANIFEST_TIMEOUT_MS;
     this.storage = options?.storage || new MemoryTransferStorage();
   }
 
@@ -612,6 +628,10 @@ export class FileReceiver {
     return this.assembledFiles;
   }
 
+  getState(): ReceiverLifecycleState {
+    return this.state;
+  }
+
   attachDataChannel(newDc: RTCDataChannel): void {
     console.log('[TRANSFER][RECEIVE] Attaching new DataChannel to FileReceiver');
     if (this.messageListener && this.dc) {
@@ -627,13 +647,20 @@ export class FileReceiver {
     if (newDc) {
       this.attachDataChannel(newDc);
     }
+    this.transitionTo('receiving_file');
     this.resetStallTimer();
     this.updateProgress('resuming');
   }
 
   start(): void {
     this.bindDataChannelEvents();
-    this.resetStallTimer();
+    this.transitionTo('waiting_for_manifest');
+    this.resetStallTimer(this.manifestTimeoutMs);
+  }
+
+  private transitionTo(newState: ReceiverLifecycleState) {
+    console.log(`[TRANSFER][RECEIVE] State transition: ${this.state} -> ${newState}`);
+    this.state = newState;
   }
 
   private bindDataChannelEvents(): void {
@@ -643,7 +670,6 @@ export class FileReceiver {
 
     this.messageListener = (event: MessageEvent) => {
       if (this.cancelled) return;
-      this.resetStallTimer();
 
       this.messageQueue = this.messageQueue
         .then(() => this.processMessage(event))
@@ -659,228 +685,245 @@ export class FileReceiver {
     if (this.cancelled) return;
 
     if (typeof event.data === 'string') {
-        try {
-          const msg = JSON.parse(event.data);
-          console.log(`[TRANSFER][RECEIVE] Control message received: ${msg.type}`);
+      try {
+        const msg = JSON.parse(event.data);
+        console.log(`[TRANSFER][RECEIVE] Control message received: ${msg.type}`);
 
-          switch (msg.type) {
-            case 'TRANSFER_START': {
-              const manifest = validateManifest(msg.manifest);
-              if (this.activeTransferId && manifest.transferId !== this.activeTransferId) {
-                throw new Error(`Transfer ID mismatch: expected ${this.activeTransferId}, got ${manifest.transferId}`);
-              }
-              this.activeTransferId = manifest.transferId;
-              this.manifest = manifest;
-              this.totalFiles = manifest.totalFiles;
-              this.totalBytes = manifest.totalSize;
-              this.startTime = Date.now();
-
-              await this.storage.createTransfer(manifest);
-
-              this.updateProgress('receiving');
-              break;
+        switch (msg.type) {
+          case 'TRANSFER_START': {
+            const manifest = validateManifest(msg.manifest);
+            if (this.activeTransferId && manifest.transferId !== this.activeTransferId) {
+              throw new Error(`Transfer ID mismatch: expected ${this.activeTransferId}, got ${manifest.transferId}`);
             }
+            this.activeTransferId = manifest.transferId;
+            this.manifest = manifest;
+            this.totalFiles = manifest.totalFiles;
+            this.totalBytes = manifest.totalSize;
+            this.startTime = Date.now();
 
-            case 'RESUME_REQUEST': {
-              const req = msg as ResumeRequestMessage;
-              console.log(`[TRANSFER][RECEIVE] Received RESUME_REQUEST for transfer ${req.transferId}`);
+            await this.storage.createTransfer(manifest);
 
-              if (this.activeTransferId && req.transferId !== this.activeTransferId) {
-                console.warn(`[TRANSFER][RECEIVE] RESUME_REQUEST transferId mismatch (${req.transferId} vs ${this.activeTransferId})`);
-                const rejectResp: ResumeResponseMessage = {
-                  type: 'RESUME_RESPONSE',
-                  transferId: req.transferId,
-                  accepted: false,
-                  error: `Transfer ID mismatch: active is ${this.activeTransferId}`,
-                };
-                this.dc.send(JSON.stringify(rejectResp));
-                return;
-              }
+            this.transitionTo('receiving_file');
+            this.resetStallTimer();
+            this.updateProgress('receiving');
+            break;
+          }
 
-              if (!this.manifest && req.manifest) {
-                this.manifest = validateManifest(req.manifest);
-                this.activeTransferId = this.manifest.transferId;
-                this.totalFiles = this.manifest.totalFiles;
-                this.totalBytes = this.manifest.totalSize;
-                await this.storage.createTransfer(this.manifest);
-              }
+          case 'RESUME_REQUEST': {
+            const req = msg as ResumeRequestMessage;
+            console.log(`[TRANSFER][RECEIVE] Received RESUME_REQUEST for transfer ${req.transferId}`);
 
-              if (!this.activeTransferId) {
-                this.activeTransferId = req.transferId;
-              }
-
-              const fileStatuses: ResumeFileStatus[] = [];
-              if (this.manifest) {
-                for (const mFile of this.manifest.files) {
-                  const storedBlob = await this.storage.getFinalizedBlob(this.activeTransferId, mFile.id);
-                  const missingChunks = await this.storage.getMissingChunks(
-                    this.activeTransferId,
-                    mFile.id,
-                    mFile.totalChunks
-                  );
-
-                  const isComplete =
-                    storedBlob !== null ||
-                    (missingChunks.length === 0 && (mFile.totalChunks === 0 || mFile.size === 0));
-
-                  fileStatuses.push({
-                    fileId: mFile.id,
-                    completed: isComplete,
-                    missingChunks: isComplete ? [] : missingChunks,
-                  });
-                }
-              }
-
-              const acceptResp: ResumeResponseMessage = {
+            if (this.activeTransferId && req.transferId !== this.activeTransferId) {
+              console.warn(`[TRANSFER][RECEIVE] RESUME_REQUEST transferId mismatch (${req.transferId} vs ${this.activeTransferId})`);
+              const rejectResp: ResumeResponseMessage = {
                 type: 'RESUME_RESPONSE',
-                transferId: this.activeTransferId,
-                accepted: true,
-                files: fileStatuses,
+                transferId: req.transferId,
+                accepted: false,
+                error: `Transfer ID mismatch: active is ${this.activeTransferId}`,
               };
-
-              console.log('[TRANSFER][RECEIVE] Sending RESUME_RESPONSE:', acceptResp);
-              this.dc.send(JSON.stringify(acceptResp));
-              this.updateProgress('resuming');
-              break;
+              this.dc.send(JSON.stringify(rejectResp));
+              return;
             }
 
-            case 'FILE_START': {
-              if (!this.manifest || !this.activeTransferId) {
-                throw new Error('Received FILE_START before TRANSFER_START manifest or RESUME_REQUEST');
-              }
-              if (msg.transferId !== this.activeTransferId) {
-                throw new Error(`FILE_START transferId mismatch (${msg.transferId} vs ${this.activeTransferId})`);
-              }
-              const manifestEntry = this.manifest.files.find((f) => f.id === msg.fileId);
-              if (!manifestEntry) {
-                throw new Error(`FILE_START fileId '${msg.fileId}' not found in authorized manifest`);
-              }
-              if (msg.size !== manifestEntry.size || msg.totalChunks !== manifestEntry.totalChunks || msg.sha256 !== manifestEntry.sha256) {
-                throw new Error(`FILE_START metadata mismatch for file '${manifestEntry.name}'`);
-              }
-
-              await this.storage.initFile(this.activeTransferId, manifestEntry);
-
-              this.currentFileName = manifestEntry.name;
-              this.updateProgress('receiving');
-              break;
+            if (!this.manifest && req.manifest) {
+              this.manifest = validateManifest(req.manifest);
+              this.activeTransferId = this.manifest.transferId;
+              this.totalFiles = this.manifest.totalFiles;
+              this.totalBytes = this.manifest.totalSize;
+              await this.storage.createTransfer(this.manifest);
             }
 
-            case 'FILE_END': {
-              if (!this.activeTransferId || msg.transferId !== this.activeTransferId) {
-                throw new Error('FILE_END transferId mismatch');
-              }
-              await this.handleFileEnd(msg.fileId);
-              break;
+            if (!this.activeTransferId) {
+              this.activeTransferId = req.transferId;
             }
 
-            case 'TRANSFER_END': {
-              if (!this.activeTransferId || msg.transferId !== this.activeTransferId) {
-                throw new Error('TRANSFER_END transferId mismatch');
+            const fileStatuses: ResumeFileStatus[] = [];
+            if (this.manifest) {
+              for (const mFile of this.manifest.files) {
+                const storedBlob = await this.storage.getFinalizedBlob(this.activeTransferId, mFile.id);
+                const missingChunks = await this.storage.getMissingChunks(
+                  this.activeTransferId,
+                  mFile.id,
+                  mFile.totalChunks
+                );
+
+                const isComplete =
+                  storedBlob !== null ||
+                  (missingChunks.length === 0 && (mFile.totalChunks === 0 || mFile.size === 0));
+
+                fileStatuses.push({
+                  fileId: mFile.id,
+                  completed: isComplete,
+                  missingChunks: isComplete ? [] : missingChunks,
+                });
               }
-              console.log('[TRANSFER][RECEIVE] TRANSFER_END received, validating complete assembly');
-              this.clearStallTimer();
-              if (this.manifest && this.assembledFiles.length !== this.manifest.totalFiles) {
-                throw new Error(`Incomplete transfer: received ${this.assembledFiles.length} of ${this.manifest.totalFiles} files`);
-              }
-              if (this.onComplete) {
-                this.onComplete(this.assembledFiles);
-              }
-              break;
             }
 
-            case 'CANCEL': {
-              console.log('[TRANSFER][RECEIVE] CANCEL received');
-              this.cancelled = true;
-              this.clearStallTimer();
-              if (this.onError) this.onError(msg.reason || 'Transfer cancelled by peer');
-              break;
-            }
+            const acceptResp: ResumeResponseMessage = {
+              type: 'RESUME_RESPONSE',
+              transferId: this.activeTransferId,
+              accepted: true,
+              files: fileStatuses,
+            };
 
-            case 'ERROR': {
-              console.error('[TRANSFER][RECEIVE] ERROR received from sender', msg);
-              this.cancelled = true;
-              this.clearStallTimer();
-              if (this.onError) this.onError(msg.message || msg.code || 'Transfer error');
-              break;
-            }
+            console.log('[TRANSFER][RECEIVE] Sending RESUME_RESPONSE:', acceptResp);
+            this.dc.send(JSON.stringify(acceptResp));
+            this.transitionTo('receiving_file');
+            this.resetStallTimer();
+            this.updateProgress('resuming');
+            break;
           }
-        } catch (err: unknown) {
-          const errorMsg = err instanceof Error ? err.message : 'Malformed transfer message';
-          console.error('[TRANSFER][RECEIVE] Control message error:', errorMsg);
-          this.sendError('PROTOCOL_ERROR', errorMsg);
-          this.clearStallTimer();
-          if (this.onError) this.onError(errorMsg);
+
+          case 'FILE_START': {
+            if (!this.manifest || !this.activeTransferId) {
+              throw new Error('Received FILE_START before TRANSFER_START manifest or RESUME_REQUEST');
+            }
+            if (msg.transferId !== this.activeTransferId) {
+              throw new Error(`FILE_START transferId mismatch (${msg.transferId} vs ${this.activeTransferId})`);
+            }
+            const manifestEntry = this.manifest.files.find((f) => f.id === msg.fileId);
+            if (!manifestEntry) {
+              throw new Error(`FILE_START fileId '${msg.fileId}' not found in authorized manifest`);
+            }
+            if (msg.size !== manifestEntry.size || msg.totalChunks !== manifestEntry.totalChunks || msg.sha256 !== manifestEntry.sha256) {
+              throw new Error(`FILE_START metadata mismatch for file '${manifestEntry.name}'`);
+            }
+
+            await this.storage.initFile(this.activeTransferId, manifestEntry);
+
+            this.currentFileName = manifestEntry.name;
+            this.transitionTo('receiving_file');
+            this.resetStallTimer();
+            this.updateProgress('receiving');
+            break;
+          }
+
+          case 'FILE_END': {
+            if (!this.activeTransferId || msg.transferId !== this.activeTransferId) {
+              throw new Error('FILE_END transferId mismatch');
+            }
+            await this.handleFileEnd(msg.fileId);
+            break;
+          }
+
+          case 'TRANSFER_END': {
+            if (!this.activeTransferId || msg.transferId !== this.activeTransferId) {
+              throw new Error('TRANSFER_END transferId mismatch');
+            }
+            console.log('[TRANSFER][RECEIVE] TRANSFER_END received, validating complete assembly');
+            this.clearStallTimer();
+            if (this.manifest && this.assembledFiles.length !== this.manifest.totalFiles) {
+              throw new Error(`Incomplete transfer: received ${this.assembledFiles.length} of ${this.manifest.totalFiles} files`);
+            }
+            this.transitionTo('completed');
+            if (this.onComplete) {
+              this.onComplete(this.assembledFiles);
+            }
+            break;
+          }
+
+          case 'CANCEL': {
+            console.log('[TRANSFER][RECEIVE] CANCEL received');
+            this.cancelled = true;
+            this.clearStallTimer();
+            this.transitionTo('cancelled');
+            if (this.onError) this.onError(msg.reason || 'Transfer cancelled by peer');
+            break;
+          }
+
+          case 'ERROR': {
+            console.error('[TRANSFER][RECEIVE] ERROR received from sender', msg);
+            this.cancelled = true;
+            this.clearStallTimer();
+            this.transitionTo('failed');
+            if (this.onError) this.onError(msg.message || msg.code || 'Transfer error');
+            break;
+          }
         }
-      } else {
-        // ArrayBuffer Binary Chunk
-        try {
-          const buffer = event.data as ArrayBuffer;
-          if (buffer.byteLength < 4) {
-            throw new Error('Malformed chunk: payload too small');
-          }
-          const view = new DataView(buffer);
-          const headerLen = view.getUint32(0, false);
-
-          if (4 + headerLen > buffer.byteLength) {
-            throw new Error('Malformed chunk: invalid header length');
-          }
-
-          const headerBytes = new Uint8Array(buffer, 4, headerLen);
-          const headerStr = new TextDecoder().decode(headerBytes);
-          const header = JSON.parse(headerStr) as ChunkHeader;
-
-          if (!this.activeTransferId || header.transferId !== this.activeTransferId) {
-            throw new Error(`Chunk rejected: transfer ID mismatch (${header.transferId} vs ${this.activeTransferId})`);
-          }
-
-          if (!this.manifest) {
-            throw new Error('Chunk received before manifest initialized');
-          }
-
-          const manifestEntry = this.manifest.files.find((f) => f.id === header.fileId);
-          if (!manifestEntry) {
-            throw new Error(`Chunk rejected: unknown file ID '${header.fileId}'`);
-          }
-
-          if (header.index < 0 || header.index >= manifestEntry.totalChunks) {
-            throw new Error(`Chunk rejected: index ${header.index} out of bounds (totalChunks=${manifestEntry.totalChunks})`);
-          }
-
-          const chunkData = new Uint8Array(buffer, 4 + headerLen);
-          if (chunkData.byteLength > CHUNK_SIZE) {
-            throw new Error(`Chunk rejected: oversized chunk (${chunkData.byteLength} > ${CHUNK_SIZE})`);
-          }
-
-          const alreadyHas = await this.storage.hasChunk(this.activeTransferId, header.fileId, header.index);
-          if (alreadyHas) {
-            console.log(`[TRANSFER][RECEIVE] Duplicate chunk ${header.index} received for file ${manifestEntry.name} - ignoring`);
-          } else {
-            await this.storage.writeChunk(this.activeTransferId, header.fileId, header.index, chunkData);
-            this.totalReceivedBytes += chunkData.byteLength;
-
-            if (header.index % 500 === 0 || header.index === manifestEntry.totalChunks - 1) {
-              console.log(`[TRANSFER][RECV][CHUNK] persisted index=${header.index + 1}/${manifestEntry.totalChunks}`);
-            }
-
-            if (header.index % 10 === 0 || this.totalReceivedBytes >= this.totalBytes) {
-              this.updateProgress('receiving');
-            }
-          }
-        } catch (err: unknown) {
-          const errorMsg = err instanceof Error ? err.message : 'Chunk processing error';
-          console.error('[TRANSFER][RECEIVE] Chunk error:', errorMsg);
-          this.cancelled = true;
-          this.sendError('CHUNK_ERROR', errorMsg);
-          this.clearStallTimer();
-          if (this.onError) this.onError(errorMsg);
+      } catch (err: unknown) {
+        const errorMsg = err instanceof Error ? err.message : 'Malformed transfer message';
+        console.error('[TRANSFER][RECEIVE] Control message error:', errorMsg);
+        this.sendError('PROTOCOL_ERROR', errorMsg);
+        this.clearStallTimer();
+        this.transitionTo('failed');
+        if (this.onError) this.onError(errorMsg);
+      }
+    } else {
+      // ArrayBuffer Binary Chunk
+      try {
+        const buffer = event.data as ArrayBuffer;
+        if (buffer.byteLength < 4) {
+          throw new Error('Malformed chunk: payload too small');
         }
+        const view = new DataView(buffer);
+        const headerLen = view.getUint32(0, false);
+
+        if (4 + headerLen > buffer.byteLength) {
+          throw new Error('Malformed chunk: invalid header length');
+        }
+
+        const headerBytes = new Uint8Array(buffer, 4, headerLen);
+        const headerStr = new TextDecoder().decode(headerBytes);
+        const header = JSON.parse(headerStr) as ChunkHeader;
+
+        if (!this.activeTransferId || header.transferId !== this.activeTransferId) {
+          throw new Error(`Chunk rejected: transfer ID mismatch (${header.transferId} vs ${this.activeTransferId})`);
+        }
+
+        if (!this.manifest) {
+          throw new Error('Chunk received before manifest initialized');
+        }
+
+        const manifestEntry = this.manifest.files.find((f) => f.id === header.fileId);
+        if (!manifestEntry) {
+          throw new Error(`Chunk rejected: unknown file ID '${header.fileId}'`);
+        }
+
+        if (header.index < 0 || header.index >= manifestEntry.totalChunks) {
+          throw new Error(`Chunk rejected: index ${header.index} out of bounds (totalChunks=${manifestEntry.totalChunks})`);
+        }
+
+        const chunkData = new Uint8Array(buffer, 4 + headerLen);
+        if (chunkData.byteLength > CHUNK_SIZE) {
+          throw new Error(`Chunk rejected: oversized chunk (${chunkData.byteLength} > ${CHUNK_SIZE})`);
+        }
+
+        const alreadyHas = await this.storage.hasChunk(this.activeTransferId, header.fileId, header.index);
+        if (alreadyHas) {
+          console.log(`[TRANSFER][RECEIVE] Duplicate chunk ${header.index} received for file ${manifestEntry.name} - ignoring`);
+        } else {
+          await this.storage.writeChunk(this.activeTransferId, header.fileId, header.index, chunkData);
+          this.totalReceivedBytes += chunkData.byteLength;
+
+          if (header.index % 500 === 0 || header.index === manifestEntry.totalChunks - 1) {
+            console.log(`[TRANSFER][RECV][CHUNK] persisted index=${header.index + 1}/${manifestEntry.totalChunks}`);
+          }
+
+          if (header.index % 10 === 0 || this.totalReceivedBytes >= this.totalBytes) {
+            this.updateProgress('receiving');
+          }
+        }
+
+        // Active chunk successfully received and written: reset network stall timer
+        if (this.state === 'receiving_file') {
+          this.resetStallTimer();
+        }
+      } catch (err: unknown) {
+        const errorMsg = err instanceof Error ? err.message : 'Chunk processing error';
+        console.error('[TRANSFER][RECEIVE] Chunk error:', errorMsg);
+        this.cancelled = true;
+        this.sendError('CHUNK_ERROR', errorMsg);
+        this.clearStallTimer();
+        this.transitionTo('failed');
+        if (this.onError) this.onError(errorMsg);
       }
     }
+  }
 
   private async handleFileEnd(fileId: string) {
     const tFileEndStart = performance.now();
     console.log(`[TRANSFER][RECV][FILE_END] START fileId=${fileId}`);
+    this.transitionTo('verifying');
     this.clearStallTimer();
 
     if (!this.manifest || !this.activeTransferId) {
@@ -923,6 +966,7 @@ export class FileReceiver {
         );
       }
 
+      this.transitionTo('acknowledging');
       console.log(`[TRANSFER][RECV][ACK] sending FILE_ACK`);
       const ackMsg: FileAckMessage = {
         type: 'FILE_ACK',
@@ -943,6 +987,7 @@ export class FileReceiver {
       });
 
       this.currentFileIndex++;
+      this.transitionTo('receiving_file');
       this.resetStallTimer();
       console.log(`[TRANSFER][RECV][FILE_END] COMPLETE fileId=${fileId} elapsed=${(performance.now() - tFileEndStart).toFixed(0)}ms`);
     } catch (err: unknown) {
@@ -961,6 +1006,7 @@ export class FileReceiver {
         // ignore send error
       }
       this.clearStallTimer();
+      this.transitionTo('failed');
       if (this.onError) {
         this.onError(errorMsg);
       }
@@ -987,6 +1033,7 @@ export class FileReceiver {
     console.log(`[TRANSFER][RECEIVE] Transfer cancelled: ${reason}`);
     this.cancelled = true;
     this.clearStallTimer();
+    this.transitionTo('cancelled');
     if (this.dc.readyState === 'open') {
       const cancelMsg: TransferCancelMessage = {
         type: 'CANCEL',
@@ -1001,16 +1048,18 @@ export class FileReceiver {
     }
   }
 
-  private resetStallTimer() {
+  private resetStallTimer(timeoutMs?: number) {
     this.clearStallTimer();
+    const duration = timeoutMs || this.stallTimeoutMs;
     this.stallTimer = setTimeout(() => {
       console.error('[TRANSFER][RECEIVE] Transfer timed out (no activity received within limit)');
       this.cancelled = true;
+      this.transitionTo('failed');
       this.sendError('STALL_TIMEOUT', 'Transfer timed out due to inactivity');
       if (this.onError) {
         this.onError('Transfer timed out due to inactivity');
       }
-    }, this.stallTimeoutMs);
+    }, duration);
   }
 
   private clearStallTimer() {
@@ -1042,5 +1091,6 @@ export class FileReceiver {
     });
   }
 }
+
 
 
