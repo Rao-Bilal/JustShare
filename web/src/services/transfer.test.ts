@@ -966,5 +966,96 @@ describe('Phase 2A - Transfer Protocol & Validation', () => {
       await completePromise;
       expect(receiver.getState()).toBe('completed');
     });
+
+    it('resets sender ACK timer upon receiving VERIFYING keepalive messages', async () => {
+      const file = new File(['Keepalive test file'], 'keepalive.txt');
+      const [senderDc, receiverDc] = createConnectedPair();
+
+      // Sender has a 300ms ack timeout
+      const sender = new FileSender(senderDc as unknown as RTCDataChannel, [file], {
+        ackTimeoutMs: 300,
+      });
+
+      // Custom mock receiver to intercept FILE_END and send keepalives
+      let fileId = '';
+      let transferId = '';
+      let receivedChunks = 0;
+
+      receiverDc.addEventListener('message', async (e: unknown) => {
+        const event = e as { data: string | ArrayBuffer };
+        if (typeof event.data === 'string') {
+          const msg = JSON.parse(event.data);
+          if (msg.type === 'TRANSFER_START') {
+            transferId = msg.manifest.transferId;
+            fileId = msg.manifest.files[0].id;
+          } else if (msg.type === 'FILE_END') {
+            // Send 3 keepalives at 150ms intervals (total 450ms > 300ms ackTimeout)
+            for (let k = 0; k < 3; k++) {
+              await new Promise((r) => setTimeout(r, 150));
+              receiverDc.send(
+                JSON.stringify({
+                  type: 'VERIFYING',
+                  transferId,
+                  fileId,
+                  progress: (k + 1) * 10,
+                })
+              );
+            }
+
+            // Finally send FILE_ACK
+            await new Promise((r) => setTimeout(r, 100));
+            receiverDc.send(
+              JSON.stringify({
+                type: 'FILE_ACK',
+                transferId,
+                fileId,
+                sha256Match: true,
+              })
+            );
+          }
+        } else {
+          receivedChunks++;
+        }
+      });
+
+      await expect(sender.start()).resolves.toBeUndefined();
+    });
+
+    it('ignores VERIFYING keepalive messages with mismatched transferId or fileId and times out', async () => {
+      const file = new File(['Keepalive mismatch test file'], 'mismatch.txt');
+      const [senderDc, receiverDc] = createConnectedPair();
+
+      const sender = new FileSender(senderDc as unknown as RTCDataChannel, [file], {
+        ackTimeoutMs: 250,
+      });
+
+      let senderError = '';
+      sender.onError = (err) => {
+        senderError = err;
+      };
+
+      receiverDc.addEventListener('message', async (e: unknown) => {
+        const event = e as { data: string | ArrayBuffer };
+        if (typeof event.data === 'string') {
+          const msg = JSON.parse(event.data);
+          if (msg.type === 'FILE_END') {
+            // Send keepalives with wrong fileId
+            for (let k = 0; k < 3; k++) {
+              await new Promise((r) => setTimeout(r, 100));
+              receiverDc.send(
+                JSON.stringify({
+                  type: 'VERIFYING',
+                  transferId: 'wrong-tx-id',
+                  fileId: 'wrong-file-id',
+                })
+              );
+            }
+          }
+        }
+      });
+
+      await sender.start();
+      expect(senderError).toContain('Timeout waiting for receiver ACK');
+    });
   });
 });

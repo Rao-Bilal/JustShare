@@ -87,6 +87,13 @@ export interface FileEndMessage {
   fileId: string;
 }
 
+export interface FileVerifyingMessage {
+  type: 'VERIFYING';
+  transferId: string;
+  fileId: string;
+  progress?: number;
+}
+
 export interface FileAckMessage {
   type: 'FILE_ACK';
   transferId: string;

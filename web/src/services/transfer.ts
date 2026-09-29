@@ -4,6 +4,7 @@ import {
   FileAckMessage,
   FileEndMessage,
   FileStartMessage,
+  FileVerifyingMessage,
   ManifestFileEntry,
   ResumeFileStatus,
   ResumeRequestMessage,
@@ -25,6 +26,8 @@ export const MAX_FILE_SIZE = 100 * 1024 * 1024 * 1024; // 100 GB
 export const MAX_FILES_COUNT = 10000;
 export const MAX_FILENAME_LENGTH = 255;
 export const DEFAULT_ACK_TIMEOUT_MS = 60000; // 60s
+export const ACK_HARD_CEILING_TIMEOUT_MS = 15 * 60 * 1000; // 15m
+export const VERIFYING_KEEPALIVE_INTERVAL_MS = 5000; // 5s
 export const DEFAULT_STALL_TIMEOUT_MS = 60000; // 60s
 export const DEFAULT_RESUME_TIMEOUT_MS = 15000; // 15s
 export const BACKPRESSURE_HIGH_WATERMARK = 1024 * 1024; // 1 MB
@@ -559,15 +562,29 @@ export class FileSender {
         totalChunks,
       });
 
-      // Wait for FILE_ACK with timeout
+      // Wait for FILE_ACK with rolling timeout (reset on VERIFYING keepalives) up to hard ceiling
       await new Promise<void>((resolve, reject) => {
-        const timer = setTimeout(() => {
+        let ackTimer: ReturnType<typeof setTimeout> | null = null;
+        let hardCeilingTimer: ReturnType<typeof setTimeout> | null = null;
+
+        const resetAckTimer = () => {
+          if (ackTimer) clearTimeout(ackTimer);
+          ackTimer = setTimeout(() => {
+            cleanup();
+            reject(new Error(`Timeout waiting for receiver ACK for file ${file.name}`));
+          }, this.ackTimeoutMs);
+        };
+
+        resetAckTimer();
+
+        hardCeilingTimer = setTimeout(() => {
           cleanup();
-          reject(new Error(`Timeout waiting for receiver ACK for file ${file.name}`));
-        }, this.ackTimeoutMs);
+          reject(new Error(`Hard ceiling timeout (15m) exceeded waiting for receiver ACK for file ${file.name}`));
+        }, ACK_HARD_CEILING_TIMEOUT_MS);
 
         const cleanup = () => {
-          clearTimeout(timer);
+          if (ackTimer) clearTimeout(ackTimer);
+          if (hardCeilingTimer) clearTimeout(hardCeilingTimer);
           this.dc.removeEventListener('message', handler);
           this.dc.removeEventListener('close', closeHandler);
         };
@@ -595,6 +612,9 @@ export class FileSender {
                 } else {
                   resolve();
                 }
+              } else if (msg.type === 'VERIFYING' && msg.fileId === fileId && msg.transferId === this.transferId) {
+                console.log(`[TRANSFER][SEND] Received VERIFYING keepalive for file ${fileId}`);
+                resetAckTimer();
               } else if (msg.type === 'CANCEL') {
                 console.log('[TRANSFER][SEND] Received CANCEL signal');
                 cleanup();
@@ -1067,6 +1087,30 @@ export class FileReceiver {
 
     this.updateProgress('verifying');
 
+    const sendVerifyingKeepalive = (progressBytes?: number) => {
+      if (this.dc.readyState === 'open' && this.activeTransferId) {
+        try {
+          const verifyingMsg: FileVerifyingMessage = {
+            type: 'VERIFYING',
+            transferId: this.activeTransferId,
+            fileId,
+            progress: progressBytes,
+          };
+          this.dc.send(JSON.stringify(verifyingMsg));
+        } catch {
+          // ignore send error on closed channel
+        }
+      }
+    };
+
+    // Send first VERIFYING keepalive immediately
+    sendVerifyingKeepalive(0);
+
+    // Periodic 5s keepalive timer
+    const keepaliveTimer = setInterval(() => {
+      sendVerifyingKeepalive();
+    }, VERIFYING_KEEPALIVE_INTERVAL_MS);
+
     try {
       const result = await this.storage.verifyAndFinalizeFile(
         this.activeTransferId,
@@ -1129,6 +1173,8 @@ export class FileReceiver {
       if (this.onError) {
         this.onError(errorMsg);
       }
+    } finally {
+      clearInterval(keepaliveTimer);
     }
   }
 
