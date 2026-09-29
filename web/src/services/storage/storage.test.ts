@@ -190,6 +190,116 @@ describe('TransferStorage Implementations', () => {
         expect(await storage.getTransfer('tx-delete-test')).toBeNull();
         expect(await storage.hasChunk('tx-delete-test', 'f-del', 0)).toBe(false);
       });
+
+      describe('verifyAndFinalizeFile chunk batching & boundary test suite', () => {
+        const createMultiChunkTest = (totalChunks: number, chunkSize = 16) => {
+          return async () => {
+            const storage = await createStorage();
+            const txId = `tx-batch-${totalChunks}`;
+            const fileId = `f-batch-${totalChunks}`;
+
+            const hasher = new IncrementalSha256();
+            const chunks: Uint8Array[] = [];
+            let totalBytes = 0;
+
+            for (let i = 0; i < totalChunks; i++) {
+              const chunk = new Uint8Array(chunkSize);
+              for (let b = 0; b < chunkSize; b++) {
+                chunk[b] = (i * 17 + b * 3) & 0xff;
+              }
+              chunks.push(chunk);
+              hasher.update(chunk);
+              totalBytes += chunkSize;
+            }
+
+            const expectedHash = hasher.digest();
+
+            const manifest: TransferManifest = {
+              transferId: txId,
+              totalFiles: 1,
+              totalSize: totalBytes,
+              files: [
+                {
+                  id: fileId,
+                  name: `test-${totalChunks}.bin`,
+                  size: totalBytes,
+                  mimeType: 'application/octet-stream',
+                  totalChunks,
+                  sha256: expectedHash,
+                },
+              ],
+            };
+
+            await storage.createTransfer(manifest);
+            for (let i = 0; i < totalChunks; i++) {
+              await storage.writeChunk(txId, fileId, i, chunks[i]);
+            }
+
+            let progressCallCount = 0;
+            let lastProcessed = 0;
+            const result = await storage.verifyAndFinalizeFile(
+              txId,
+              fileId,
+              expectedHash,
+              (bytesProcessed, total) => {
+                progressCallCount++;
+                lastProcessed = bytesProcessed;
+                expect(total).toBe(totalBytes);
+              }
+            );
+
+            expect(result.match).toBe(true);
+            expect(result.calculatedSha256).toBe(expectedHash);
+            expect(result.blob.size).toBe(totalBytes);
+
+            if (totalChunks > 0) {
+              expect(progressCallCount).toBe(totalChunks);
+              expect(lastProcessed).toBe(totalBytes);
+            }
+
+            const finalizedBlob = await storage.getFinalizedBlob(txId, fileId);
+            expect(finalizedBlob).not.toBeNull();
+            expect(finalizedBlob?.size).toBe(totalBytes);
+          };
+        };
+
+        it('verifies 0-chunk (0-byte) file correctly', createMultiChunkTest(0));
+        it('verifies 1-chunk file correctly', createMultiChunkTest(1));
+        it('verifies exactly 1 batch size (200 chunks) correctly', createMultiChunkTest(200, 8));
+        it('verifies batch size + 1 (201 chunks) correctly', createMultiChunkTest(201, 8));
+        it('verifies >2 batches (450 chunks) correctly with correct digest', createMultiChunkTest(450, 8));
+
+        it('throws descriptive error on missing chunks during verify', async () => {
+          const storage = await createStorage();
+          const txId = 'tx-err-missing';
+          const fileId = 'f-err-missing';
+
+          const manifest: TransferManifest = {
+            transferId: txId,
+            totalFiles: 1,
+            totalSize: 30,
+            files: [
+              {
+                id: fileId,
+                name: 'missing.bin',
+                size: 30,
+                mimeType: 'text/plain',
+                totalChunks: 3,
+                sha256: 'somehash',
+              },
+            ],
+          };
+
+          await storage.createTransfer(manifest);
+          await storage.writeChunk(txId, fileId, 0, new Uint8Array(10));
+          // chunk 1 is missing
+          await storage.writeChunk(txId, fileId, 2, new Uint8Array(10));
+
+          await expect(
+            storage.verifyAndFinalizeFile(txId, fileId, 'somehash')
+          ).rejects.toThrow();
+        });
+      });
     });
   };
 

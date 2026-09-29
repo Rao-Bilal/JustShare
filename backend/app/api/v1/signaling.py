@@ -81,7 +81,39 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str, token: str =
             msg_type = data.get("type")
             payload = data.get("payload", {})
             
-            if msg_type in ["signal", "file_metadata", "transfer_response", "state_update"]:
+            if msg_type == "dev_log":
+                milestone = payload.get("milestone", "unknown")
+                sender_redacted = payload.get("senderDeviceIdRedacted", "anon")
+                tx_id = payload.get("transferId", "")
+                file_name = payload.get("fileName", "")
+                progress = payload.get("percent")
+                elapsed = payload.get("elapsedMs")
+                msg = payload.get("message", "")
+                
+                parts = [f"[REMOTE-DEV-LOG][{sender_redacted}][{milestone}]"]
+                if tx_id:
+                    parts.append(f"tx={tx_id}")
+                if file_name:
+                    parts.append(f"file='{file_name}'")
+                if progress is not None:
+                    parts.append(f"progress={progress}%")
+                if elapsed is not None:
+                    parts.append(f"elapsed={elapsed}ms")
+                if msg:
+                    parts.append(f"msg=\"{msg}\"")
+                    
+                print(" ".join(parts), flush=True)
+
+                out_msg = {
+                    "type": "dev_log",
+                    "from": device_id,
+                    "payload": payload
+                }
+                for other_device_id, other_ws in active_connections[session_id].items():
+                    if other_device_id != device_id:
+                        await other_ws.send_json(out_msg)
+
+            elif msg_type in ["signal", "file_metadata", "transfer_response", "state_update"]:
                 out_msg = {
                     "type": msg_type,
                     "from": device_id,

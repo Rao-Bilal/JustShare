@@ -1,6 +1,12 @@
-// Pure TypeScript Streaming SHA-256 implementation (FIPS 180-4 compliant)
-// Constant O(1) memory footprint for processing arbitrary multi-gigabyte files.
+import { createSHA256 } from 'hash-wasm';
 
+export interface IStreamingHasher {
+  readonly implementationName: string;
+  update(chunk: Uint8Array): this;
+  digest(): string;
+}
+
+// Pure TypeScript Streaming SHA-256 fallback (FIPS 180-4 compliant)
 const K = new Uint32Array([
   0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
   0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
@@ -12,7 +18,8 @@ const K = new Uint32Array([
   0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
 ]);
 
-export class IncrementalSha256 {
+export class PureJsIncrementalSha256 implements IStreamingHasher {
+  readonly implementationName = 'PureJsIncrementalSha256';
   private h0 = 0x6a09e667;
   private h1 = 0xbb67ae85;
   private h2 = 0x3c6ef372;
@@ -32,7 +39,6 @@ export class IncrementalSha256 {
     let offset = 0;
     let length = chunk.byteLength;
 
-    // Track total processed bytes
     this.totalBytesLow += length;
     if (this.totalBytesLow >= 0x100000000) {
       this.totalBytesHigh += Math.floor(this.totalBytesLow / 0x100000000);
@@ -71,7 +77,6 @@ export class IncrementalSha256 {
   private processBlock(block: Uint8Array, offset: number): void {
     const w = this.w;
 
-    // Message schedule
     for (let i = 0; i < 16; i++) {
       const idx = offset + (i << 2);
       w[i] = (block[idx] << 24) | (block[idx + 1] << 16) | (block[idx + 2] << 8) | block[idx + 3];
@@ -121,18 +126,15 @@ export class IncrementalSha256 {
   }
 
   digest(): string {
-    // Total bits = totalBytes * 8
     const totalBitsLow = (this.totalBytesLow << 3) >>> 0;
     const totalBitsHigh = ((this.totalBytesHigh << 3) | (this.totalBytesLow >>> 29)) >>> 0;
 
-    // Append 0x80 byte
     const pad = new Uint8Array(128);
     pad[0] = 0x80;
 
     const padLength = this.bufferLength < 56 ? 56 - this.bufferLength : 120 - this.bufferLength;
     this.update(pad.subarray(0, padLength));
 
-    // Append 64-bit big-endian length in bits
     const lenBlock = new Uint8Array(8);
     const view = new DataView(lenBlock.buffer);
     view.setUint32(0, totalBitsHigh, false);
@@ -145,25 +147,54 @@ export class IncrementalSha256 {
   }
 }
 
+// Preserve IncrementalSha256 export for full backward compatibility
+export class IncrementalSha256 extends PureJsIncrementalSha256 {}
+
 /**
- * Stream-reads a Blob or File in 64 KB slices to compute SHA-256 without loading entire file in RAM.
+ * Creates an optimized streaming SHA-256 instance powered by WebAssembly (hash-wasm)
+ * with transparent fallback to pure-JS if WASM is unavailable.
+ */
+export async function createStreamingHasher(): Promise<IStreamingHasher> {
+  try {
+    const wasmHasher = await createSHA256();
+    wasmHasher.init();
+    const instance: IStreamingHasher = {
+      implementationName: 'hash-wasm (createSHA256)',
+      update(chunk: Uint8Array): IStreamingHasher {
+        wasmHasher.update(chunk);
+        return instance;
+      },
+      digest(): string {
+        return wasmHasher.digest('hex');
+      },
+    };
+    return instance;
+  } catch (err) {
+    console.warn('[CRYPTO] Failed to initialize hash-wasm WebAssembly SHA-256. Falling back to pure-JS:', err);
+    return new PureJsIncrementalSha256();
+  }
+}
+
+export const STREAMING_HASH_SLICE_SIZE = 2 * 1024 * 1024; // 2 MB blocks
+
+/**
+ * Stream-reads a Blob or File in 2 MB slices to compute SHA-256 with WASM acceleration.
  */
 export async function sha256BlobStreaming(
   blob: Blob,
   onProgress?: (bytesProcessed: number, totalBytes: number) => void
 ): Promise<string> {
-  const SLICE_SIZE = 64 * 1024; // 64 KB
   const total = blob.size;
 
   if (total === 0) {
     return 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
   }
 
-  const hasher = new IncrementalSha256();
+  const hasher = await createStreamingHasher();
   let offset = 0;
 
   while (offset < total) {
-    const end = Math.min(offset + SLICE_SIZE, total);
+    const end = Math.min(offset + STREAMING_HASH_SLICE_SIZE, total);
     const slice = blob.slice(offset, end);
     const buffer = await slice.arrayBuffer();
     hasher.update(new Uint8Array(buffer));
@@ -176,16 +207,22 @@ export async function sha256BlobStreaming(
   return hasher.digest();
 }
 
-export async function sha256File(file: File): Promise<string> {
-  return sha256BlobStreaming(file);
+export async function sha256File(
+  file: File,
+  onProgress?: (bytesProcessed: number, totalBytes: number) => void
+): Promise<string> {
+  return sha256BlobStreaming(file, onProgress);
 }
 
-export async function sha256Blob(blob: Blob): Promise<string> {
-  return sha256BlobStreaming(blob);
+export async function sha256Blob(
+  blob: Blob,
+  onProgress?: (bytesProcessed: number, totalBytes: number) => void
+): Promise<string> {
+  return sha256BlobStreaming(blob, onProgress);
 }
 
 export async function sha256Chunks(chunks: Uint8Array[]): Promise<string> {
-  const hasher = new IncrementalSha256();
+  const hasher = await createStreamingHasher();
   for (const chunk of chunks) {
     if (chunk instanceof Uint8Array) {
       hasher.update(chunk);

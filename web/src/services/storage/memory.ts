@@ -1,5 +1,5 @@
 import { ManifestFileEntry, TransferManifest } from '../../types';
-import { IncrementalSha256 } from '../crypto';
+import { createStreamingHasher } from '../crypto';
 import { StoredFileInfo, StoredTransferInfo, TransferStorage } from './types';
 
 export class MemoryTransferStorage implements TransferStorage {
@@ -169,7 +169,7 @@ export class MemoryTransferStorage implements TransferStorage {
 
     const t0 = performance.now();
     console.log(`[TRANSFER][RECV][VERIFY] START fileId=${fileId}`);
-    const hasher = new IncrementalSha256();
+    const hasher = await createStreamingHasher();
     const chunkParts: Uint8Array[] = [];
     let bytesProcessed = 0;
 

@@ -16,6 +16,7 @@ import {
   TransferStartMessage,
 } from '../types';
 import { sha256File } from './crypto';
+import { RemoteDevLogger } from './devLogger';
 import { MemoryTransferStorage } from './storage/memory';
 import { TransferStorage } from './storage/types';
 
@@ -153,6 +154,7 @@ export interface SenderOptions {
   chunkSize?: number;
   ackTimeoutMs?: number;
   resumeTimeoutMs?: number;
+  logger?: RemoteDevLogger;
 }
 
 export class FileSender {
@@ -163,6 +165,7 @@ export class FileSender {
   private resumeTimeoutMs: number;
   private hashes: Map<string, string> = new Map();
   private manifest: TransferManifest | null = null;
+  private logger: RemoteDevLogger | null = null;
   public onProgress: ((progress: TransferProgress) => void) | null = null;
   public onComplete: (() => void) | null = null;
   public onError: ((error: string) => void) | null = null;
@@ -179,6 +182,7 @@ export class FileSender {
     this.transferId = options?.transferId || (typeof crypto.randomUUID === 'function' ? crypto.randomUUID() : `tx_${Date.now()}`);
     this.ackTimeoutMs = options?.ackTimeoutMs || DEFAULT_ACK_TIMEOUT_MS;
     this.resumeTimeoutMs = options?.resumeTimeoutMs || DEFAULT_RESUME_TIMEOUT_MS;
+    this.logger = options?.logger || null;
 
     for (const f of files) {
       this.totalBytes += f.size;
@@ -196,6 +200,10 @@ export class FileSender {
   attachDataChannel(newDc: RTCDataChannel): void {
     console.log('[TRANSFER][SEND] Attaching new DataChannel to FileSender');
     this.dc = newDc;
+  }
+
+  setLogger(logger: RemoteDevLogger | null): void {
+    this.logger = logger;
   }
 
   pause(): void {
@@ -217,13 +225,48 @@ export class FileSender {
       for (let i = 0; i < this.files.length; i++) {
         if (this.cancelled || this.isPaused) return;
         const file = this.files[i];
+        const fileStartTime = performance.now();
+        const totalChunks = file.size === 0 ? 0 : Math.ceil(file.size / CHUNK_SIZE);
+        const fileId = `file_${i}_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+
+        this.logger?.log('hash_started', {
+          transferId: this.transferId,
+          fileId,
+          fileName: file.name,
+          fileSize: file.size,
+          totalChunks,
+        });
+
         this.updateProgress(i, 'verifying');
 
-        const hash = await sha256File(file);
-        const fileId = `file_${i}_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+        let lastProgressReportPercent = 0;
+        const hash = await sha256File(file, (processed, total) => {
+          if (total > 0 && this.logger) {
+            const pct = Math.floor((processed / total) * 100);
+            if (pct >= lastProgressReportPercent + 10 || pct === 100) {
+              lastProgressReportPercent = pct;
+              this.logger.log('hash_progress', {
+                transferId: this.transferId,
+                fileId,
+                fileName: file.name,
+                fileSize: file.size,
+                percent: pct,
+              });
+            }
+          }
+        });
+
+        const hashElapsedMs = Math.round(performance.now() - fileStartTime);
         this.hashes.set(fileId, hash);
 
-        const totalChunks = file.size === 0 ? 0 : Math.ceil(file.size / CHUNK_SIZE);
+        this.logger?.log('hash_completed', {
+          transferId: this.transferId,
+          fileId,
+          fileName: file.name,
+          fileSize: file.size,
+          elapsedMs: hashElapsedMs,
+        });
+
         manifestFiles.push({
           id: fileId,
           name: file.name,
@@ -243,6 +286,12 @@ export class FileSender {
         files: manifestFiles,
       });
 
+      this.logger?.log('manifest_created', {
+        transferId: this.transferId,
+        fileSize: this.totalBytes,
+        totalChunks: manifestFiles.reduce((acc, f) => acc + f.totalChunks, 0),
+      });
+
       console.log(`[TRANSFER][SEND] Sending TRANSFER_START with manifest (${this.manifest.totalFiles} files, ${this.manifest.totalSize} bytes)`);
       const startMsg: TransferStartMessage = {
         type: 'TRANSFER_START',
@@ -251,10 +300,19 @@ export class FileSender {
       };
       this.dc.send(JSON.stringify(startMsg));
 
+      this.logger?.log('transfer_start_sent', {
+        transferId: this.transferId,
+        fileSize: this.totalBytes,
+      });
+
       await this.transferFiles();
     } catch (err: unknown) {
       const errorMsg = err instanceof Error ? err.message : 'Unknown transfer error';
       console.error('[TRANSFER][SEND] Transfer failed:', errorMsg);
+      this.logger?.log('sender_error', {
+        transferId: this.transferId,
+        message: errorMsg,
+      });
       if (this.onError && !this.cancelled && !this.isPaused) {
         this.onError(errorMsg);
       }
@@ -401,11 +459,22 @@ export class FileSender {
       };
       this.dc.send(JSON.stringify(fileStartMsg));
 
+      this.logger?.log('file_start_sent', {
+        transferId: this.transferId,
+        fileId,
+        fileName: file.name,
+        fileSize: file.size,
+        totalChunks,
+      });
+
       const chunksToSend = fileStatus
         ? fileStatus.missingChunks
         : Array.from({ length: totalChunks }, (_, idx) => idx);
 
       console.log(`[TRANSFER][SEND] Transmitting ${chunksToSend.length}/${totalChunks} chunks for '${file.name}'`);
+
+      let firstChunkLogged = false;
+      let lastChunkLoggedIndex = -1;
 
       for (const j of chunksToSend) {
         if (this.cancelled || this.isPaused) return;
@@ -440,6 +509,31 @@ export class FileSender {
 
         this.bytesTransferred += chunkData.byteLength;
 
+        if (!firstChunkLogged) {
+          firstChunkLogged = true;
+          this.logger?.log('first_chunk_sent', {
+            transferId: this.transferId,
+            fileId,
+            fileName: file.name,
+            chunkIndex: j,
+            totalChunks,
+          });
+        }
+
+        // Periodic chunk progress: log every 100 chunks or on the last chunk
+        if (j - lastChunkLoggedIndex >= 100 || j === chunksToSend[chunksToSend.length - 1]) {
+          lastChunkLoggedIndex = j;
+          const pct = totalChunks > 0 ? Math.round(((j + 1) / totalChunks) * 100) : 100;
+          this.logger?.log('chunk_progress', {
+            transferId: this.transferId,
+            fileId,
+            fileName: file.name,
+            chunkIndex: j + 1,
+            totalChunks,
+            percent: pct,
+          });
+        }
+
         if (j % 500 === 0 || j === chunksToSend[chunksToSend.length - 1]) {
           console.log(`[TRANSFER][SEND][CHUNK] sent index=${j + 1}/${totalChunks} bytes=${chunkData.byteLength}`);
         }
@@ -457,6 +551,13 @@ export class FileSender {
         fileId,
       };
       this.dc.send(JSON.stringify(fileEndMsg));
+
+      this.logger?.log('file_end_sent', {
+        transferId: this.transferId,
+        fileId,
+        fileName: file.name,
+        totalChunks,
+      });
 
       // Wait for FILE_ACK with timeout
       await new Promise<void>((resolve, reject) => {
@@ -482,6 +583,12 @@ export class FileSender {
               const msg = JSON.parse(event.data);
               if (msg.type === 'FILE_ACK' && msg.fileId === fileId && msg.transferId === this.transferId) {
                 console.log(`[TRANSFER][SEND] Received FILE_ACK (fileId=${fileId}, match=${msg.sha256Match})`);
+                this.logger?.log('file_ack_received', {
+                  transferId: this.transferId,
+                  fileId,
+                  fileName: file.name,
+                  message: `match=${msg.sha256Match}`,
+                });
                 cleanup();
                 if (!msg.sha256Match) {
                   reject(new Error(`SHA-256 mismatch on receiver for file '${file.name}': ${msg.error || 'integrity check failed'}`));
@@ -515,6 +622,18 @@ export class FileSender {
       transferId: this.transferId,
     };
     this.dc.send(JSON.stringify(transferEndMsg));
+
+    this.logger?.log('transfer_end_sent', {
+      transferId: this.transferId,
+      fileSize: this.totalBytes,
+    });
+
+    this.logger?.log('sender_completed', {
+      transferId: this.transferId,
+      fileSize: this.totalBytes,
+      elapsedMs: Math.round(Date.now() - this.startTime),
+    });
+
     if (this.onComplete) this.onComplete();
   }
 

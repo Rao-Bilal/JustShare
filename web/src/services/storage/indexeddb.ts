@@ -1,9 +1,10 @@
 import { ManifestFileEntry, TransferManifest } from '../../types';
-import { IncrementalSha256 } from '../crypto';
+import { createStreamingHasher } from '../crypto';
 import { StoredFileInfo, StoredTransferInfo, TransferStorage } from './types';
 
 const DB_NAME = 'justshare_storage_v1';
 const DB_VERSION = 1;
+export const VERIFY_BATCH_SIZE = 200;
 
 export class IndexedDBTransferStorage implements TransferStorage {
   readonly name = 'IndexedDBTransferStorage';
@@ -337,58 +338,87 @@ export class IndexedDBTransferStorage implements TransferStorage {
       return { match, calculatedSha256: emptyHash, blob };
     }
 
-    const hasher = new IncrementalSha256();
+    const hasher = await createStreamingHasher();
+    console.log(`[TRANSFER][RECV][VERIFY] START fileId=${fileId} hasher=${hasher.implementationName}`);
     const chunkParts: Uint8Array[] = [];
     let bytesProcessed = 0;
     let expectedIndex = 0;
+    const batchSize = VERIFY_BATCH_SIZE;
 
-    console.log(`[TRANSFER][RECV][VERIFY] reading chunks`);
-    await new Promise<void>((resolve, reject) => {
-      const tx = db.transaction(['chunks'], 'readonly');
-      const store = tx.objectStore('chunks');
-      const index = store.index('by_file');
-      const range = IDBKeyRange.only([transferId, fileId]);
-      const request = index.openCursor(range);
+    let totalGetAllTimeMs = 0;
+    let totalHasherUpdateTimeMs = 0;
+    let totalOnProgressTimeMs = 0;
 
-      request.onsuccess = () => {
-        const cursor = request.result;
-        if (cursor) {
-          const rec = cursor.value;
-          if (rec.index !== expectedIndex) {
-            reject(new Error(`Missing or out-of-order chunk: expected ${expectedIndex}, got ${rec.index}`));
-            return;
-          }
-          const chunkData = rec.data as Uint8Array;
-          hasher.update(chunkData);
-          chunkParts.push(chunkData);
-          bytesProcessed += chunkData.byteLength;
-          expectedIndex++;
+    console.log(`[TRANSFER][RECV][VERIFY] reading chunks in batches of ${batchSize}`);
+    while (expectedIndex < file.totalChunks) {
+      const batchStartIndex = expectedIndex;
+      const batchEndIndex = Math.min(file.totalChunks - 1, batchStartIndex + batchSize - 1);
+      const batchRange = IDBKeyRange.bound(
+        [transferId, fileId, batchStartIndex],
+        [transferId, fileId, batchEndIndex]
+      );
 
-          if (expectedIndex % 500 === 0 || expectedIndex === file.totalChunks) {
-            console.log(`[TRANSFER][RECV][VERIFY] processed chunk ${expectedIndex}/${file.totalChunks} (${(performance.now() - t0).toFixed(0)}ms)`);
-          }
+      const tGetAllStart = performance.now();
+      const batchRecords = await new Promise<{ index: number; data: Uint8Array; byteLength: number }[]>((resolve, reject) => {
+        const tx = db.transaction(['chunks'], 'readonly');
+        const store = tx.objectStore('chunks');
+        const req = store.getAll(batchRange);
 
-          if (onProgress) {
-            onProgress(bytesProcessed, file.size);
-          }
+        req.onsuccess = () => {
+          resolve(req.result as { index: number; data: Uint8Array; byteLength: number }[]);
+        };
+        req.onerror = () => reject(req.error);
+      });
+      totalGetAllTimeMs += performance.now() - tGetAllStart;
 
-          cursor.continue();
-        } else {
-          if (expectedIndex < file.totalChunks) {
-            reject(new Error(`Missing chunks: received ${expectedIndex} of ${file.totalChunks}`));
-            return;
-          }
-          resolve();
+      const expectedBatchCount = batchEndIndex - batchStartIndex + 1;
+      if (batchRecords.length !== expectedBatchCount) {
+        throw new Error(`Missing chunks: received ${expectedIndex + batchRecords.length} of ${file.totalChunks}`);
+      }
+
+      for (let b = 0; b < batchRecords.length; b++) {
+        const rec = batchRecords[b];
+        if (rec.index !== expectedIndex) {
+          throw new Error(`Missing or out-of-order chunk: expected ${expectedIndex}, got ${rec.index}`);
         }
-      };
+        const chunkData = rec.data as Uint8Array;
+        
+        const tHashStart = performance.now();
+        hasher.update(chunkData);
+        totalHasherUpdateTimeMs += performance.now() - tHashStart;
 
-      request.onerror = () => reject(request.error);
-    });
+        chunkParts.push(chunkData);
+        bytesProcessed += chunkData.byteLength;
+        expectedIndex++;
 
+        if (expectedIndex % 500 === 0 || expectedIndex === file.totalChunks) {
+          console.log(`[TRANSFER][RECV][VERIFY] processed chunk ${expectedIndex}/${file.totalChunks} (${(performance.now() - t0).toFixed(0)}ms)`);
+        }
+
+        if (onProgress) {
+          const tProgStart = performance.now();
+          onProgress(bytesProcessed, file.size);
+          totalOnProgressTimeMs += performance.now() - tProgStart;
+        }
+      }
+    }
+
+    const tDigestStart = performance.now();
     const calculatedSha256 = hasher.digest();
+    const digestTimeMs = performance.now() - tDigestStart;
     const match = calculatedSha256.toLowerCase() === expectedSha256.toLowerCase();
     const verifyDuration = performance.now() - t0;
+    const everythingElseMs = verifyDuration - (totalGetAllTimeMs + totalHasherUpdateTimeMs + totalOnProgressTimeMs);
+
     console.log(`[TRANSFER][RECV][VERIFY] SHA256 complete match=${match} calculated=${calculatedSha256} elapsed=${verifyDuration.toFixed(0)}ms`);
+    console.log(
+      `[TRANSFER][RECV][VERIFY][TIMING_BREAKDOWN] fileId=${fileId} totalVerifyMs=${verifyDuration.toFixed(2)}ms ` +
+      `| getAllAwaitsMs=${totalGetAllTimeMs.toFixed(2)}ms ` +
+      `| hasherUpdateMs=${totalHasherUpdateTimeMs.toFixed(2)}ms ` +
+      `| onProgressMs=${totalOnProgressTimeMs.toFixed(2)}ms ` +
+      `| everythingElseMs=${everythingElseMs.toFixed(2)}ms ` +
+      `| (digestTime=${digestTimeMs.toFixed(2)}ms)`
+    );
 
     if (!match) {
       return { match: false, calculatedSha256, blob: new Blob() };

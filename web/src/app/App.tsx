@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { createSession, getSession, joinSession, updateSessionState } from '../services/api';
+import { formatRemoteLog, RemoteDevLogger, RemoteLogPayload } from '../services/devLogger';
 import { getOrCreateDevice, resetDevice } from '../services/device';
 import { formatBytes, formatEta, formatSpeed } from '../services/format';
 import { SignalingClient } from '../services/signaling';
@@ -192,6 +193,17 @@ export function App() {
     const fileArray = Array.from(files);
     console.log(`[TRANSFER][SEND] file selected: ${fileArray.length} file(s)`);
     setSelectedFilesState(fileArray);
+
+    if (sigRef.current && deviceRef.current) {
+      const logger = new RemoteDevLogger(sigRef.current, deviceRef.current.device_id);
+      fileArray.forEach((f) => {
+        logger.log('file_selected', {
+          fileName: f.name,
+          fileSize: f.size,
+          totalChunks: f.size === 0 ? 0 : Math.ceil(f.size / 65536),
+        });
+      });
+    }
   };
 
   const sendFileMetadata = () => {
@@ -391,7 +403,8 @@ export function App() {
           updateSessionState(curDevice.token, curSession.session_id, 'TRANSFERRING').catch((err) => {
             console.error('[TRANSFER][SEND] Failed to update state to TRANSFERRING', err);
           });
-          const sender = new FileSender(dc, curFiles);
+          const devLogger = curSig && curDevice ? new RemoteDevLogger(curSig, curDevice.device_id) : undefined;
+          const sender = new FileSender(dc, curFiles, { logger: devLogger });
           senderRef.current = sender;
           sender.onProgress = setTransferProgress;
           sender.onComplete = () => {
@@ -493,6 +506,13 @@ export function App() {
           rtcRef.current.handleSignal(signalMsg.payload);
         } else if (!rtcRef.current) {
           console.warn('[SIGNAL][RECEIVE] Received signal before rtcRef was ready');
+        }
+      });
+
+      sig.on('dev_log', (msg: unknown) => {
+        const payload = (msg as { payload: RemoteLogPayload }).payload;
+        if (payload) {
+          console.log(formatRemoteLog(payload));
         }
       });
 
