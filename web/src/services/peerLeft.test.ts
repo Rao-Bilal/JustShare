@@ -45,7 +45,7 @@ class MockDataChannel {
     }
   }
 
-  send(_data: string | ArrayBuffer): void {
+  send(): void {
     // mock send
   }
 
