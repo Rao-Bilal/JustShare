@@ -9,6 +9,8 @@ import { FileReceiver, FileSender } from '../services/transfer';
 import { WebRTCConnection } from '../services/webrtc';
 import { AppScreen, DeviceInfo, FileInfo, SessionInfo, SessionState, TransferProgress } from '../types';
 import { decidePeerLeftAction } from '../services/peerLeft';
+import { determineInitialUrlAction } from '../services/pairingUrl';
+import { QRCodeDisplay } from '../components/QRCodeDisplay';
 
 export function App() {
   const [device, setDevice] = useState<{ device_id: string; display_name: string; token: string } | null>(null);
@@ -36,6 +38,7 @@ export function App() {
   const deviceRef = useRef<{ device_id: string; display_name: string; token: string } | null>(null);
   const selectedFilesRef = useRef<File[]>([]);
   const peerDeviceRef = useRef<DeviceInfo | null>(null);
+  const hasAutoJoinedRef = useRef(false);
 
   const setScreenState = (s: AppScreen) => {
     screenRef.current = s;
@@ -71,9 +74,35 @@ export function App() {
         console.warn('Failed to initialize transfer storage:', err);
       });
 
+    const initialUrlAction = determineInitialUrlAction(window.location.hash);
+    if (initialUrlAction.action !== 'none') {
+      window.history.replaceState(null, document.title, window.location.pathname + window.location.search);
+    }
+
+    if (initialUrlAction.action === 'join') {
+      setRole('receiver');
+      setScreenState('receive');
+      setPairingInput(initialUrlAction.code);
+      setJoining(true);
+    } else if (initialUrlAction.action === 'error') {
+      setRole('receiver');
+      setScreenState('receive');
+      setError(initialUrlAction.message);
+    }
+
     getOrCreateDevice()
-      .then(setDeviceState)
-      .catch((e: unknown) => setError(e instanceof Error ? e.message : 'Device init error'));
+      .then((freshDev) => {
+        setDeviceState(freshDev);
+        if (initialUrlAction.action === 'join' && !hasAutoJoinedRef.current) {
+          hasAutoJoinedRef.current = true;
+          submitPairingCode(initialUrlAction.code, freshDev);
+        }
+      })
+      .catch((e: unknown) => {
+        const errorMsg = e instanceof Error ? e.message : 'Device init error';
+        setError('Device registration failed: ' + errorMsg);
+        setJoining(false);
+      });
   }, []);
 
   // Poll for peer info if waiting on send screen
@@ -497,15 +526,19 @@ export function App() {
     setScreenState('receive');
   };
 
-  const submitPairingCode = async (codeToJoin: string) => {
-    if (codeToJoin.length !== 6 || joining) return;
+  const submitPairingCode = async (
+    codeToJoin: string,
+    targetDevice?: { device_id: string; display_name: string; token: string }
+  ) => {
+    if (codeToJoin.length !== 6) return;
     setJoining(true);
     setError(null);
 
-    let currentDevice = deviceRef.current;
+    let currentDevice = targetDevice || deviceRef.current;
     if (!currentDevice) {
       currentDevice = await handleAuthFailure();
       if (!currentDevice) {
+        setError('Device registration failed. Please refresh.');
         setJoining(false);
         return;
       }
@@ -729,7 +762,7 @@ export function App() {
 
           {!peerDevice ? (
             <div>
-              <p className="status-msg">Share this temporary 6-digit code with the receiver:</p>
+              <p className="status-msg">Share this temporary 6-digit code or scan the QR code to pair:</p>
               <div className="pairing-code">
                 {session.pairing_code.split('').map((digit, i) => (
                   <div key={i} className="pairing-digit">
@@ -737,6 +770,7 @@ export function App() {
                   </div>
                 ))}
               </div>
+              <QRCodeDisplay pairingCode={session.pairing_code} />
               <p className="note" style={{ textAlign: 'center' }}>
                 <span className="spinner"></span> Waiting for receiver to join...
               </p>
