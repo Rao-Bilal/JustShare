@@ -156,6 +156,7 @@ export interface SenderOptions {
   transferId?: string;
   chunkSize?: number;
   ackTimeoutMs?: number;
+  ackHardCeilingTimeoutMs?: number;
   resumeTimeoutMs?: number;
   logger?: RemoteDevLogger;
 }
@@ -165,6 +166,7 @@ export class FileSender {
   private files: File[];
   private transferId: string;
   private ackTimeoutMs: number;
+  private ackHardCeilingTimeoutMs: number;
   private resumeTimeoutMs: number;
   private hashes: Map<string, string> = new Map();
   private manifest: TransferManifest | null = null;
@@ -174,6 +176,9 @@ export class FileSender {
   public onError: ((error: string) => void) | null = null;
   private cancelled = false;
   private isPaused = false;
+  private isCompleted = false;
+  private abortedError: Error | null = null;
+  private onControlAbort: ((err: Error) => void) | null = null;
 
   private totalBytes = 0;
   private bytesTransferred = 0;
@@ -184,6 +189,7 @@ export class FileSender {
     this.files = files;
     this.transferId = options?.transferId || (typeof crypto.randomUUID === 'function' ? crypto.randomUUID() : `tx_${Date.now()}`);
     this.ackTimeoutMs = options?.ackTimeoutMs || DEFAULT_ACK_TIMEOUT_MS;
+    this.ackHardCeilingTimeoutMs = options?.ackHardCeilingTimeoutMs || ACK_HARD_CEILING_TIMEOUT_MS;
     this.resumeTimeoutMs = options?.resumeTimeoutMs || DEFAULT_RESUME_TIMEOUT_MS;
     this.logger = options?.logger || null;
 
@@ -220,13 +226,56 @@ export class FileSender {
   async start(): Promise<void> {
     this.startTime = Date.now();
     this.isPaused = false;
+    this.isCompleted = false;
+    this.abortedError = null;
     console.log('[TRANSFER][SEND] Calculating hashes before transfer start');
+
+    const controlHandler = (event: MessageEvent) => {
+      if (this.isCompleted || this.cancelled) return;
+      if (typeof event.data === 'string') {
+        try {
+          const msg = JSON.parse(event.data);
+          if (msg.type === 'CANCEL') {
+            console.log('[TRANSFER][SEND] Received CANCEL signal from receiver');
+            this.cancelled = true;
+            this.abortedError = new Error(`Transfer cancelled by receiver: ${msg.reason || 'unspecified'}`);
+            if (this.onControlAbort) {
+              this.onControlAbort(this.abortedError);
+            }
+          } else if (msg.type === 'ERROR') {
+            console.error('[TRANSFER][SEND] Received ERROR signal from receiver', msg);
+            this.cancelled = true;
+            this.abortedError = new Error(`Transfer error from receiver: ${msg.message || msg.code || 'Transfer error'}`);
+            if (this.onControlAbort) {
+              this.onControlAbort(this.abortedError);
+            }
+          }
+        } catch {
+          // ignore malformed JSON
+        }
+      }
+    };
+
+    const closeHandler = () => {
+      if (this.isCompleted || this.cancelled || this.isPaused) return;
+      this.cancelled = true;
+      this.abortedError = new Error('DataChannel closed unexpectedly');
+      if (this.onControlAbort) {
+        this.onControlAbort(this.abortedError);
+      }
+    };
+
+    this.dc.addEventListener('message', controlHandler);
+    this.dc.addEventListener('close', closeHandler);
 
     try {
       const manifestFiles: ManifestFileEntry[] = [];
 
       for (let i = 0; i < this.files.length; i++) {
-        if (this.cancelled || this.isPaused) return;
+        if (this.cancelled || this.isPaused || this.abortedError) {
+          if (this.abortedError) throw this.abortedError;
+          return;
+        }
         const file = this.files[i];
         const fileStartTime = performance.now();
         const totalChunks = file.size === 0 ? 0 : Math.ceil(file.size / CHUNK_SIZE);
@@ -259,6 +308,11 @@ export class FileSender {
           }
         });
 
+        if (this.cancelled || this.isPaused || this.abortedError) {
+          if (this.abortedError) throw this.abortedError;
+          return;
+        }
+
         const hashElapsedMs = Math.round(performance.now() - fileStartTime);
         this.hashes.set(fileId, hash);
 
@@ -280,7 +334,10 @@ export class FileSender {
         });
       }
 
-      if (this.cancelled || this.isPaused) return;
+      if (this.cancelled || this.isPaused || this.abortedError) {
+        if (this.abortedError) throw this.abortedError;
+        return;
+      }
 
       this.manifest = validateManifest({
         transferId: this.transferId,
@@ -316,9 +373,13 @@ export class FileSender {
         transferId: this.transferId,
         message: errorMsg,
       });
-      if (this.onError && !this.cancelled && !this.isPaused) {
+      if (this.onError && !this.isCompleted && !this.isPaused) {
         this.onError(errorMsg);
       }
+    } finally {
+      this.dc.removeEventListener('message', controlHandler);
+      this.dc.removeEventListener('close', closeHandler);
+      this.onControlAbort = null;
     }
   }
 
@@ -326,13 +387,53 @@ export class FileSender {
     if (newDc) {
       this.attachDataChannel(newDc);
     }
-    if (this.cancelled) return;
+    this.cancelled = false;
     this.isPaused = false;
+    this.isCompleted = false;
+    this.abortedError = null;
 
     console.log(`[TRANSFER][SEND] Initiating resume handshake for transfer ${this.transferId}`);
     if (this.onProgress && this.files.length > 0) {
       this.updateProgress(0, 'resuming');
     }
+
+    const controlHandler = (event: MessageEvent) => {
+      if (this.isCompleted || this.cancelled) return;
+      if (typeof event.data === 'string') {
+        try {
+          const msg = JSON.parse(event.data);
+          if (msg.type === 'CANCEL') {
+            console.log('[TRANSFER][SEND] Received CANCEL signal from receiver');
+            this.cancelled = true;
+            this.abortedError = new Error(`Transfer cancelled by receiver: ${msg.reason || 'unspecified'}`);
+            if (this.onControlAbort) {
+              this.onControlAbort(this.abortedError);
+            }
+          } else if (msg.type === 'ERROR') {
+            console.error('[TRANSFER][SEND] Received ERROR signal from receiver', msg);
+            this.cancelled = true;
+            this.abortedError = new Error(`Transfer error from receiver: ${msg.message || msg.code || 'Transfer error'}`);
+            if (this.onControlAbort) {
+              this.onControlAbort(this.abortedError);
+            }
+          }
+        } catch {
+          // ignore malformed JSON
+        }
+      }
+    };
+
+    const closeHandler = () => {
+      if (this.isCompleted || this.cancelled || this.isPaused) return;
+      this.cancelled = true;
+      this.abortedError = new Error('DataChannel closed unexpectedly');
+      if (this.onControlAbort) {
+        this.onControlAbort(this.abortedError);
+      }
+    };
+
+    this.dc.addEventListener('message', controlHandler);
+    this.dc.addEventListener('close', closeHandler);
 
     try {
       if (!this.manifest) {
@@ -359,6 +460,12 @@ export class FileSender {
           clearTimeout(timer);
           this.dc.removeEventListener('message', handler);
           this.dc.removeEventListener('close', closeHandler);
+          this.onControlAbort = null;
+        };
+
+        this.onControlAbort = (err: Error) => {
+          cleanup();
+          reject(err);
         };
 
         const closeHandler = () => {
@@ -374,12 +481,6 @@ export class FileSender {
                 console.log('[TRANSFER][SEND] Received RESUME_RESPONSE:', msg);
                 cleanup();
                 resolve(msg as ResumeResponseMessage);
-              } else if (msg.type === 'CANCEL') {
-                cleanup();
-                reject(new Error(`Transfer cancelled by receiver: ${msg.reason}`));
-              } else if (msg.type === 'ERROR') {
-                cleanup();
-                reject(new Error(`Receiver error: ${msg.message || msg.code}`));
               }
             } catch {
               // ignore parse errors
@@ -423,9 +524,13 @@ export class FileSender {
     } catch (err: unknown) {
       const errorMsg = err instanceof Error ? err.message : 'Resume failed';
       console.error('[TRANSFER][SEND] Resume failed:', errorMsg);
-      if (this.onError && !this.cancelled && !this.isPaused) {
+      if (this.onError && !this.isCompleted && !this.isPaused) {
         this.onError(errorMsg);
       }
+    } finally {
+      this.dc.removeEventListener('message', controlHandler);
+      this.dc.removeEventListener('close', closeHandler);
+      this.onControlAbort = null;
     }
   }
 
@@ -480,7 +585,10 @@ export class FileSender {
       let lastChunkLoggedIndex = -1;
 
       for (const j of chunksToSend) {
-        if (this.cancelled || this.isPaused) return;
+        if (this.cancelled || this.isPaused || this.abortedError) {
+          if (this.abortedError) throw this.abortedError;
+          return;
+        }
 
         const start = j * CHUNK_SIZE;
         const end = Math.min(start + CHUNK_SIZE, file.size);
@@ -509,6 +617,11 @@ export class FileSender {
         payload.set(new Uint8Array(chunkData), 4 + headerBytes.length);
 
         await sendChunkWithBackpressure(this.dc, payload.buffer);
+
+        if (this.cancelled || this.isPaused || this.abortedError) {
+          if (this.abortedError) throw this.abortedError;
+          return;
+        }
 
         this.bytesTransferred += chunkData.byteLength;
 
@@ -579,14 +692,20 @@ export class FileSender {
 
         hardCeilingTimer = setTimeout(() => {
           cleanup();
-          reject(new Error(`Hard ceiling timeout (15m) exceeded waiting for receiver ACK for file ${file.name}`));
-        }, ACK_HARD_CEILING_TIMEOUT_MS);
+          reject(new Error(`Hard ceiling timeout exceeded waiting for receiver ACK for file ${file.name}`));
+        }, this.ackHardCeilingTimeoutMs);
 
         const cleanup = () => {
           if (ackTimer) clearTimeout(ackTimer);
           if (hardCeilingTimer) clearTimeout(hardCeilingTimer);
           this.dc.removeEventListener('message', handler);
           this.dc.removeEventListener('close', closeHandler);
+          this.onControlAbort = null;
+        };
+
+        this.onControlAbort = (err: Error) => {
+          cleanup();
+          reject(err);
         };
 
         const closeHandler = () => {
@@ -615,14 +734,6 @@ export class FileSender {
               } else if (msg.type === 'VERIFYING' && msg.fileId === fileId && msg.transferId === this.transferId) {
                 console.log(`[TRANSFER][SEND] Received VERIFYING keepalive for file ${fileId}`);
                 resetAckTimer();
-              } else if (msg.type === 'CANCEL') {
-                console.log('[TRANSFER][SEND] Received CANCEL signal');
-                cleanup();
-                reject(new Error(`Transfer cancelled by receiver: ${msg.reason}`));
-              } else if (msg.type === 'ERROR') {
-                console.error('[TRANSFER][SEND] Received ERROR signal', msg);
-                cleanup();
-                reject(new Error(`Transfer error from receiver: ${msg.message || msg.code}`));
               }
             } catch {
               // ignore JSON parse errors on malformed messages
@@ -635,7 +746,10 @@ export class FileSender {
       });
     }
 
-    if (this.cancelled || this.isPaused) return;
+    if (this.cancelled || this.isPaused || this.abortedError) {
+      if (this.abortedError) throw this.abortedError;
+      return;
+    }
     console.log('[TRANSFER][SEND] Sending TRANSFER_END');
     const transferEndMsg: TransferEndMessage = {
       type: 'TRANSFER_END',
@@ -654,6 +768,7 @@ export class FileSender {
       elapsedMs: Math.round(Date.now() - this.startTime),
     });
 
+    this.isCompleted = true;
     if (this.onComplete) this.onComplete();
   }
 
@@ -674,12 +789,21 @@ export class FileSender {
     }
   }
 
-  private updateProgress(fileIndex: number, state: TransferProgress['state']) {
+  private lastProgressEmitTime = 0;
+
+  private updateProgress(fileIndex: number, state: TransferProgress['state'], force = false) {
     if (!this.onProgress) return;
 
+    const now = performance.now();
     const currentFile = this.files[fileIndex] || this.files[0];
     const currentName = currentFile ? currentFile.name : '';
     const percentage = this.totalBytes === 0 ? 100 : Math.min(100, (this.bytesTransferred / this.totalBytes) * 100);
+
+    // Throttle progress updates to at most 4/s (every 250ms), except for forced updates, state transitions, or 100% completion
+    if (!force && percentage < 100 && now - this.lastProgressEmitTime < 250) {
+      return;
+    }
+    this.lastProgressEmitTime = now;
 
     const elapsed = (Date.now() - this.startTime) / 1000;
     const speed = elapsed > 0 ? this.bytesTransferred / elapsed : 0;
@@ -1168,6 +1292,7 @@ export class FileReceiver {
       } catch {
         // ignore send error
       }
+      this.sendError('VERIFY_FAILED', errorMsg);
       this.clearStallTimer();
       this.transitionTo('failed');
       if (this.onError) {
@@ -1234,10 +1359,23 @@ export class FileReceiver {
     }
   }
 
-  private updateProgress(state: TransferProgress['state']) {
+  private lastProgressEmitTime = 0;
+  private lastEmittedState: TransferProgress['state'] | null = null;
+
+  private updateProgress(state: TransferProgress['state'], force = false) {
     if (!this.onProgress) return;
 
+    const now = performance.now();
     const percentage = this.totalBytes === 0 ? 100 : Math.min(100, (this.totalReceivedBytes / this.totalBytes) * 100);
+
+    const stateChanged = this.lastEmittedState !== state;
+
+    // Throttle progress updates to at most 4/s (every 250ms), except for forced updates, state transitions, or 100% completion
+    if (!force && !stateChanged && percentage < 100 && now - this.lastProgressEmitTime < 250) {
+      return;
+    }
+    this.lastEmittedState = state;
+    this.lastProgressEmitTime = now;
 
     const elapsed = (Date.now() - this.startTime) / 1000;
     const speed = elapsed > 0 ? this.totalReceivedBytes / elapsed : 0;

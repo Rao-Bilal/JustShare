@@ -571,9 +571,11 @@ export function App() {
       console.log('[TRANSFER][RECEIVE] DataChannel received, starting FileReceiver');
       const receiver = new FileReceiver(dc, { storage: storageRef.current || undefined });
       receiverRef.current = receiver;
+      let lastVerifyingFileIndex = -1;
       receiver.onProgress = (progress) => {
         setTransferProgress(progress);
-        if (progress.state === 'verifying') {
+        if (progress.state === 'verifying' && progress.currentFileIndex !== lastVerifyingFileIndex) {
+          lastVerifyingFileIndex = progress.currentFileIndex;
           updateSessionState(curDevice.token, curSession.session_id, 'VERIFYING').catch((err) => {
             console.error('[TRANSFER][RECEIVE] Failed to update state to VERIFYING', err);
           });

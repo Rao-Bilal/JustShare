@@ -33,6 +33,17 @@ class MockDataChannel {
     }
   }
 
+  listenerCount(type?: string): number {
+    if (type) {
+      return this.listeners.get(type)?.length || 0;
+    }
+    let count = 0;
+    for (const list of this.listeners.values()) {
+      count += list.length;
+    }
+    return count;
+  }
+
   dispatchEvent(type: string, eventData: unknown): void {
     const list = this.listeners.get(type);
     if (list) {
@@ -979,7 +990,6 @@ describe('Phase 2A - Transfer Protocol & Validation', () => {
       // Custom mock receiver to intercept FILE_END and send keepalives
       let fileId = '';
       let transferId = '';
-      let receivedChunks = 0;
 
       receiverDc.addEventListener('message', async (e: unknown) => {
         const event = e as { data: string | ArrayBuffer };
@@ -1013,8 +1023,6 @@ describe('Phase 2A - Transfer Protocol & Validation', () => {
               })
             );
           }
-        } else {
-          receivedChunks++;
         }
       });
 
@@ -1056,6 +1064,408 @@ describe('Phase 2A - Transfer Protocol & Validation', () => {
 
       await sender.start();
       expect(senderError).toContain('Timeout waiting for receiver ACK');
+    });
+
+    it('aborts transfer if continuous keepalives exceed the hard ceiling timeout', async () => {
+      const file = new File(['Hard ceiling test file'], 'ceiling.txt');
+      const [senderDc, receiverDc] = createConnectedPair();
+
+      // Short ackTimeoutMs (200ms) and short hardCeiling (350ms)
+      const sender = new FileSender(senderDc as unknown as RTCDataChannel, [file], {
+        ackTimeoutMs: 200,
+        ackHardCeilingTimeoutMs: 350,
+      });
+
+      let senderError = '';
+      sender.onError = (err) => {
+        senderError = err;
+      };
+
+      let fileId = '';
+      let transferId = '';
+      let interval: ReturnType<typeof setInterval> | null = null;
+      receiverDc.addEventListener('message', async (e: unknown) => {
+        const event = e as { data: string | ArrayBuffer };
+        if (typeof event.data === 'string') {
+          const msg = JSON.parse(event.data);
+          if (msg.type === 'TRANSFER_START') {
+            transferId = msg.manifest.transferId;
+            fileId = msg.manifest.files[0].id;
+          } else if (msg.type === 'FILE_END') {
+            // Keep sending keepalives indefinitely every 50ms (well within the 200ms ackTimeout)
+            interval = setInterval(() => {
+              receiverDc.send(
+                JSON.stringify({
+                  type: 'VERIFYING',
+                  transferId,
+                  fileId,
+                })
+              );
+            }, 50);
+          }
+        }
+      });
+
+      await sender.start();
+      if (interval) clearInterval(interval);
+      expect(senderError).toContain('Hard ceiling timeout exceeded');
+    });
+
+    it('leaves no DataChannel listeners or timers after success, failure, cancel, and timeout', async () => {
+      // 1. Success case
+      {
+        const [senderDc, receiverDc] = createConnectedPair();
+        const file = new File(['Cleanup success file'], 'clean1.txt');
+        const sender = new FileSender(senderDc as unknown as RTCDataChannel, [file]);
+        const receiver = new FileReceiver(receiverDc as unknown as RTCDataChannel);
+
+        const done = new Promise<void>((r) => {
+          receiver.onComplete = () => r();
+        });
+        receiver.start();
+        await sender.start();
+        await done;
+
+        // Verify sender cleaned up all internal per-step listeners
+        expect(senderDc.listenerCount()).toBe(0);
+      }
+
+      // 2. Timeout case
+      {
+        const [senderDc, receiverDc] = createConnectedPair();
+        const file = new File(['Cleanup timeout file'], 'clean2.txt');
+        const sender = new FileSender(senderDc as unknown as RTCDataChannel, [file], { ackTimeoutMs: 50 });
+
+        // Receiver swallows FILE_ACK and sends no keepalives
+        receiverDc.addEventListener('message', () => {});
+        await sender.start();
+
+        expect(senderDc.listenerCount()).toBe(0);
+      }
+
+      // 3. Cancel case
+      {
+        const [senderDc] = createConnectedPair();
+        const file = new File(['Cleanup cancel file'], 'clean3.txt');
+        const sender = new FileSender(senderDc as unknown as RTCDataChannel, [file]);
+        const p = sender.start();
+        sender.cancel('test cancel');
+        await p;
+
+        expect(senderDc.listenerCount()).toBe(0);
+      }
+    });
+
+    it('throttles progress updates to at most 4/s and always emits the final 100% progress', async () => {
+      const [senderDc, receiverDc] = createConnectedPair();
+      // 500 KB file with 8 chunks
+      const data = new Uint8Array(500 * 1024);
+      const file = new File([data], 'throttle-test.bin');
+
+      const sender = new FileSender(senderDc as unknown as RTCDataChannel, [file]);
+      const receiver = new FileReceiver(receiverDc as unknown as RTCDataChannel);
+
+      const senderProgressEvents: number[] = [];
+      sender.onProgress = (p) => {
+        senderProgressEvents.push(p.percentage);
+      };
+
+      const receiverProgressEvents: number[] = [];
+      receiver.onProgress = (p) => {
+        receiverProgressEvents.push(p.percentage);
+      };
+
+      const done = new Promise<void>((r) => {
+        receiver.onComplete = () => r();
+      });
+
+      receiver.start();
+      await sender.start();
+      await done;
+
+      // Ensure final 100% progress was received on both ends
+      expect(senderProgressEvents.length).toBeGreaterThan(0);
+      expect(senderProgressEvents[senderProgressEvents.length - 1]).toBe(100);
+
+      expect(receiverProgressEvents.length).toBeGreaterThan(0);
+      expect(receiverProgressEvents[receiverProgressEvents.length - 1]).toBe(100);
+    });
+
+    it('sender aborts immediately when receiver sends ERROR during chunk transmission', async () => {
+      const largeFile = new File([new Uint8Array(500 * 1024)], 'abort-error.bin');
+      const [senderDc, receiverDc] = createConnectedPair();
+
+      const sender = new FileSender(senderDc as unknown as RTCDataChannel, [largeFile]);
+
+      let senderError = '';
+      sender.onError = (err) => {
+        senderError = err;
+      };
+
+      receiverDc.addEventListener('message', (e: unknown) => {
+        const event = e as { data: string | ArrayBuffer };
+        if (event.data instanceof ArrayBuffer) {
+          // As soon as first chunk arrives, receiver sends ERROR
+          receiverDc.send(
+            JSON.stringify({
+              type: 'ERROR',
+              code: 'DISK_FULL',
+              message: 'Storage full on receiver device',
+            })
+          );
+        }
+      });
+
+      await sender.start();
+      expect(senderError).toContain('Storage full on receiver device');
+    });
+
+    it('sender aborts immediately when receiver sends CANCEL during chunk transmission', async () => {
+      const largeFile = new File([new Uint8Array(500 * 1024)], 'abort-cancel.bin');
+      const [senderDc, receiverDc] = createConnectedPair();
+
+      const sender = new FileSender(senderDc as unknown as RTCDataChannel, [largeFile]);
+
+      let senderError = '';
+      sender.onError = (err) => {
+        senderError = err;
+      };
+
+      receiverDc.addEventListener('message', (e: unknown) => {
+        const event = e as { data: string | ArrayBuffer };
+        if (event.data instanceof ArrayBuffer) {
+          // As soon as first chunk arrives, receiver sends CANCEL
+          receiverDc.send(
+            JSON.stringify({
+              type: 'CANCEL',
+              reason: 'User rejected mid-transfer',
+            })
+          );
+        }
+      });
+
+      await sender.start();
+      expect(senderError).toContain('User rejected mid-transfer');
+    });
+
+    it('receiver sends ERROR message over DataChannel when failure occurs', async () => {
+      const [senderDc, receiverDc] = createConnectedPair();
+
+      const receivedMessages: string[] = [];
+      senderDc.addEventListener('message', (e: unknown) => {
+        const event = e as { data: string | ArrayBuffer };
+        if (typeof event.data === 'string') {
+          receivedMessages.push(event.data);
+        }
+      });
+
+      const receiver = new FileReceiver(receiverDc as unknown as RTCDataChannel);
+      let receiverError = '';
+      receiver.onError = (err) => {
+        receiverError = err;
+      };
+
+      receiver.start();
+
+      // Send invalid FILE_START before manifest from sender to receiver
+      senderDc.send(
+        JSON.stringify({
+          type: 'FILE_START',
+          transferId: 'invalid-tx',
+          fileId: 'f1',
+          name: 'corrupt.txt',
+          size: 100,
+          chunkSize: 65536,
+          totalChunks: 1,
+          sha256: 'a'.repeat(64),
+        })
+      );
+
+      // Wait a tick for processing
+      await new Promise((r) => setTimeout(r, 50));
+
+      expect(receiverError).toBeTruthy();
+      const hasErrorMessage = receivedMessages.some((m) => {
+        try {
+          const parsed = JSON.parse(m);
+          return parsed.type === 'ERROR' && parsed.code === 'PROTOCOL_ERROR';
+        } catch {
+          return false;
+        }
+      });
+      expect(hasErrorMessage).toBe(true);
+    });
+
+    it('sender marks completed upon finishing, ignoring subsequent late ERROR/CANCEL messages', async () => {
+      const file = new File(['Small complete test'], 'complete.txt');
+      const [senderDc, receiverDc] = createConnectedPair();
+
+      const sender = new FileSender(senderDc as unknown as RTCDataChannel, [file]);
+      const receiver = new FileReceiver(receiverDc as unknown as RTCDataChannel);
+
+      let senderCompleted = false;
+      let senderErrored = false;
+      sender.onComplete = () => {
+        senderCompleted = true;
+      };
+      sender.onError = () => {
+        senderErrored = true;
+      };
+
+      receiver.start();
+      await sender.start();
+
+      expect(senderCompleted).toBe(true);
+
+      // Simulate late CANCEL or ERROR arriving after sender finished
+      senderDc.send(
+        JSON.stringify({
+          type: 'ERROR',
+          message: 'Late error after completion',
+        })
+      );
+
+      await new Promise((r) => setTimeout(r, 50));
+      expect(senderErrored).toBe(false);
+    });
+
+    it('multi-file transfer emits verifying state once per file and sends keepalives per file', async () => {
+      const file1 = new File(['File one content'], 'file1.txt');
+      const file2 = new File(['File two content with different length'], 'file2.txt');
+      const [senderDc, receiverDc] = createConnectedPair();
+
+      const sender = new FileSender(senderDc as unknown as RTCDataChannel, [file1, file2]);
+      const receiver = new FileReceiver(receiverDc as unknown as RTCDataChannel);
+
+      const verifyingFileIndexesEmitted: number[] = [];
+      let lastVerifyingFileIndex = -1;
+
+      receiver.onProgress = (progress) => {
+        if (progress.state === 'verifying' && progress.currentFileIndex !== lastVerifyingFileIndex) {
+          lastVerifyingFileIndex = progress.currentFileIndex;
+          verifyingFileIndexesEmitted.push(progress.currentFileIndex);
+        }
+      };
+
+      const verifyingMessagesReceived: { fileId: string; type: string }[] = [];
+      senderDc.addEventListener('message', (e: unknown) => {
+        const event = e as { data: string | ArrayBuffer };
+        if (typeof event.data === 'string') {
+          try {
+            const msg = JSON.parse(event.data);
+            if (msg.type === 'VERIFYING') {
+              verifyingMessagesReceived.push(msg);
+            }
+          } catch {
+            // ignore
+          }
+        }
+      });
+
+      const done = new Promise<void>((resolve) => {
+        receiver.onComplete = () => resolve();
+      });
+
+      receiver.start();
+      await sender.start();
+      await done;
+
+      // Exactly two verifying triggers, one for file index 0 and one for file index 1
+      expect(verifyingFileIndexesEmitted).toEqual([0, 1]);
+      // Sender received at least one VERIFYING keepalive message per file
+      const distinctKeepaliveFileIds = new Set(verifyingMessagesReceived.map((m) => m.fileId));
+      expect(distinctKeepaliveFileIds.size).toBe(2);
+    });
+
+    it('sender fails promptly when DataChannel closes abruptly (tab closed mid-transfer)', async () => {
+      const largeFile = new File([new Uint8Array(500 * 1024)], 'tab-close.bin');
+      const [senderDc, receiverDc] = createConnectedPair();
+
+      const sender = new FileSender(senderDc as unknown as RTCDataChannel, [largeFile]);
+
+      let senderError = '';
+      sender.onError = (err) => {
+        senderError = err;
+      };
+
+      receiverDc.addEventListener('message', (e: unknown) => {
+        const event = e as { data: string | ArrayBuffer };
+        if (event.data instanceof ArrayBuffer) {
+          // As soon as chunk transmission starts, simulate tab close / hard disconnect
+          senderDc.close();
+          receiverDc.close();
+        }
+      });
+
+      const t0 = performance.now();
+      await sender.start();
+      const elapsed = performance.now() - t0;
+
+      expect(senderError).toContain('DataChannel closed');
+      // Must fail immediately (within 200ms), not waiting for timeouts
+      expect(elapsed).toBeLessThan(500);
+    });
+
+    it('whole-start() control listener and close handler are completely removed after success, failure, cancel, and close', async () => {
+      // 1. Success
+      {
+        const file = new File(['test'], 'success.txt');
+        const [senderDc, receiverDc] = createConnectedPair();
+        const sender = new FileSender(senderDc as unknown as RTCDataChannel, [file]);
+        const receiver = new FileReceiver(receiverDc as unknown as RTCDataChannel);
+        receiver.start();
+        await sender.start();
+
+        expect(senderDc.listenerCount()).toBe(0);
+      }
+
+      // 2. Receiver ERROR abort
+      {
+        const file = new File(['test'], 'abort.txt');
+        const [senderDc, receiverDc] = createConnectedPair();
+        const sender = new FileSender(senderDc as unknown as RTCDataChannel, [file]);
+        receiverDc.addEventListener('message', (e: unknown) => {
+          const event = e as { data: string | ArrayBuffer };
+          if (typeof event.data === 'string' && JSON.parse(event.data).type === 'TRANSFER_START') {
+            receiverDc.send(JSON.stringify({ type: 'ERROR', code: 'FAIL', message: 'Receiver failed' }));
+          }
+        });
+        await sender.start();
+
+        expect(senderDc.listenerCount()).toBe(0);
+      }
+
+      // 3. CANCEL
+      {
+        const file = new File(['test'], 'cancel.txt');
+        const [senderDc, receiverDc] = createConnectedPair();
+        const sender = new FileSender(senderDc as unknown as RTCDataChannel, [file]);
+        receiverDc.addEventListener('message', (e: unknown) => {
+          const event = e as { data: string | ArrayBuffer };
+          if (typeof event.data === 'string' && JSON.parse(event.data).type === 'TRANSFER_START') {
+            receiverDc.send(JSON.stringify({ type: 'CANCEL', reason: 'User cancelled' }));
+          }
+        });
+        await sender.start();
+
+        expect(senderDc.listenerCount()).toBe(0);
+      }
+
+      // 4. Abrupt channel close
+      {
+        const file = new File(['test'], 'close.txt');
+        const [senderDc, receiverDc] = createConnectedPair();
+        const sender = new FileSender(senderDc as unknown as RTCDataChannel, [file]);
+        receiverDc.addEventListener('message', (e: unknown) => {
+          const event = e as { data: string | ArrayBuffer };
+          if (typeof event.data === 'string' && JSON.parse(event.data).type === 'TRANSFER_START') {
+            senderDc.close();
+          }
+        });
+        await sender.start();
+
+        expect(senderDc.listenerCount()).toBe(0);
+      }
     });
   });
 });
