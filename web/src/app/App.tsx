@@ -543,6 +543,7 @@ export function App() {
         return;
       }
     }
+    setDeviceState(currentDevice);
 
     try {
       let res;

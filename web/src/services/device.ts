@@ -8,6 +8,8 @@ export interface StoredDevice {
   token: string;
 }
 
+let inFlightRegistration: Promise<StoredDevice> | null = null;
+
 export async function getOrCreateDevice(): Promise<StoredDevice> {
   const stored = localStorage.getItem(DEVICE_KEY);
   if (stored) {
@@ -22,17 +24,29 @@ export async function getOrCreateDevice(): Promise<StoredDevice> {
 }
 
 export async function resetDevice(): Promise<StoredDevice> {
+  if (inFlightRegistration) {
+    return inFlightRegistration;
+  }
+
   localStorage.removeItem(DEVICE_KEY);
   const randomSuffix = Math.floor(Math.random() * 65536)
     .toString(16)
     .padStart(4, '0');
   const displayName = `Browser-${randomSuffix}`;
 
-  const device = await createDevice(displayName);
-  localStorage.setItem(DEVICE_KEY, JSON.stringify(device));
-  return device;
+  inFlightRegistration = createDevice(displayName)
+    .then((device) => {
+      localStorage.setItem(DEVICE_KEY, JSON.stringify(device));
+      return device;
+    })
+    .finally(() => {
+      inFlightRegistration = null;
+    });
+
+  return inFlightRegistration;
 }
 
 export function clearDevice(): void {
   localStorage.removeItem(DEVICE_KEY);
+  inFlightRegistration = null;
 }
