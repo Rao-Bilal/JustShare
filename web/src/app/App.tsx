@@ -8,10 +8,12 @@ import { createTransferStorage, TransferStorage } from '../services/storage';
 import { FileReceiver, FileSender } from '../services/transfer';
 import { WebRTCConnection } from '../services/webrtc';
 import { AppScreen, DeviceInfo, FileInfo, SessionInfo, SessionState, TransferProgress } from '../types';
+import { decidePeerLeftAction } from '../services/peerLeft';
 
 export function App() {
   const [device, setDevice] = useState<{ device_id: string; display_name: string; token: string } | null>(null);
   const [screen, setScreen] = useState<AppScreen>('home');
+  const screenRef = useRef<AppScreen>('home');
   const [, setRole] = useState<'sender' | 'receiver' | null>(null);
   const [session, setSession] = useState<SessionInfo | null>(null);
   const [peerDevice, setPeerDevice] = useState<DeviceInfo | null>(null);
@@ -34,6 +36,11 @@ export function App() {
   const deviceRef = useRef<{ device_id: string; display_name: string; token: string } | null>(null);
   const selectedFilesRef = useRef<File[]>([]);
   const peerDeviceRef = useRef<DeviceInfo | null>(null);
+
+  const setScreenState = (s: AppScreen) => {
+    screenRef.current = s;
+    setScreen(s);
+  };
 
   const setSessionState = (sess: SessionInfo | null) => {
     sessionRef.current = sess;
@@ -89,7 +96,7 @@ export function App() {
   const goHome = () => {
     if (sigRef.current) sigRef.current.disconnect();
     if (rtcRef.current) rtcRef.current.close();
-    setScreen('home');
+    setScreenState('home');
     setRole(null);
     setSessionState(null);
     setPeerDeviceState(null);
@@ -100,6 +107,52 @@ export function App() {
     setIncomingTotalSize(0);
     setTransferProgress(null);
     setError(null);
+  };
+
+  const handlePeerLeft = () => {
+    const isSenderDone = senderRef.current ? (senderRef.current as unknown as { isCompleted: boolean }).isCompleted === true : false;
+    const receiver = receiverRef.current;
+    const receiverState = receiver ? receiver.getState() : undefined;
+    const assembledCount = receiver ? receiver.getAssembledFiles().length : undefined;
+    const totalCount = receiver ? receiver.getManifest()?.totalFiles : undefined;
+
+    const decision = decidePeerLeftAction({
+      screen: screenRef.current,
+      isSenderCompleted: isSenderDone,
+      receiverState,
+      assembledFilesCount: assembledCount,
+      totalFilesCount: totalCount,
+    });
+
+    if (decision.action === 'fail') {
+      console.warn('[PEER_LEFT] Peer disconnected during active transfer, setting screen to failed');
+      if (senderRef.current) {
+        senderRef.current.cancel('Peer disconnected');
+      }
+      if (receiverRef.current) {
+        receiverRef.current.cancel('Peer disconnected');
+      }
+      if (rtcRef.current) {
+        rtcRef.current.close();
+      }
+      if (sigRef.current) {
+        sigRef.current.disconnect();
+      }
+
+      setError(decision.error);
+      setScreenState('failed');
+
+      const curSession = sessionRef.current;
+      const curDevice = deviceRef.current;
+      if (curSession && curDevice?.token) {
+        updateSessionState(curDevice.token, curSession.session_id, 'FAILED').catch(() => {});
+      }
+    } else if (decision.action === 'go_home') {
+      setError(decision.error);
+      goHome();
+    } else {
+      console.log('[PEER_LEFT] Ignoring peer_left (transfer already finished or terminal)');
+    }
   };
 
   const handleAuthFailure = async () => {
@@ -148,7 +201,7 @@ export function App() {
         state: res.state as SessionState,
       };
       setSessionState(sess);
-      setScreen('send');
+      setScreenState('send');
 
       const sig = new SignalingClient();
       sigRef.current = sig;
@@ -158,8 +211,7 @@ export function App() {
         setPeerDeviceState(payload);
       });
       sig.on('peer_left', () => {
-        setError('Peer disconnected');
-        goHome();
+        handlePeerLeft();
       });
       sig.on('transfer_response', (msg: unknown) => {
         console.log('[SIGNAL] transfer_response handler START');
@@ -167,13 +219,13 @@ export function App() {
         console.log(`[SIGNAL] transfer_response accepted=${payload?.accepted}`);
         if (payload && payload.accepted) {
           console.log('[SIGNAL] transfer_response handler invoking sender WebRTC initialization');
-          setScreen('transfer');
+          setScreenState('transfer');
           startWebRTCSender();
           console.log('[SIGNAL] transfer_response handler completed');
         } else {
           console.log('[SIGNAL] transfer_response rejected');
           setError('Transfer rejected by receiver');
-          setScreen('failed');
+          setScreenState('failed');
         }
       });
       sig.on('error', (msg: unknown) => {
@@ -229,7 +281,7 @@ export function App() {
         total_size: totalSize,
       },
     });
-    setScreen('send');
+    setScreenState('send');
   };
 
   const reconnectAttemptsRef = useRef<number>(0);
@@ -241,7 +293,7 @@ export function App() {
     const curDevice = deviceRef.current;
     const curSig = sigRef.current;
 
-    if (!curSession || !curDevice || !curSig || screen !== 'transfer') {
+    if (!curSession || !curDevice || !curSig || screenRef.current !== 'transfer') {
       return;
     }
 
@@ -253,7 +305,7 @@ export function App() {
     if (reconnectAttemptsRef.current >= MAX_RECONNECT_ATTEMPTS) {
       console.error('[RECOVERY] Max reconnect attempts exceeded');
       setError('Connection lost: could not recover after maximum retries');
-      setScreen('failed');
+      setScreenState('failed');
       if (curDevice && curSession) {
         updateSessionState(curDevice.token, curSession.session_id, 'FAILED').catch(() => {});
       }
@@ -369,7 +421,7 @@ export function App() {
         hasDevice: !!curDevice
       });
       setError('Internal error: WebRTC session not ready');
-      setScreen('failed');
+      setScreenState('failed');
       return;
     }
 
@@ -409,12 +461,15 @@ export function App() {
           sender.onProgress = setTransferProgress;
           sender.onComplete = () => {
             console.log('[TRANSFER][SEND] FileSender completed');
-            setScreen('completed');
+            setScreenState('completed');
           };
           sender.onError = (e) => {
+            if (screenRef.current === 'failed' || screenRef.current === 'cancelled' || screenRef.current === 'completed') {
+              return;
+            }
             console.error('[TRANSFER][SEND] FileSender error:', e);
             setError(e);
-            setScreen('failed');
+            setScreenState('failed');
           };
           sender.start();
         };
@@ -431,7 +486,7 @@ export function App() {
     } catch (err) {
       console.error('[TRANSFER][SEND] runSender FAILED:', err);
       setError('WebRTC initialization failed');
-      setScreen('failed');
+      setScreenState('failed');
     }
   };
 
@@ -439,7 +494,7 @@ export function App() {
   const startReceiving = () => {
     setError(null);
     setRole('receiver');
-    setScreen('receive');
+    setScreenState('receive');
   };
 
   const submitPairingCode = async (codeToJoin: string) => {
@@ -517,8 +572,7 @@ export function App() {
       });
 
       sig.on('peer_left', () => {
-        setError('Peer disconnected');
-        goHome();
+        handlePeerLeft();
       });
 
       sig.connect(sess.session_id, currentDevice.token);
@@ -584,20 +638,23 @@ export function App() {
       receiver.onComplete = (files) => {
         console.log('[TRANSFER][RECEIVE] FileReceiver completed, files verified');
         setCompletedFiles(files);
-        setScreen('completed');
+        setScreenState('completed');
         updateSessionState(curDevice.token, curSession.session_id, 'COMPLETED').catch((err) => {
           console.error('[TRANSFER][RECEIVE] Failed to update state to COMPLETED', err);
         });
       };
       receiver.onError = (err) => {
+        if (screenRef.current === 'failed' || screenRef.current === 'cancelled' || screenRef.current === 'completed') {
+          return;
+        }
         console.error('[TRANSFER][RECEIVE] FileReceiver error:', err);
         setError(err);
-        setScreen('failed');
+        setScreenState('failed');
       };
       receiver.start();
     };
 
-    setScreen('transfer');
+    setScreenState('transfer');
   };
 
   const rejectTransfer = () => {
@@ -621,7 +678,7 @@ export function App() {
     if (senderRef.current) senderRef.current.cancel('User cancelled');
     if (receiverRef.current) receiverRef.current.cancel('User cancelled');
     if (curSession && curDevice) updateSessionState(curDevice.token, curSession.session_id, 'CANCELLED').catch(() => {});
-    setScreen('cancelled');
+    setScreenState('cancelled');
   };
 
   return (
