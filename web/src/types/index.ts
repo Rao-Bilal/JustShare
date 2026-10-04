@@ -62,7 +62,8 @@ export type TransferMessageType =
   | 'CANCEL'
   | 'ERROR'
   | 'RESUME_REQUEST'
-  | 'RESUME_RESPONSE';
+  | 'RESUME_RESPONSE'
+  | 'PREPARING';
 
 export interface TransferStartMessage {
   type: 'TRANSFER_START';
@@ -91,6 +92,12 @@ export interface FileVerifyingMessage {
   type: 'VERIFYING';
   transferId: string;
   fileId: string;
+  progress?: number;
+}
+
+export interface PreparingMessage {
+  type: 'PREPARING';
+  transferId: string;
   progress?: number;
 }
 
@@ -166,5 +173,5 @@ export interface TransferProgress {
   percentage: number;
   speed: number; // bytes per second
   eta: number; // seconds remaining
-  state: 'sending' | 'receiving' | 'paused' | 'reconnecting' | 'resuming' | 'verifying' | 'completed' | 'failed' | 'cancelled';
+  state: 'preparing' | 'sending' | 'receiving' | 'paused' | 'reconnecting' | 'resuming' | 'verifying' | 'completed' | 'failed' | 'cancelled';
 }

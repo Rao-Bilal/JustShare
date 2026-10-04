@@ -924,6 +924,8 @@ export function App() {
               ? 'Resuming Transfer...'
               : transferProgress?.state === 'paused'
               ? 'Transfer Paused'
+              : transferProgress?.state === 'preparing'
+              ? `Preparing... (${transferProgress.percentage.toFixed(0)}%)`
               : transferProgress?.state === 'verifying'
               ? 'Verifying File Integrity...'
               : 'Transferring Files'}

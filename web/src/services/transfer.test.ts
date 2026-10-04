@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { MemoryTransferStorage } from './storage/memory';
 import {
   FileReceiver,
@@ -1466,6 +1466,265 @@ describe('Phase 2A - Transfer Protocol & Validation', () => {
 
         expect(senderDc.listenerCount()).toBe(0);
       }
+    });
+  });
+
+  describe('Phase 2C - Large File Preparation & PREPARING Keepalive', () => {
+    it('receiver in waiting_for_manifest does not time out during a 5-minute pre-transfer hash with PREPARING keepalives', async () => {
+      vi.useFakeTimers();
+      try {
+        const [, receiverDc] = createConnectedPair();
+        const receiver = new FileReceiver(receiverDc as unknown as RTCDataChannel, {
+          expectedTransferId: 'tx-5min-prep',
+          manifestTimeoutMs: 60000,
+          prepareHardCeilingTimeoutMs: 30 * 60 * 1000,
+        });
+
+        let receiverError = '';
+        receiver.onError = (e) => {
+          receiverError = e;
+        };
+
+        receiver.start();
+        expect(receiver.getState()).toBe('waiting_for_manifest');
+
+        // Simulate 5 minutes (300s = 60 intervals of 5s) of PREPARING keepalives
+        for (let i = 1; i <= 60; i++) {
+          await vi.advanceTimersByTimeAsync(5000);
+          receiverDc.dispatchEvent('message', {
+            data: JSON.stringify({
+              type: 'PREPARING',
+              transferId: 'tx-5min-prep',
+              progress: Math.floor((i / 60) * 100),
+            }),
+          });
+        }
+
+        expect(receiverError).toBe('');
+        expect(receiver.getState()).toBe('waiting_for_manifest');
+
+        // Now send TRANSFER_START
+        receiverDc.dispatchEvent('message', {
+          data: JSON.stringify({
+            type: 'TRANSFER_START',
+            transferId: 'tx-5min-prep',
+            manifest: {
+              transferId: 'tx-5min-prep',
+              totalFiles: 1,
+              totalSize: 4,
+              files: [
+                {
+                  id: 'f-1',
+                  name: 'large.iso',
+                  size: 4,
+                  mimeType: 'application/octet-stream',
+                  totalChunks: 1,
+                  sha256: '9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08',
+                },
+              ],
+            },
+          }),
+        });
+
+        // Allow microtasks / storage init to run
+        await vi.advanceTimersByTimeAsync(10);
+
+        expect(receiver.getState()).toBe('receiving_file');
+        expect(receiverError).toBe('');
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('receiver times out at 60 s when no PREPARING keepalives or TRANSFER_START arrive', async () => {
+      vi.useFakeTimers();
+      try {
+        const [, receiverDc] = createConnectedPair();
+        const receiver = new FileReceiver(receiverDc as unknown as RTCDataChannel, {
+          expectedTransferId: 'tx-no-keepalive',
+          manifestTimeoutMs: 60000,
+        });
+
+        let receiverError = '';
+        receiver.onError = (e) => {
+          receiverError = e;
+        };
+
+        receiver.start();
+        expect(receiver.getState()).toBe('waiting_for_manifest');
+
+        // Advance past 60s
+        await vi.advanceTimersByTimeAsync(60001);
+
+        expect(receiverError).toContain('Transfer timed out due to inactivity');
+        expect(receiver.getState()).toBe('failed');
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('ignores PREPARING keepalives with mismatched transferId and times out at 60 s', async () => {
+      vi.useFakeTimers();
+      try {
+        const [, receiverDc] = createConnectedPair();
+        const receiver = new FileReceiver(receiverDc as unknown as RTCDataChannel, {
+          expectedTransferId: 'tx-expected',
+          manifestTimeoutMs: 60000,
+        });
+
+        let receiverError = '';
+        receiver.onError = (e) => {
+          receiverError = e;
+        };
+
+        receiver.start();
+
+        // Send keepalives with wrong transferId every 5s
+        for (let i = 0; i < 13; i++) {
+          await vi.advanceTimersByTimeAsync(5000);
+          receiverDc.dispatchEvent('message', {
+            data: JSON.stringify({
+              type: 'PREPARING',
+              transferId: 'tx-wrong',
+              progress: 50,
+            }),
+          });
+        }
+
+        expect(receiverError).toContain('Transfer timed out due to inactivity');
+        expect(receiver.getState()).toBe('failed');
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('hard ceiling timeout aborts receiver if PREPARING keepalives exceed 30 minutes', async () => {
+      vi.useFakeTimers();
+      try {
+        const [, receiverDc] = createConnectedPair();
+        const receiver = new FileReceiver(receiverDc as unknown as RTCDataChannel, {
+          expectedTransferId: 'tx-ceiling',
+          manifestTimeoutMs: 60000,
+          prepareHardCeilingTimeoutMs: 30 * 60 * 1000,
+        });
+
+        let receiverError = '';
+        receiver.onError = (e) => {
+          receiverError = e;
+        };
+
+        receiver.start();
+
+        // Send keepalives every 30s across 30 minutes (60 keepalives)
+        for (let i = 0; i < 60; i++) {
+          await vi.advanceTimersByTimeAsync(30000);
+          receiverDc.dispatchEvent('message', {
+            data: JSON.stringify({
+              type: 'PREPARING',
+              transferId: 'tx-ceiling',
+              progress: 10,
+            }),
+          });
+        }
+
+        // Advance 1 more ms to trigger hard ceiling
+        await vi.advanceTimersByTimeAsync(1);
+
+        expect(receiverError).toContain('Preparation phase exceeded');
+        expect(receiver.getState()).toBe('failed');
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('sender hashing loop stops immediately and triggers onError when receiver sends ERROR during preparation', async () => {
+      const file = new File(['Some file content'], 'prep-error.txt');
+      const [senderDc, receiverDc] = createConnectedPair();
+
+      const sender = new FileSender(senderDc as unknown as RTCDataChannel, [file], {
+        transferId: 'tx-prep-err',
+      });
+
+      let senderError = '';
+      sender.onError = (err) => {
+        senderError = err;
+      };
+
+      // When receiver gets PREPARING keepalive, respond with ERROR
+      receiverDc.addEventListener('message', (e: unknown) => {
+        const event = e as { data: string | ArrayBuffer };
+        if (typeof event.data === 'string') {
+          const parsed = JSON.parse(event.data);
+          if (parsed.type === 'PREPARING') {
+            receiverDc.send(
+              JSON.stringify({
+                type: 'ERROR',
+                transferId: 'tx-prep-err',
+                code: 'FAIL',
+                message: 'Receiver rejected transfer',
+              })
+            );
+          }
+        }
+      });
+
+      await sender.start();
+
+      expect(senderError).toContain('Transfer error from receiver: Receiver rejected transfer');
+      expect(senderDc.listenerCount()).toBe(0);
+    });
+
+    it('sender hashing loop stops immediately and triggers onError when DataChannel closes during preparation', async () => {
+      const file = new File(['Some file content'], 'prep-close.txt');
+      const [senderDc, receiverDc] = createConnectedPair();
+
+      const sender = new FileSender(senderDc as unknown as RTCDataChannel, [file], {
+        transferId: 'tx-prep-close',
+      });
+
+      let senderError = '';
+      sender.onError = (err) => {
+        senderError = err;
+      };
+
+      // When receiver gets PREPARING keepalive, close the channel
+      receiverDc.addEventListener('message', (e: unknown) => {
+        const event = e as { data: string | ArrayBuffer };
+        if (typeof event.data === 'string') {
+          const parsed = JSON.parse(event.data);
+          if (parsed.type === 'PREPARING') {
+            senderDc.close();
+          }
+        }
+      });
+
+      await sender.start();
+
+      expect(senderError).toContain('DataChannel closed unexpectedly');
+      expect(senderDc.listenerCount()).toBe(0);
+    });
+
+    it('sender reports preparing state with percentage during hashing progress', async () => {
+      const file = new File(['test file content for progress'], 'prep-prog.txt');
+      const [senderDc, receiverDc] = createConnectedPair();
+
+      const sender = new FileSender(senderDc as unknown as RTCDataChannel, [file], {
+        transferId: 'tx-prep-prog',
+      });
+      const receiver = new FileReceiver(receiverDc as unknown as RTCDataChannel, {
+        expectedTransferId: 'tx-prep-prog',
+      });
+
+      const reportedStates: string[] = [];
+      sender.onProgress = (p) => {
+        reportedStates.push(p.state);
+      };
+
+      receiver.start();
+      await sender.start();
+
+      expect(reportedStates).toContain('preparing');
+      expect(reportedStates).toContain('sending');
     });
   });
 });

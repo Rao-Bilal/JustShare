@@ -6,6 +6,7 @@ import {
   FileStartMessage,
   FileVerifyingMessage,
   ManifestFileEntry,
+  PreparingMessage,
   ResumeFileStatus,
   ResumeRequestMessage,
   ResumeResponseMessage,
@@ -28,6 +29,8 @@ export const MAX_FILENAME_LENGTH = 255;
 export const DEFAULT_ACK_TIMEOUT_MS = 60000; // 60s
 export const ACK_HARD_CEILING_TIMEOUT_MS = 15 * 60 * 1000; // 15m
 export const VERIFYING_KEEPALIVE_INTERVAL_MS = 5000; // 5s
+export const PREPARING_KEEPALIVE_INTERVAL_MS = 5000; // 5s
+export const PREPARE_HARD_CEILING_TIMEOUT_MS = 30 * 60 * 1000; // 30m
 export const DEFAULT_STALL_TIMEOUT_MS = 60000; // 60s
 export const DEFAULT_RESUME_TIMEOUT_MS = 15000; // 15s
 export const BACKPRESSURE_HIGH_WATERMARK = 1024 * 1024; // 1 MB
@@ -268,8 +271,29 @@ export class FileSender {
     this.dc.addEventListener('message', controlHandler);
     this.dc.addEventListener('close', closeHandler);
 
+    let currentHashedBytes = 0;
+    const sendPreparingKeepalive = () => {
+      if (this.cancelled || this.isPaused || this.dc.readyState !== 'open') return;
+      const pct = this.totalBytes === 0 ? 100 : (currentHashedBytes / this.totalBytes) * 100;
+      const prepMsg: PreparingMessage = {
+        type: 'PREPARING',
+        transferId: this.transferId,
+        progress: Math.round(pct),
+      };
+      try {
+        this.dc.send(JSON.stringify(prepMsg));
+      } catch {
+        // ignore send error
+      }
+    };
+
+    // Send initial keepalive immediately
+    sendPreparingKeepalive();
+    const prepareKeepaliveTimer = setInterval(sendPreparingKeepalive, PREPARING_KEEPALIVE_INTERVAL_MS);
+
     try {
       const manifestFiles: ManifestFileEntry[] = [];
+      let bytesHashedBeforeCurrentFile = 0;
 
       for (let i = 0; i < this.files.length; i++) {
         if (this.cancelled || this.isPaused || this.abortedError) {
@@ -289,29 +313,42 @@ export class FileSender {
           totalChunks,
         });
 
-        this.updateProgress(i, 'verifying');
+        this.bytesTransferred = bytesHashedBeforeCurrentFile;
+        this.updateProgress(i, 'preparing', true);
 
         let lastProgressReportPercent = 0;
-        const hash = await sha256File(file, (processed, total) => {
-          if (total > 0 && this.logger) {
-            const pct = Math.floor((processed / total) * 100);
-            if (pct >= lastProgressReportPercent + 10 || pct === 100) {
-              lastProgressReportPercent = pct;
-              this.logger.log('hash_progress', {
-                transferId: this.transferId,
-                fileId,
-                fileName: file.name,
-                fileSize: file.size,
-                percent: pct,
-              });
+        const hash = await sha256File(
+          file,
+          (processed, total) => {
+            currentHashedBytes = bytesHashedBeforeCurrentFile + processed;
+            this.bytesTransferred = currentHashedBytes;
+            this.updateProgress(i, 'preparing');
+
+            if (total > 0 && this.logger) {
+              const pct = Math.floor((processed / total) * 100);
+              if (pct >= lastProgressReportPercent + 10 || pct === 100) {
+                lastProgressReportPercent = pct;
+                this.logger.log('hash_progress', {
+                  transferId: this.transferId,
+                  fileId,
+                  fileName: file.name,
+                  fileSize: file.size,
+                  percent: pct,
+                });
+              }
             }
-          }
-        });
+          },
+          () => this.cancelled || this.isPaused || !!this.abortedError
+        );
 
         if (this.cancelled || this.isPaused || this.abortedError) {
           if (this.abortedError) throw this.abortedError;
           return;
         }
+
+        bytesHashedBeforeCurrentFile += file.size;
+        currentHashedBytes = bytesHashedBeforeCurrentFile;
+        this.bytesTransferred = currentHashedBytes;
 
         const hashElapsedMs = Math.round(performance.now() - fileStartTime);
         this.hashes.set(fileId, hash);
@@ -334,10 +371,14 @@ export class FileSender {
         });
       }
 
+      clearInterval(prepareKeepaliveTimer);
+
       if (this.cancelled || this.isPaused || this.abortedError) {
         if (this.abortedError) throw this.abortedError;
         return;
       }
+
+      this.bytesTransferred = 0;
 
       this.manifest = validateManifest({
         transferId: this.transferId,
@@ -377,6 +418,7 @@ export class FileSender {
         this.onError(errorMsg);
       }
     } finally {
+      clearInterval(prepareKeepaliveTimer);
       this.dc.removeEventListener('message', controlHandler);
       this.dc.removeEventListener('close', closeHandler);
       this.onControlAbort = null;
@@ -827,6 +869,7 @@ export interface ReceiverOptions {
   expectedTransferId?: string;
   stallTimeoutMs?: number;
   manifestTimeoutMs?: number;
+  prepareHardCeilingTimeoutMs?: number;
   storage?: TransferStorage;
 }
 
@@ -861,7 +904,9 @@ export class FileReceiver {
   private startTime = 0;
   private stallTimeoutMs: number;
   private manifestTimeoutMs: number;
+  private prepareHardCeilingTimeoutMs: number;
   private stallTimer: ReturnType<typeof setTimeout> | null = null;
+  private manifestHardCeilingTimer: ReturnType<typeof setTimeout> | null = null;
   private messageListener: ((event: MessageEvent) => void) | null = null;
   private messageQueue: Promise<void> = Promise.resolve();
   private state: ReceiverLifecycleState = 'idle';
@@ -872,6 +917,7 @@ export class FileReceiver {
     this.activeTransferId = options?.expectedTransferId || null;
     this.stallTimeoutMs = options?.stallTimeoutMs || DEFAULT_STALL_TIMEOUT_MS;
     this.manifestTimeoutMs = options?.manifestTimeoutMs || DEFAULT_MANIFEST_TIMEOUT_MS;
+    this.prepareHardCeilingTimeoutMs = options?.prepareHardCeilingTimeoutMs || PREPARE_HARD_CEILING_TIMEOUT_MS;
     this.storage = options?.storage || new MemoryTransferStorage();
   }
 
@@ -919,6 +965,7 @@ export class FileReceiver {
     this.bindDataChannelEvents();
     this.transitionTo('waiting_for_manifest');
     this.resetStallTimer(this.manifestTimeoutMs);
+    this.armManifestHardCeilingTimer();
   }
 
   private transitionTo(newState: ReceiverLifecycleState) {
@@ -953,7 +1000,26 @@ export class FileReceiver {
         console.log(`[TRANSFER][RECEIVE] Control message received: ${msg.type}`);
 
         switch (msg.type) {
+          case 'PREPARING': {
+            if (this.state === 'waiting_for_manifest') {
+              const prepMsg = msg as PreparingMessage;
+              if (this.activeTransferId && prepMsg.transferId && prepMsg.transferId !== this.activeTransferId) {
+                console.warn(
+                  `[TRANSFER][RECEIVE] PREPARING transferId mismatch (expected ${this.activeTransferId}, got ${prepMsg.transferId}) - ignoring`
+                );
+                break;
+              }
+              if (!this.activeTransferId && prepMsg.transferId) {
+                this.activeTransferId = prepMsg.transferId;
+              }
+              console.log(`[TRANSFER][RECEIVE] Received PREPARING keepalive (progress=${prepMsg.progress}%)`);
+              this.resetStallTimer(this.manifestTimeoutMs);
+            }
+            break;
+          }
+
           case 'TRANSFER_START': {
+            this.clearManifestHardCeilingTimer();
             const manifest = validateManifest(msg.manifest);
             if (this.activeTransferId && manifest.transferId !== this.activeTransferId) {
               throw new Error(`Transfer ID mismatch: expected ${this.activeTransferId}, got ${manifest.transferId}`);
@@ -973,6 +1039,7 @@ export class FileReceiver {
           }
 
           case 'RESUME_REQUEST': {
+            this.clearManifestHardCeilingTimer();
             const req = msg as ResumeRequestMessage;
             console.log(`[TRANSFER][RECEIVE] Received RESUME_REQUEST for transfer ${req.transferId}`);
 
@@ -1075,6 +1142,7 @@ export class FileReceiver {
             }
             console.log('[TRANSFER][RECEIVE] TRANSFER_END received, validating complete assembly');
             this.clearStallTimer();
+            this.clearManifestHardCeilingTimer();
             if (this.manifest && this.assembledFiles.length !== this.manifest.totalFiles) {
               throw new Error(`Incomplete transfer: received ${this.assembledFiles.length} of ${this.manifest.totalFiles} files`);
             }
@@ -1089,6 +1157,7 @@ export class FileReceiver {
             console.log('[TRANSFER][RECEIVE] CANCEL received');
             this.cancelled = true;
             this.clearStallTimer();
+            this.clearManifestHardCeilingTimer();
             this.transitionTo('cancelled');
             if (this.onError) this.onError(msg.reason || 'Transfer cancelled by peer');
             break;
@@ -1098,6 +1167,7 @@ export class FileReceiver {
             console.error('[TRANSFER][RECEIVE] ERROR received from sender', msg);
             this.cancelled = true;
             this.clearStallTimer();
+            this.clearManifestHardCeilingTimer();
             this.transitionTo('failed');
             if (this.onError) this.onError(msg.message || msg.code || 'Transfer error');
             break;
@@ -1323,6 +1393,7 @@ export class FileReceiver {
     console.log(`[TRANSFER][RECEIVE] Transfer cancelled: ${reason}`);
     this.cancelled = true;
     this.clearStallTimer();
+    this.clearManifestHardCeilingTimer();
     this.transitionTo('cancelled');
     if (this.dc.readyState === 'open') {
       const cancelMsg: TransferCancelMessage = {
@@ -1338,12 +1409,35 @@ export class FileReceiver {
     }
   }
 
+  private armManifestHardCeilingTimer() {
+    this.clearManifestHardCeilingTimer();
+    this.manifestHardCeilingTimer = setTimeout(() => {
+      console.error('[TRANSFER][RECEIVE] Preparation phase exceeded maximum timeout limit');
+      this.cancelled = true;
+      this.clearStallTimer();
+      this.clearManifestHardCeilingTimer();
+      this.transitionTo('failed');
+      this.sendError('PREPARE_TIMEOUT', 'Preparation phase exceeded 30 minute limit');
+      if (this.onError) {
+        this.onError('Preparation phase exceeded maximum timeout limit');
+      }
+    }, this.prepareHardCeilingTimeoutMs);
+  }
+
+  private clearManifestHardCeilingTimer() {
+    if (this.manifestHardCeilingTimer) {
+      clearTimeout(this.manifestHardCeilingTimer);
+      this.manifestHardCeilingTimer = null;
+    }
+  }
+
   private resetStallTimer(timeoutMs?: number) {
     this.clearStallTimer();
     const duration = timeoutMs || this.stallTimeoutMs;
     this.stallTimer = setTimeout(() => {
       console.error('[TRANSFER][RECEIVE] Transfer timed out (no activity received within limit)');
       this.cancelled = true;
+      this.clearManifestHardCeilingTimer();
       this.transitionTo('failed');
       this.sendError('STALL_TIMEOUT', 'Transfer timed out due to inactivity');
       if (this.onError) {

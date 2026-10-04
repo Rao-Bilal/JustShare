@@ -182,7 +182,8 @@ export const STREAMING_HASH_SLICE_SIZE = 2 * 1024 * 1024; // 2 MB blocks
  */
 export async function sha256BlobStreaming(
   blob: Blob,
-  onProgress?: (bytesProcessed: number, totalBytes: number) => void
+  onProgress?: (bytesProcessed: number, totalBytes: number) => void,
+  shouldAbort?: () => boolean
 ): Promise<string> {
   const total = blob.size;
 
@@ -194,9 +195,15 @@ export async function sha256BlobStreaming(
   let offset = 0;
 
   while (offset < total) {
+    if (shouldAbort && shouldAbort()) {
+      throw new Error('Hash calculation aborted');
+    }
     const end = Math.min(offset + STREAMING_HASH_SLICE_SIZE, total);
     const slice = blob.slice(offset, end);
     const buffer = await slice.arrayBuffer();
+    if (shouldAbort && shouldAbort()) {
+      throw new Error('Hash calculation aborted');
+    }
     hasher.update(new Uint8Array(buffer));
     offset = end;
     if (onProgress) {
@@ -209,16 +216,18 @@ export async function sha256BlobStreaming(
 
 export async function sha256File(
   file: File,
-  onProgress?: (bytesProcessed: number, totalBytes: number) => void
+  onProgress?: (bytesProcessed: number, totalBytes: number) => void,
+  shouldAbort?: () => boolean
 ): Promise<string> {
-  return sha256BlobStreaming(file, onProgress);
+  return sha256BlobStreaming(file, onProgress, shouldAbort);
 }
 
 export async function sha256Blob(
   blob: Blob,
-  onProgress?: (bytesProcessed: number, totalBytes: number) => void
+  onProgress?: (bytesProcessed: number, totalBytes: number) => void,
+  shouldAbort?: () => boolean
 ): Promise<string> {
-  return sha256BlobStreaming(blob, onProgress);
+  return sha256BlobStreaming(blob, onProgress, shouldAbort);
 }
 
 export async function sha256Chunks(chunks: Uint8Array[]): Promise<string> {
