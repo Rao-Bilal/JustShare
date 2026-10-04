@@ -6,7 +6,7 @@ export interface StoredFileInfo {
   size: number;
   totalChunks: number;
   chunkSize: number;
-  sha256: string;
+  sha256?: string;
   mimeType: string;
   completed: boolean;
   receivedChunksCount: number;

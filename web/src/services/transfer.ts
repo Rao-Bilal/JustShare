@@ -17,7 +17,7 @@ import {
   TransferProgress,
   TransferStartMessage,
 } from '../types';
-import { sha256File } from './crypto';
+import { createStreamingHasher, sha256File } from './crypto';
 import { RemoteDevLogger } from './devLogger';
 import { MemoryTransferStorage } from './storage/memory';
 import { TransferStorage } from './storage/types';
@@ -97,8 +97,12 @@ export function validateManifest(manifest: unknown): TransferManifest {
       throw new Error(`Invalid manifest: file '${file.name}' has invalid totalChunks (${file.totalChunks}, expected ${expectedChunks})`);
     }
 
-    if (typeof file.sha256 !== 'string' || !/^[a-f0-9]{64}$/i.test(file.sha256)) {
-      throw new Error(`Invalid manifest: file '${file.name}' has invalid SHA-256 hash`);
+    let sha256Val: string | undefined = undefined;
+    if (file.sha256 !== undefined && file.sha256 !== null && file.sha256 !== '') {
+      if (typeof file.sha256 !== 'string' || !/^[a-f0-9]{64}$/i.test(file.sha256)) {
+        throw new Error(`Invalid manifest: file '${file.name}' has invalid SHA-256 hash`);
+      }
+      sha256Val = file.sha256.toLowerCase();
     }
 
     calculatedTotalSize += file.size;
@@ -110,7 +114,7 @@ export function validateManifest(manifest: unknown): TransferManifest {
       mimeType: typeof file.mimeType === 'string' ? file.mimeType : 'application/octet-stream',
       relativePath: typeof file.relativePath === 'string' ? file.relativePath : undefined,
       totalChunks: file.totalChunks,
-      sha256: file.sha256.toLowerCase(),
+      sha256: sha256Val,
     });
   }
 
@@ -231,7 +235,7 @@ export class FileSender {
     this.isPaused = false;
     this.isCompleted = false;
     this.abortedError = null;
-    console.log('[TRANSFER][SEND] Calculating hashes before transfer start');
+    console.log('[TRANSFER][SEND] Starting transfer with deferred streaming SHA-256');
 
     const controlHandler = (event: MessageEvent) => {
       if (this.isCompleted || this.cancelled) return;
@@ -271,29 +275,8 @@ export class FileSender {
     this.dc.addEventListener('message', controlHandler);
     this.dc.addEventListener('close', closeHandler);
 
-    let currentHashedBytes = 0;
-    const sendPreparingKeepalive = () => {
-      if (this.cancelled || this.isPaused || this.dc.readyState !== 'open') return;
-      const pct = this.totalBytes === 0 ? 100 : (currentHashedBytes / this.totalBytes) * 100;
-      const prepMsg: PreparingMessage = {
-        type: 'PREPARING',
-        transferId: this.transferId,
-        progress: Math.round(pct),
-      };
-      try {
-        this.dc.send(JSON.stringify(prepMsg));
-      } catch {
-        // ignore send error
-      }
-    };
-
-    // Send initial keepalive immediately
-    sendPreparingKeepalive();
-    const prepareKeepaliveTimer = setInterval(sendPreparingKeepalive, PREPARING_KEEPALIVE_INTERVAL_MS);
-
     try {
       const manifestFiles: ManifestFileEntry[] = [];
-      let bytesHashedBeforeCurrentFile = 0;
 
       for (let i = 0; i < this.files.length; i++) {
         if (this.cancelled || this.isPaused || this.abortedError) {
@@ -301,65 +284,8 @@ export class FileSender {
           return;
         }
         const file = this.files[i];
-        const fileStartTime = performance.now();
         const totalChunks = file.size === 0 ? 0 : Math.ceil(file.size / CHUNK_SIZE);
         const fileId = `file_${i}_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-
-        this.logger?.log('hash_started', {
-          transferId: this.transferId,
-          fileId,
-          fileName: file.name,
-          fileSize: file.size,
-          totalChunks,
-        });
-
-        this.bytesTransferred = bytesHashedBeforeCurrentFile;
-        this.updateProgress(i, 'preparing', true);
-
-        let lastProgressReportPercent = 0;
-        const hash = await sha256File(
-          file,
-          (processed, total) => {
-            currentHashedBytes = bytesHashedBeforeCurrentFile + processed;
-            this.bytesTransferred = currentHashedBytes;
-            this.updateProgress(i, 'preparing');
-
-            if (total > 0 && this.logger) {
-              const pct = Math.floor((processed / total) * 100);
-              if (pct >= lastProgressReportPercent + 10 || pct === 100) {
-                lastProgressReportPercent = pct;
-                this.logger.log('hash_progress', {
-                  transferId: this.transferId,
-                  fileId,
-                  fileName: file.name,
-                  fileSize: file.size,
-                  percent: pct,
-                });
-              }
-            }
-          },
-          () => this.cancelled || this.isPaused || !!this.abortedError
-        );
-
-        if (this.cancelled || this.isPaused || this.abortedError) {
-          if (this.abortedError) throw this.abortedError;
-          return;
-        }
-
-        bytesHashedBeforeCurrentFile += file.size;
-        currentHashedBytes = bytesHashedBeforeCurrentFile;
-        this.bytesTransferred = currentHashedBytes;
-
-        const hashElapsedMs = Math.round(performance.now() - fileStartTime);
-        this.hashes.set(fileId, hash);
-
-        this.logger?.log('hash_completed', {
-          transferId: this.transferId,
-          fileId,
-          fileName: file.name,
-          fileSize: file.size,
-          elapsedMs: hashElapsedMs,
-        });
 
         manifestFiles.push({
           id: fileId,
@@ -367,11 +293,8 @@ export class FileSender {
           size: file.size,
           mimeType: file.type || 'application/octet-stream',
           totalChunks,
-          sha256: hash,
         });
       }
-
-      clearInterval(prepareKeepaliveTimer);
 
       if (this.cancelled || this.isPaused || this.abortedError) {
         if (this.abortedError) throw this.abortedError;
@@ -418,7 +341,6 @@ export class FileSender {
         this.onError(errorMsg);
       }
     } finally {
-      clearInterval(prepareKeepaliveTimer);
       this.dc.removeEventListener('message', controlHandler);
       this.dc.removeEventListener('close', closeHandler);
       this.onControlAbort = null;
@@ -585,7 +507,6 @@ export class FileSender {
       const file = this.files[i];
       const manifestEntry = this.manifest.files[i];
       const fileId = manifestEntry.id;
-      const hash = manifestEntry.sha256;
       const totalChunks = manifestEntry.totalChunks;
 
       const fileStatus = fileStatusMap?.get(fileId);
@@ -605,7 +526,6 @@ export class FileSender {
         size: file.size,
         chunkSize: CHUNK_SIZE,
         totalChunks,
-        sha256: hash,
       };
       this.dc.send(JSON.stringify(fileStartMsg));
 
@@ -617,96 +537,193 @@ export class FileSender {
         totalChunks,
       });
 
-      const chunksToSend = fileStatus
-        ? fileStatus.missingChunks
-        : Array.from({ length: totalChunks }, (_, idx) => idx);
+      const isResumedFile = fileStatus !== undefined;
+      let finalHash: string;
 
-      console.log(`[TRANSFER][SEND] Transmitting ${chunksToSend.length}/${totalChunks} chunks for '${file.name}'`);
-
-      let firstChunkLogged = false;
-      let lastChunkLoggedIndex = -1;
-
-      for (const j of chunksToSend) {
-        if (this.cancelled || this.isPaused || this.abortedError) {
-          if (this.abortedError) throw this.abortedError;
-          return;
-        }
-
-        const start = j * CHUNK_SIZE;
-        const end = Math.min(start + CHUNK_SIZE, file.size);
-        const chunkBlob = file.slice(start, end);
-        const chunkData = await chunkBlob.arrayBuffer();
-
-        const header: ChunkHeader = {
-          transferId: this.transferId,
-          fileId,
-          index: j,
-          totalChunks,
-          byteLength: chunkData.byteLength,
-        };
-        const headerStr = JSON.stringify(header);
-        const headerBytes = new TextEncoder().encode(headerStr);
-
-        const payload = new Uint8Array(4 + headerBytes.length + chunkData.byteLength);
-
-        // 4 bytes uint32 BE header length
-        const view = new DataView(payload.buffer);
-        view.setUint32(0, headerBytes.length, false);
-
-        // header bytes
-        payload.set(headerBytes, 4);
-        // chunk data
-        payload.set(new Uint8Array(chunkData), 4 + headerBytes.length);
-
-        await sendChunkWithBackpressure(this.dc, payload.buffer);
-
-        if (this.cancelled || this.isPaused || this.abortedError) {
-          if (this.abortedError) throw this.abortedError;
-          return;
-        }
-
-        this.bytesTransferred += chunkData.byteLength;
-
-        if (!firstChunkLogged) {
-          firstChunkLogged = true;
-          this.logger?.log('first_chunk_sent', {
-            transferId: this.transferId,
-            fileId,
-            fileName: file.name,
-            chunkIndex: j,
-            totalChunks,
+      if (isResumedFile) {
+        // Resuming: check if hash is already cached
+        const cachedHash = this.hashes.get(fileId);
+        let hashPromise: Promise<string>;
+        if (cachedHash) {
+          hashPromise = Promise.resolve(cachedHash);
+        } else {
+          console.log(`[TRANSFER][SEND] Hashing file '${file.name}' concurrently during resume`);
+          hashPromise = sha256File(
+            file,
+            undefined,
+            () => this.cancelled || this.isPaused || !!this.abortedError
+          ).then((h) => {
+            this.hashes.set(fileId, h);
+            return h;
           });
         }
 
-        // Periodic chunk progress: log every 100 chunks or on the last chunk
-        if (j - lastChunkLoggedIndex >= 100 || j === chunksToSend[chunksToSend.length - 1]) {
-          lastChunkLoggedIndex = j;
-          const pct = totalChunks > 0 ? Math.round(((j + 1) / totalChunks) * 100) : 100;
-          this.logger?.log('chunk_progress', {
+        const chunksToSend = fileStatus.missingChunks;
+        console.log(`[TRANSFER][SEND] Transmitting ${chunksToSend.length}/${totalChunks} missing chunks for '${file.name}'`);
+
+        let firstChunkLogged = false;
+        let lastChunkLoggedIndex = -1;
+
+        for (const j of chunksToSend) {
+          if (this.cancelled || this.isPaused || this.abortedError) {
+            if (this.abortedError) throw this.abortedError;
+            return;
+          }
+
+          const start = j * CHUNK_SIZE;
+          const end = Math.min(start + CHUNK_SIZE, file.size);
+          const chunkBlob = file.slice(start, end);
+          const chunkData = await chunkBlob.arrayBuffer();
+
+          const header: ChunkHeader = {
             transferId: this.transferId,
             fileId,
-            fileName: file.name,
-            chunkIndex: j + 1,
+            index: j,
             totalChunks,
-            percent: pct,
-          });
+            byteLength: chunkData.byteLength,
+          };
+          const headerStr = JSON.stringify(header);
+          const headerBytes = new TextEncoder().encode(headerStr);
+
+          const payload = new Uint8Array(4 + headerBytes.length + chunkData.byteLength);
+          const view = new DataView(payload.buffer);
+          view.setUint32(0, headerBytes.length, false);
+          payload.set(headerBytes, 4);
+          payload.set(new Uint8Array(chunkData), 4 + headerBytes.length);
+
+          await sendChunkWithBackpressure(this.dc, payload.buffer);
+
+          if (this.cancelled || this.isPaused || this.abortedError) {
+            if (this.abortedError) throw this.abortedError;
+            return;
+          }
+
+          this.bytesTransferred += chunkData.byteLength;
+
+          if (!firstChunkLogged) {
+            firstChunkLogged = true;
+            this.logger?.log('first_chunk_sent', {
+              transferId: this.transferId,
+              fileId,
+              fileName: file.name,
+              chunkIndex: j,
+              totalChunks,
+            });
+          }
+
+          if (j - lastChunkLoggedIndex >= 100 || j === chunksToSend[chunksToSend.length - 1]) {
+            lastChunkLoggedIndex = j;
+            const pct = totalChunks > 0 ? Math.round(((j + 1) / totalChunks) * 100) : 100;
+            this.logger?.log('chunk_progress', {
+              transferId: this.transferId,
+              fileId,
+              fileName: file.name,
+              chunkIndex: j + 1,
+              totalChunks,
+              percent: pct,
+            });
+          }
+
+          if (j % 500 === 0 || j === chunksToSend[chunksToSend.length - 1]) {
+            console.log(`[TRANSFER][SEND][CHUNK] sent index=${j + 1}/${totalChunks} bytes=${chunkData.byteLength}`);
+          }
+
+          if (j % 10 === 0 || j === chunksToSend[chunksToSend.length - 1]) {
+            this.updateProgress(i, 'sending');
+          }
         }
 
-        if (j % 500 === 0 || j === chunksToSend[chunksToSend.length - 1]) {
-          console.log(`[TRANSFER][SEND][CHUNK] sent index=${j + 1}/${totalChunks} bytes=${chunkData.byteLength}`);
+        finalHash = await hashPromise;
+      } else {
+        // Fresh transfer: stream hash chunk by chunk
+        const hasher = await createStreamingHasher();
+        const chunksToSend = Array.from({ length: totalChunks }, (_, idx) => idx);
+        console.log(`[TRANSFER][SEND] Transmitting ${chunksToSend.length}/${totalChunks} chunks for '${file.name}'`);
+
+        let firstChunkLogged = false;
+        let lastChunkLoggedIndex = -1;
+
+        for (const j of chunksToSend) {
+          if (this.cancelled || this.isPaused || this.abortedError) {
+            if (this.abortedError) throw this.abortedError;
+            return;
+          }
+
+          const start = j * CHUNK_SIZE;
+          const end = Math.min(start + CHUNK_SIZE, file.size);
+          const chunkBlob = file.slice(start, end);
+          const chunkData = await chunkBlob.arrayBuffer();
+
+          hasher.update(new Uint8Array(chunkData));
+
+          const header: ChunkHeader = {
+            transferId: this.transferId,
+            fileId,
+            index: j,
+            totalChunks,
+            byteLength: chunkData.byteLength,
+          };
+          const headerStr = JSON.stringify(header);
+          const headerBytes = new TextEncoder().encode(headerStr);
+
+          const payload = new Uint8Array(4 + headerBytes.length + chunkData.byteLength);
+          const view = new DataView(payload.buffer);
+          view.setUint32(0, headerBytes.length, false);
+          payload.set(headerBytes, 4);
+          payload.set(new Uint8Array(chunkData), 4 + headerBytes.length);
+
+          await sendChunkWithBackpressure(this.dc, payload.buffer);
+
+          if (this.cancelled || this.isPaused || this.abortedError) {
+            if (this.abortedError) throw this.abortedError;
+            return;
+          }
+
+          this.bytesTransferred += chunkData.byteLength;
+
+          if (!firstChunkLogged) {
+            firstChunkLogged = true;
+            this.logger?.log('first_chunk_sent', {
+              transferId: this.transferId,
+              fileId,
+              fileName: file.name,
+              chunkIndex: j,
+              totalChunks,
+            });
+          }
+
+          if (j - lastChunkLoggedIndex >= 100 || j === chunksToSend[chunksToSend.length - 1]) {
+            lastChunkLoggedIndex = j;
+            const pct = totalChunks > 0 ? Math.round(((j + 1) / totalChunks) * 100) : 100;
+            this.logger?.log('chunk_progress', {
+              transferId: this.transferId,
+              fileId,
+              fileName: file.name,
+              chunkIndex: j + 1,
+              totalChunks,
+              percent: pct,
+            });
+          }
+
+          if (j % 500 === 0 || j === chunksToSend[chunksToSend.length - 1]) {
+            console.log(`[TRANSFER][SEND][CHUNK] sent index=${j + 1}/${totalChunks} bytes=${chunkData.byteLength}`);
+          }
+
+          if (j % 10 === 0 || j === chunksToSend[chunksToSend.length - 1]) {
+            this.updateProgress(i, 'sending');
+          }
         }
 
-        // Update progress every 10 chunks or on last chunk
-        if (j % 10 === 0 || j === chunksToSend[chunksToSend.length - 1]) {
-          this.updateProgress(i, 'sending');
-        }
+        finalHash = hasher.digest();
+        this.hashes.set(fileId, finalHash);
       }
 
-      console.log(`[TRANSFER][SEND] Sending FILE_END for file ${i + 1} (${file.name})`);
+      console.log(`[TRANSFER][SEND] Sending FILE_END for file ${i + 1} (${file.name}) with sha256=${finalHash}`);
       const fileEndMsg: FileEndMessage = {
         type: 'FILE_END',
         transferId: this.transferId,
         fileId,
+        sha256: finalHash,
       };
       this.dc.send(JSON.stringify(fileEndMsg));
 
@@ -1115,8 +1132,11 @@ export class FileReceiver {
             if (!manifestEntry) {
               throw new Error(`FILE_START fileId '${msg.fileId}' not found in authorized manifest`);
             }
-            if (msg.size !== manifestEntry.size || msg.totalChunks !== manifestEntry.totalChunks || msg.sha256 !== manifestEntry.sha256) {
+            if (msg.size !== manifestEntry.size || msg.totalChunks !== manifestEntry.totalChunks) {
               throw new Error(`FILE_START metadata mismatch for file '${manifestEntry.name}'`);
+            }
+            if (manifestEntry.sha256 && msg.sha256 && msg.sha256 !== manifestEntry.sha256) {
+              throw new Error(`FILE_START hash mismatch for file '${manifestEntry.name}'`);
             }
 
             await this.storage.initFile(this.activeTransferId, manifestEntry);
@@ -1132,7 +1152,11 @@ export class FileReceiver {
             if (!this.activeTransferId || msg.transferId !== this.activeTransferId) {
               throw new Error('FILE_END transferId mismatch');
             }
-            await this.handleFileEnd(msg.fileId);
+            const fileEndMsg = msg as FileEndMessage;
+            if (typeof fileEndMsg.sha256 !== 'string' || !/^[a-f0-9]{64}$/i.test(fileEndMsg.sha256)) {
+              throw new Error(`FILE_END missing or invalid SHA-256 hash for fileId '${fileEndMsg.fileId}'`);
+            }
+            await this.handleFileEnd(fileEndMsg.fileId, fileEndMsg.sha256.toLowerCase());
             break;
           }
 
@@ -1253,7 +1277,7 @@ export class FileReceiver {
     }
   }
 
-  private async handleFileEnd(fileId: string) {
+  private async handleFileEnd(fileId: string, expectedSha256: string) {
     const tFileEndStart = performance.now();
     console.log(`[TRANSFER][RECV][FILE_END] START fileId=${fileId}`);
     this.transitionTo('verifying');
@@ -1266,6 +1290,13 @@ export class FileReceiver {
     const manifestEntry = this.manifest.files.find((f) => f.id === fileId);
     if (!manifestEntry) {
       throw new Error(`FILE_END received for unknown file ID '${fileId}'`);
+    }
+
+    // If manifest had a sha256 specified, verify that FILE_END matches it
+    if (manifestEntry.sha256 && manifestEntry.sha256 !== expectedSha256) {
+      throw new Error(
+        `FILE_END sha256 mismatch with manifest for file '${manifestEntry.name}' (${expectedSha256} vs ${manifestEntry.sha256})`
+      );
     }
 
     console.log(`[TRANSFER][RECV][FILE_END] checking missing chunks`);
@@ -1309,7 +1340,7 @@ export class FileReceiver {
       const result = await this.storage.verifyAndFinalizeFile(
         this.activeTransferId,
         fileId,
-        manifestEntry.sha256,
+        expectedSha256,
         (processed, total) => {
           if (total > 0) {
             this.updateProgress('verifying');
@@ -1319,7 +1350,7 @@ export class FileReceiver {
 
       if (!result.match) {
         throw new Error(
-          `SHA-256 mismatch for file '${manifestEntry.name}' (calculated ${result.calculatedSha256}, expected ${manifestEntry.sha256})`
+          `SHA-256 mismatch for file '${manifestEntry.name}' (calculated ${result.calculatedSha256}, expected ${expectedSha256})`
         );
       }
 

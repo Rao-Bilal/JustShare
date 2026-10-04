@@ -43,7 +43,7 @@ export interface ManifestFileEntry {
   mimeType: string;
   relativePath?: string;
   totalChunks: number;
-  sha256: string;
+  sha256?: string;
 }
 
 export interface TransferManifest {
@@ -79,13 +79,14 @@ export interface FileStartMessage {
   size: number;
   chunkSize: number;
   totalChunks: number;
-  sha256: string;
+  sha256?: string;
 }
 
 export interface FileEndMessage {
   type: 'FILE_END';
   transferId: string;
   fileId: string;
+  sha256: string;
 }
 
 export interface FileVerifyingMessage {

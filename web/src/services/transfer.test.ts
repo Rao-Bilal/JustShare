@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import { ChunkHeader } from '../types';
 import { MemoryTransferStorage } from './storage/memory';
 import {
   FileReceiver,
@@ -1637,94 +1638,114 @@ describe('Phase 2A - Transfer Protocol & Validation', () => {
       }
     });
 
-    it('sender hashing loop stops immediately and triggers onError when receiver sends ERROR during preparation', async () => {
-      const file = new File(['Some file content'], 'prep-error.txt');
+    it('sender starts transfer immediately without pre-hashing and receiver successfully verifies streaming sha256', async () => {
+      const file = new File(['streaming hash content across chunks '.repeat(5000)], 'stream.txt');
       const [senderDc, receiverDc] = createConnectedPair();
 
       const sender = new FileSender(senderDc as unknown as RTCDataChannel, [file], {
-        transferId: 'tx-prep-err',
-      });
-
-      let senderError = '';
-      sender.onError = (err) => {
-        senderError = err;
-      };
-
-      // When receiver gets PREPARING keepalive, respond with ERROR
-      receiverDc.addEventListener('message', (e: unknown) => {
-        const event = e as { data: string | ArrayBuffer };
-        if (typeof event.data === 'string') {
-          const parsed = JSON.parse(event.data);
-          if (parsed.type === 'PREPARING') {
-            receiverDc.send(
-              JSON.stringify({
-                type: 'ERROR',
-                transferId: 'tx-prep-err',
-                code: 'FAIL',
-                message: 'Receiver rejected transfer',
-              })
-            );
-          }
-        }
-      });
-
-      await sender.start();
-
-      expect(senderError).toContain('Transfer error from receiver: Receiver rejected transfer');
-      expect(senderDc.listenerCount()).toBe(0);
-    });
-
-    it('sender hashing loop stops immediately and triggers onError when DataChannel closes during preparation', async () => {
-      const file = new File(['Some file content'], 'prep-close.txt');
-      const [senderDc, receiverDc] = createConnectedPair();
-
-      const sender = new FileSender(senderDc as unknown as RTCDataChannel, [file], {
-        transferId: 'tx-prep-close',
-      });
-
-      let senderError = '';
-      sender.onError = (err) => {
-        senderError = err;
-      };
-
-      // When receiver gets PREPARING keepalive, close the channel
-      receiverDc.addEventListener('message', (e: unknown) => {
-        const event = e as { data: string | ArrayBuffer };
-        if (typeof event.data === 'string') {
-          const parsed = JSON.parse(event.data);
-          if (parsed.type === 'PREPARING') {
-            senderDc.close();
-          }
-        }
-      });
-
-      await sender.start();
-
-      expect(senderError).toContain('DataChannel closed unexpectedly');
-      expect(senderDc.listenerCount()).toBe(0);
-    });
-
-    it('sender reports preparing state with percentage during hashing progress', async () => {
-      const file = new File(['test file content for progress'], 'prep-prog.txt');
-      const [senderDc, receiverDc] = createConnectedPair();
-
-      const sender = new FileSender(senderDc as unknown as RTCDataChannel, [file], {
-        transferId: 'tx-prep-prog',
+        transferId: 'tx-stream-test',
       });
       const receiver = new FileReceiver(receiverDc as unknown as RTCDataChannel, {
-        expectedTransferId: 'tx-prep-prog',
+        expectedTransferId: 'tx-stream-test',
       });
 
-      const reportedStates: string[] = [];
-      sender.onProgress = (p) => {
-        reportedStates.push(p.state);
-      };
+      const receiverCompletePromise = new Promise<void>((resolve, reject) => {
+        receiver.onComplete = (assembled) => {
+          try {
+            expect(assembled.length).toBe(1);
+            expect(assembled[0].verified).toBe(true);
+            resolve();
+          } catch (e) {
+            reject(e);
+          }
+        };
+        receiver.onError = (err) => reject(new Error(err));
+      });
 
       receiver.start();
       await sender.start();
+      await receiverCompletePromise;
 
-      expect(reportedStates).toContain('preparing');
-      expect(reportedStates).toContain('sending');
+      expect(senderDc.listenerCount()).toBe(0);
+    });
+
+    it('receiver rejects FILE_END if sha256 is missing or malformed', async () => {
+      const [, receiverDc] = createConnectedPair();
+      const receiver = new FileReceiver(receiverDc as unknown as RTCDataChannel, {
+        expectedTransferId: 'tx-no-hash',
+      });
+
+      let receiverError = '';
+      receiver.onError = (e) => {
+        receiverError = e;
+      };
+
+      receiver.start();
+
+      // Send TRANSFER_START
+      receiverDc.dispatchEvent('message', {
+        data: JSON.stringify({
+          type: 'TRANSFER_START',
+          transferId: 'tx-no-hash',
+          manifest: {
+            transferId: 'tx-no-hash',
+            totalFiles: 1,
+            totalSize: 4,
+            files: [
+              {
+                id: 'f-nohash',
+                name: 'test.txt',
+                size: 4,
+                mimeType: 'text/plain',
+                totalChunks: 1,
+              },
+            ],
+          },
+        }),
+      });
+
+      // Send FILE_START
+      receiverDc.dispatchEvent('message', {
+        data: JSON.stringify({
+          type: 'FILE_START',
+          transferId: 'tx-no-hash',
+          fileId: 'f-nohash',
+          name: 'test.txt',
+          size: 4,
+          chunkSize: 65536,
+          totalChunks: 1,
+        }),
+      });
+
+      // Send chunk
+      const header: ChunkHeader = {
+        transferId: 'tx-no-hash',
+        fileId: 'f-nohash',
+        index: 0,
+        totalChunks: 1,
+        byteLength: 4,
+      };
+      const headerBytes = new TextEncoder().encode(JSON.stringify(header));
+      const payload = new Uint8Array(4 + headerBytes.length + 4);
+      new DataView(payload.buffer).setUint32(0, headerBytes.length, false);
+      payload.set(headerBytes, 4);
+      payload.set(new Uint8Array([1, 2, 3, 4]), 4 + headerBytes.length);
+      receiverDc.dispatchEvent('message', { data: payload.buffer });
+
+      // Send FILE_END without sha256
+      receiverDc.dispatchEvent('message', {
+        data: JSON.stringify({
+          type: 'FILE_END',
+          transferId: 'tx-no-hash',
+          fileId: 'f-nohash',
+        }),
+      });
+
+      // Allow microtask queue to process
+      await new Promise((r) => setTimeout(r, 50));
+
+      expect(receiverError).toContain('FILE_END missing or invalid SHA-256 hash');
+      expect(receiver.getState()).toBe('failed');
     });
   });
 });
