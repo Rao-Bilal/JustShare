@@ -1,0 +1,68 @@
+name: Oracle A1 Capacity Retry
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/15 * * * *"
+
+jobs:
+  launch:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install OCI CLI
+        run: |
+          python -m pip install --upgrade pip
+          pip install oci-cli
+
+      - name: Configure OCI CLI
+        env:
+          OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.oci
+          printf '%s\n' "$OCI_PRIVATE_KEY" > ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/oci_api_key.pem
+
+          cat > ~/.oci/config <<EOF
+          [DEFAULT]
+          user=${{ secrets.OCI_USER_OCID }}
+          fingerprint=${{ secrets.OCI_FINGERPRINT }}
+          tenancy=${{ secrets.OCI_TENANCY_OCID }}
+          region=${{ secrets.OCI_REGION }}
+          key_file=~/.oci/oci_api_key.pem
+          EOF
+
+      - name: Check for existing server
+        id: check
+        env:
+          OCI_TENANCY: ${{ secrets.OCI_TENANCY_OCID }}
+        run: |
+          INSTANCE_ID=$(oci compute instance list \
+            --compartment-id "$OCI_TENANCY" \
+            --all \
+            --query 'data[?"display-name" == `justshare-server` && "lifecycle-state" != `TERMINATED`].id | [0]' \
+            --raw-output)
+
+          if [ "$INSTANCE_ID" != "None" ] && [ -n "$INSTANCE_ID" ]; then
+            echo "Server already exists: $INSTANCE_ID"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Launch JustShare server
+        if: steps.check.outputs.exists != 'true'
+        env:
+          OCI_TENANCY: ${{ secrets.OCI_TENANCY_OCID }}
+        run: |
+          oci compute instance launch \
+            --compartment-id "$OCI_TENANCY" \
+            --availability-domain "lbSZ:AP-MUMBAI-1-AD-1" \
+            --display-name "justshare-server" \
+            --shape "VM.Standard.A1.Flex" \
+            --shape-config '{"ocpus":2,"memoryInGBs":12}' \
+            --image-id "ocid1.image.oc1.ap-mumbai-1.aaaaaaaa2jurqb3jm7hlpqw3au35loaqjkcozbyh7znn4jnfu5zbrgfulwia" \
+            --subnet-id "ocid1.subnet.oc1.ap-mumbai-1.aaaaaaaaoskuzhy2z5afejah454cwisgrd2hgfdowi2ijb3p7bryo7gxg22a" \
+            --assign-public-ip true \
+            --ssh-authorized-keys-file "$HOME/.ssh/id_rsa.pub" \
+            --boot-volume-size-in-gbs 50
