@@ -63,14 +63,35 @@ jobs:
         env:
           OCI_TENANCY: ${{ secrets.OCI_TENANCY_OCID }}
         run: |
-          oci compute instance launch \
-            --compartment-id "$OCI_TENANCY" \
-            --availability-domain "lbSZ:AP-MUMBAI-1-AD-1" \
-            --display-name "justshare-server" \
-            --shape "VM.Standard.A1.Flex" \
-            --shape-config '{"ocpus":2,"memoryInGBs":12}' \
-            --image-id "ocid1.image.oc1.ap-mumbai-1.aaaaaaaa2jurqb3jm7hlpqw3au35loaqjkcozbyh7znn4jnfu5zbrgfulwia" \
-            --subnet-id "ocid1.subnet.oc1.ap-mumbai-1.aaaaaaaaoskuzhy2z5afejah454cwisgrd2hgfdowi2ijb3p7bryo7gxg22a" \
-            --assign-public-ip true \
-            --ssh-authorized-keys-file "$HOME/.ssh/justshare.pub" \
-            --boot-volume-size-in-gbs 50
+          MAX_ATTEMPTS=5
+          WAIT_SECONDS=30
+
+          for attempt in $(seq 1 $MAX_ATTEMPTS); do
+            echo "========================================"
+            echo "A1 launch attempt $attempt/$MAX_ATTEMPTS"
+            echo "========================================"
+
+            if oci compute instance launch \
+              --compartment-id "$OCI_TENANCY" \
+              --availability-domain "lbSZ:AP-MUMBAI-1-AD-1" \
+              --display-name "justshare-server" \
+              --shape "VM.Standard.A1.Flex" \
+              --shape-config '{"ocpus":2,"memoryInGBs":12}' \
+              --image-id "ocid1.image.oc1.ap-mumbai-1.aaaaaaaa2jurqb3jm7hlpqw3au35loaqjkcozbyh7znn4jnfu5zbrgfulwia" \
+              --subnet-id "ocid1.subnet.oc1.ap-mumbai-1.aaaaaaaaoskuzhy2z5afejah454cwisgrd2hgfdowi2ijb3p7bryo7gxg22a" \
+              --assign-public-ip true \
+              --ssh-authorized-keys-file "$HOME/.ssh/justshare.pub" \
+              --boot-volume-size-in-gbs 50; then
+
+              echo "A1 instance launched successfully."
+              exit 0
+            fi
+
+            if [ "$attempt" -lt "$MAX_ATTEMPTS" ]; then
+              echo "Launch failed. Waiting ${WAIT_SECONDS}s before retry..."
+              sleep "$WAIT_SECONDS"
+            fi
+          done
+
+          echo "A1 launch failed after $MAX_ATTEMPTS attempts."
+          exit 1
