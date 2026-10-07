@@ -32,6 +32,14 @@ jobs:
           key_file=~/.oci/oci_api_key.pem
           EOF
 
+      - name: Configure SSH public key
+        env:
+          OCI_SSH_PUBLIC_KEY: ${{ secrets.OCI_SSH_PUBLIC_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$OCI_SSH_PUBLIC_KEY" > ~/.ssh/justshare.pub
+          chmod 644 ~/.ssh/justshare.pub
+
       - name: Check for existing server
         id: check
         env:
@@ -64,5 +72,5 @@ jobs:
             --image-id "ocid1.image.oc1.ap-mumbai-1.aaaaaaaa2jurqb3jm7hlpqw3au35loaqjkcozbyh7znn4jnfu5zbrgfulwia" \
             --subnet-id "ocid1.subnet.oc1.ap-mumbai-1.aaaaaaaaoskuzhy2z5afejah454cwisgrd2hgfdowi2ijb3p7bryo7gxg22a" \
             --assign-public-ip true \
-            --ssh-authorized-keys-file "$HOME/.ssh/id_rsa.pub" \
+            --ssh-authorized-keys-file "$HOME/.ssh/justshare.pub" \
             --boot-volume-size-in-gbs 50
