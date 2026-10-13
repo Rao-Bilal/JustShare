@@ -19,14 +19,29 @@ export function QrScanner({ onScan, onClose }: QrScannerProps) {
 
     async function startCamera() {
       try {
+        if (!window.isSecureContext) {
+          setError(
+            'Camera access requires a secure connection (HTTPS or localhost). If opening over local IP (http://192.168.x.x), browsers disable camera APIs for security.'
+          );
+          return;
+        }
+
         if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
           setError('Camera access is not supported by your browser.');
           return;
         }
 
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: 'environment' },
-        });
+        let stream: MediaStream;
+        try {
+          stream = await navigator.mediaDevices.getUserMedia({
+            video: { facingMode: 'environment' },
+          });
+        } catch {
+          // Fallback if environment (back) camera is not present (e.g. desktop webcam)
+          stream = await navigator.mediaDevices.getUserMedia({
+            video: true,
+          });
+        }
 
         if (!activeRef.current) {
           stream.getTracks().forEach((track) => track.stop());
