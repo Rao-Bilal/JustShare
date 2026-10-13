@@ -112,7 +112,7 @@ describe('device service', () => {
     const validToken = createMockJwt(7200);
     const savedDevice = {
       device_id: 'saved-dev-789',
-      display_name: 'Browser-saved',
+      display_name: 'Device-saved',
       token: validToken,
     };
     localStorageMock.setItem('justshare_device', JSON.stringify(savedDevice));
