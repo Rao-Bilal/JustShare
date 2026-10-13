@@ -1,4 +1,4 @@
-```yaml
+
 name: Oracle A1 Capacity Retry
 
 on:
@@ -132,4 +132,4 @@ jobs:
 
           echo "Retry window ended without a running JustShare instance."
           exit 1
-```
+
