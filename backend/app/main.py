@@ -9,6 +9,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from app.api.v1.nearby import router as nearby_router
 from app.api.v1.router import api_router
 from app.api.v1.signaling import router as signaling_router
 from app.core.config import get_settings
@@ -63,3 +64,5 @@ async def validation_error_handler(_: Request, __: RequestValidationError) -> JS
 
 app.include_router(api_router, prefix="/api/v1")
 app.include_router(signaling_router, prefix="/ws/v1/signal", tags=["signaling"])
+app.include_router(nearby_router, prefix="/ws/v1/nearby", tags=["nearby"])
+

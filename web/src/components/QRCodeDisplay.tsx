@@ -1,13 +1,17 @@
 import qrcode from 'qrcode-generator';
-import { useMemo } from 'react';
+import { useMemo, useState } from 'react';
 import { buildPairingUrl, isLocalhostHostname } from '../services/pairingUrl';
+import { Button } from './Button';
+import { IconCheck, IconCopy } from './Icons';
 
 interface QRCodeDisplayProps {
   pairingCode: string;
+  showCopyLink?: boolean;
 }
 
-export function QRCodeDisplay({ pairingCode }: QRCodeDisplayProps) {
+export function QRCodeDisplay({ pairingCode, showCopyLink = true }: QRCodeDisplayProps) {
   const envOrigin = import.meta.env.VITE_PUBLIC_ORIGIN as string | undefined;
+  const [copiedLink, setCopiedLink] = useState(false);
 
   const url = useMemo(() => {
     return buildPairingUrl(window.location.origin, pairingCode, envOrigin);
@@ -29,44 +33,46 @@ export function QRCodeDisplay({ pairingCode }: QRCodeDisplayProps) {
     return isLocalhostHostname(window.location.hostname) && !envOrigin;
   }, [envOrigin]);
 
+  const handleCopyLink = async () => {
+    try {
+      await navigator.clipboard.writeText(url);
+      setCopiedLink(true);
+      setTimeout(() => setCopiedLink(false), 2000);
+    } catch (err) {
+      console.warn('Copy link failed:', err);
+    }
+  };
+
   if (!qrDataUrl) return null;
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', margin: '1.5rem 0' }}>
-      <div
-        style={{
-          background: '#ffffff',
-          padding: '12px',
-          borderRadius: '12px',
-          boxShadow: '0 4px 12px rgba(0, 0, 0, 0.3)',
-          display: 'inline-block',
-        }}
-      >
+    <div className="qr-display-container">
+      <div className="qr-frame">
         <img
           src={qrDataUrl}
           alt={`Scan QR code to join session ${pairingCode}`}
-          style={{ width: '180px', height: '180px', display: 'block' }}
+          className="qr-image"
         />
       </div>
-      <p style={{ fontSize: '0.85rem', color: '#94a3b8', marginTop: '0.5rem', textAlign: 'center' }}>
-        Scan with camera or QR reader to connect
+      <p className="qr-caption">
+        Point camera or QR scanner at the code
       </p>
-      {isLocalhost && (
-        <div
-          style={{
-            maxWidth: '340px',
-            marginTop: '0.75rem',
-            padding: '8px 12px',
-            borderRadius: '8px',
-            backgroundColor: 'rgba(234, 179, 8, 0.1)',
-            border: '1px solid rgba(234, 179, 8, 0.3)',
-            color: '#fde047',
-            fontSize: '0.78rem',
-            textAlign: 'center',
-            lineHeight: '1.4',
-          }}
+
+      {showCopyLink && (
+        <Button
+          variant="secondary"
+          size="sm"
+          onClick={handleCopyLink}
+          icon={copiedLink ? <IconCheck size={14} /> : <IconCopy size={14} />}
+          className="qr-copy-btn"
         >
-          <strong>Localhost Notice:</strong> Opened via localhost. To scan from a phone, open JustShare on your computer using your local network IP (e.g. <code>http://192.168.x.x:5173</code>), or enter the 6-digit code manually.
+          {copiedLink ? 'Link Copied!' : 'Copy Pairing Link'}
+        </Button>
+      )}
+
+      {isLocalhost && (
+        <div className="localhost-banner">
+          <strong>Localhost Notice:</strong> When testing across devices on Wi-Fi, open JustShare using your local network IP (e.g. <code>http://192.168.x.x:5173</code>), or enter the 6-digit code manually.
         </div>
       )}
     </div>
