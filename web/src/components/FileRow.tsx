@@ -1,14 +1,12 @@
 import { formatBytes } from '../services/format';
-import { getFileIconComponent, IconCheckCircle, IconX } from './Icons';
+import { truncateMiddle } from '../services/errorMapper';
 
 export interface FileRowProps {
   name: string;
   size: number;
   relativePath?: string;
   onRemove?: () => void;
-  progress?: number; // 0 to 100
-  isVerified?: boolean;
-  statusText?: string;
+  showMiddleTruncate?: boolean;
 }
 
 export function FileRow({
@@ -16,52 +14,29 @@ export function FileRow({
   size,
   relativePath,
   onRemove,
-  progress,
-  isVerified,
-  statusText,
+  showMiddleTruncate = true,
 }: FileRowProps) {
-  const displayName = relativePath || name;
+  const fullPath = relativePath || name;
+  const displayTitle = showMiddleTruncate ? truncateMiddle(fullPath, 34) : fullPath;
 
   return (
     <div className="file-row">
-      <div className="file-row-icon" aria-hidden="true">
-        {getFileIconComponent(name, 20)}
-      </div>
-
-      <div className="file-row-info">
-        <span className="file-row-name" title={displayName}>
-          {displayName}
-        </span>
-        <div className="file-row-meta">
-          <span className="file-row-size">{formatBytes(size)}</span>
-          {statusText && <span className="file-row-status">{statusText}</span>}
-          {isVerified && (
-            <span className="file-row-verified">
-              <IconCheckCircle size={14} /> SHA-256 Verified
-            </span>
-          )}
-        </div>
-        {typeof progress === 'number' && progress >= 0 && progress < 100 && (
-          <div className="file-row-progress-track">
-            <div
-              className="file-row-progress-fill"
-              style={{ width: `${Math.min(100, Math.max(0, progress))}%` }}
-            />
-          </div>
+      <span className="file-row-name" title={fullPath}>
+        {displayTitle}
+      </span>
+      <div className="file-row-meta">
+        <span className="tabular-numbers">{formatBytes(size)}</span>
+        {onRemove && (
+          <button
+            type="button"
+            className="btn-remove-file"
+            onClick={onRemove}
+            aria-label={`Remove ${fullPath}`}
+          >
+            Remove
+          </button>
         )}
       </div>
-
-      {onRemove && (
-        <button
-          type="button"
-          className="file-row-remove-btn"
-          onClick={onRemove}
-          aria-label={`Remove ${displayName}`}
-          title={`Remove ${displayName}`}
-        >
-          <IconX size={16} />
-        </button>
-      )}
     </div>
   );
 }

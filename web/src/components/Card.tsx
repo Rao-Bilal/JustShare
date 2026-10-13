@@ -1,29 +1,13 @@
 import React from 'react';
 
 export interface CardProps extends React.HTMLAttributes<HTMLDivElement> {
-  variant?: 'default' | 'flat' | 'interactive' | 'outline';
-  padding?: 'none' | 'sm' | 'md' | 'lg';
+  secondary?: boolean;
   children: React.ReactNode;
 }
 
-export function Card({
-  variant = 'default',
-  padding = 'md',
-  children,
-  className = '',
-  ...props
-}: CardProps) {
-  const classNames = [
-    'js-card',
-    `js-card-${variant}`,
-    `js-card-pad-${padding}`,
-    className,
-  ]
-    .filter(Boolean)
-    .join(' ');
-
+export function Card({ secondary = false, className = '', children, ...props }: CardProps) {
   return (
-    <div className={classNames} {...props}>
+    <div className={`card ${secondary ? 'card-secondary' : ''} ${className}`.trim()} {...props}>
       {children}
     </div>
   );

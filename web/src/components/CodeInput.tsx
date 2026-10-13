@@ -1,131 +1,118 @@
-import React, { useRef, useEffect, useState } from 'react';
+import React, { useRef, useEffect } from 'react';
 
 export interface CodeInputProps {
-  length?: number;
   value: string;
-  onChange: (value: string) => void;
-  onSubmit?: (code: string) => void;
+  onChange: (val: string) => void;
+  onSubmit: (code: string) => void;
   disabled?: boolean;
   error?: string | null;
-  autoFocus?: boolean;
 }
 
 export function CodeInput({
-  length = 6,
   value,
   onChange,
   onSubmit,
   disabled = false,
   error = null,
-  autoFocus = true,
 }: CodeInputProps) {
-  const inputRefs = useRef<(HTMLInputElement | null)[]>([]);
-  const [focusedIndex, setFocusedIndex] = useState<number>(0);
+  const inputsRef = useRef<(HTMLInputElement | null)[]>([]);
 
-  // Split string into array of single digits
-  const digits = Array.from({ length }, (_, i) => value[i] || '');
+  // 6 digit array
+  const digits = Array.from({ length: 6 }, (_, i) => value[i] || '');
 
   useEffect(() => {
-    if (autoFocus && inputRefs.current[0]) {
-      inputRefs.current[0].focus();
+    // Autofocus first empty box or box 0
+    if (!disabled) {
+      const firstEmpty = digits.findIndex((d) => !d);
+      const targetIndex = firstEmpty === -1 ? 5 : firstEmpty;
+      inputsRef.current[targetIndex]?.focus();
     }
-  }, [autoFocus]);
-
-  const handleChange = (index: number, e: React.ChangeEvent<HTMLInputElement>) => {
-    const rawVal = e.target.value.replace(/\D/g, '');
-    if (!rawVal) {
-      // Empty input
-      const newDigits = [...digits];
-      newDigits[index] = '';
-      const newVal = newDigits.join('');
-      onChange(newVal);
-      return;
-    }
-
-    // Handle single or multi-character insertion (e.g. autofill or typing)
-    const char = rawVal[rawVal.length - 1];
-    const newDigits = [...digits];
-    newDigits[index] = char;
-    const newVal = newDigits.join('');
-    onChange(newVal);
-
-    if (index < length - 1) {
-      inputRefs.current[index + 1]?.focus();
-      setFocusedIndex(index + 1);
-    } else if (newVal.length === length && onSubmit) {
-      onSubmit(newVal);
-    }
-  };
+  }, [disabled]);
 
   const handleKeyDown = (index: number, e: React.KeyboardEvent<HTMLInputElement>) => {
     if (e.key === 'Backspace') {
       if (!digits[index] && index > 0) {
-        // Current box is empty, move back and clear previous
-        const newDigits = [...digits];
-        newDigits[index - 1] = '';
-        const newVal = newDigits.join('');
-        onChange(newVal);
-        inputRefs.current[index - 1]?.focus();
-        setFocusedIndex(index - 1);
+        // Move back and clear previous
+        const nextDigits = [...digits];
+        nextDigits[index - 1] = '';
+        const nextVal = nextDigits.join('');
+        onChange(nextVal);
+        inputsRef.current[index - 1]?.focus();
       } else {
-        const newDigits = [...digits];
-        newDigits[index] = '';
-        onChange(newDigits.join(''));
+        const nextDigits = [...digits];
+        nextDigits[index] = '';
+        onChange(nextDigits.join(''));
       }
     } else if (e.key === 'ArrowLeft' && index > 0) {
-      e.preventDefault();
-      inputRefs.current[index - 1]?.focus();
-      setFocusedIndex(index - 1);
-    } else if (e.key === 'ArrowRight' && index < length - 1) {
-      e.preventDefault();
-      inputRefs.current[index + 1]?.focus();
-      setFocusedIndex(index + 1);
+      inputsRef.current[index - 1]?.focus();
+    } else if (e.key === 'ArrowRight' && index < 5) {
+      inputsRef.current[index + 1]?.focus();
+    }
+  };
+
+  const handleChange = (index: number, e: React.ChangeEvent<HTMLInputElement>) => {
+    const rawChar = e.target.value.replace(/\D/g, '');
+    if (!rawChar) {
+      const nextDigits = [...digits];
+      nextDigits[index] = '';
+      onChange(nextDigits.join(''));
+      return;
+    }
+
+    const char = rawChar.slice(-1);
+    const nextDigits = [...digits];
+    nextDigits[index] = char;
+    const nextVal = nextDigits.join('');
+    onChange(nextVal);
+
+    if (index < 5) {
+      inputsRef.current[index + 1]?.focus();
+    } else if (nextVal.length === 6) {
+      onSubmit(nextVal);
     }
   };
 
   const handlePaste = (e: React.ClipboardEvent<HTMLInputElement>) => {
     e.preventDefault();
-    const pastedData = e.clipboardData.getData('text').replace(/\D/g, '').slice(0, length);
-    if (!pastedData) return;
+    const pasted = e.clipboardData.getData('text').replace(/\D/g, '').slice(0, 6);
+    if (!pasted) return;
 
-    onChange(pastedData);
-    const targetIdx = Math.min(pastedData.length, length - 1);
-    inputRefs.current[targetIdx]?.focus();
-    setFocusedIndex(targetIdx);
+    onChange(pasted);
+    const targetIdx = Math.min(pasted.length, 5);
+    inputsRef.current[targetIdx]?.focus();
 
-    if (pastedData.length === length && onSubmit) {
-      onSubmit(pastedData);
+    if (pasted.length === 6) {
+      onSubmit(pasted);
     }
   };
 
   return (
-    <div className="code-input-container">
-      <div className={`code-digit-group ${error ? 'has-error' : ''}`} onPaste={handlePaste}>
-        {Array.from({ length }, (_, i) => (
+    <div>
+      <div className="code-input-row" onPaste={handlePaste}>
+        {Array.from({ length: 6 }, (_, i) => (
           <input
             key={i}
             ref={(el) => {
-              inputRefs.current[i] = el;
+              inputsRef.current[i] = el;
             }}
             type="text"
             inputMode="numeric"
+            autoComplete="one-time-code"
             pattern="[0-9]*"
             maxLength={1}
-            value={digits[i] || ''}
             disabled={disabled}
-            aria-label={`Digit ${i + 1} of ${length}`}
-            className={`code-digit-box ${focusedIndex === i ? 'is-focused' : ''} ${digits[i] ? 'has-value' : ''}`}
+            value={digits[i]}
+            aria-label={`Digit ${i + 1} of 6`}
+            className="code-input-box"
             onChange={(e) => handleChange(i, e)}
             onKeyDown={(e) => handleKeyDown(i, e)}
-            onFocus={() => setFocusedIndex(i)}
-            autoComplete="one-time-code"
           />
         ))}
       </div>
       {error && (
-        <p className="code-input-error" role="alert">
+        <div className="code-error-text" role="alert" aria-live="polite">
           {error}
-        </p>
+        </div>
       )}
     </div>
   );
