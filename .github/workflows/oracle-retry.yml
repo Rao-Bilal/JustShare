@@ -1,3 +1,4 @@
+```yaml
 name: Oracle A1 Capacity Retry
 
 on:
@@ -5,10 +6,16 @@ on:
   schedule:
     - cron: "*/15 * * * *"
 
+# Prevent overlapping launch attempts from scheduled/manual runs.
+concurrency:
+  group: justshare-oracle-a1-launch
+  cancel-in-progress: false
+
 jobs:
   launch:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    timeout-minutes: 350
 
     steps:
       - name: Install OCI CLI
@@ -32,6 +39,7 @@ jobs:
           region=${{ secrets.OCI_REGION }}
           key_file=~/.oci/oci_api_key.pem
           EOF
+          chmod 600 ~/.oci/config
 
       - name: Configure SSH public key
         env:
@@ -56,23 +64,25 @@ jobs:
             echo "Server already exists: $INSTANCE_ID"
             echo "exists=true" >> "$GITHUB_OUTPUT"
           else
+            echo "No existing JustShare server found."
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Launch JustShare server
+      - name: Retry A1 launch until capacity is available
         if: steps.check.outputs.exists != 'true'
         env:
           OCI_TENANCY: ${{ secrets.OCI_TENANCY_OCID }}
         run: |
-          MAX_ATTEMPTS=5
-          WAIT_SECONDS=30
+          END=$((SECONDS + 20400))
+          WAIT_SECONDS=120
 
-          for attempt in $(seq 1 $MAX_ATTEMPTS); do
+          while [ "$SECONDS" -lt "$END" ]; do
             echo "========================================"
-            echo "A1 launch attempt $attempt/$MAX_ATTEMPTS"
+            echo "$(date -u): Attempting JustShare A1 launch..."
             echo "========================================"
 
-            if oci compute instance launch \
+            set +e
+            OUTPUT=$(oci compute instance launch \
               --compartment-id "$OCI_TENANCY" \
               --availability-domain "lbSZ:AP-MUMBAI-1-AD-1" \
               --display-name "justshare-server" \
@@ -82,17 +92,44 @@ jobs:
               --subnet-id "ocid1.subnet.oc1.ap-mumbai-1.aaaaaaaaoskuzhy2z5afejah454cwisgrd2hgfdowi2ijb3p7bryo7gxg22a" \
               --assign-public-ip true \
               --ssh-authorized-keys-file "$HOME/.ssh/justshare.pub" \
-              --boot-volume-size-in-gbs 50; then
+              --boot-volume-size-in-gbs 50 \
+              --wait-for-state RUNNING \
+              --max-wait-seconds 180 \
+              2>&1)
+            STATUS=$?
+            set -e
 
-              echo "A1 instance launched successfully."
+            echo "$OUTPUT"
+
+            if [ "$STATUS" -eq 0 ]; then
+              echo "JustShare instance launched and reached RUNNING."
               exit 0
             fi
 
-            if [ "$attempt" -lt "$MAX_ATTEMPTS" ]; then
-              echo "Launch failed. Waiting ${WAIT_SECONDS}s before retry..."
-              sleep "$WAIT_SECONDS"
+            # Stop on errors that retrying cannot fix.
+            if echo "$OUTPUT" | grep -Eqi \
+              'NotAuthenticated|InvalidAuthenticationToken|NotAuthorizedOrNotFound|InvalidParameter|Invalid value for|401|403'; then
+              echo "Permanent authentication/configuration error. Stopping retries."
+              exit "$STATUS"
             fi
+
+            # Capacity exhaustion and rate limiting are retried with a delay.
+            if echo "$OUTPUT" | grep -Eqi \
+              'Out of host capacity|TooManyRequests|Too many requests|429|InternalError'; then
+              echo "Temporary capacity/rate-limit error. Waiting ${WAIT_SECONDS}s."
+            else
+              echo "Unrecognized launch error. Stopping to avoid retrying a permanent failure."
+              exit "$STATUS"
+            fi
+
+            REMAINING=$((END - SECONDS))
+            if [ "$REMAINING" -le "$WAIT_SECONDS" ]; then
+              break
+            fi
+
+            sleep "$WAIT_SECONDS"
           done
 
-          echo "A1 launch failed after $MAX_ATTEMPTS attempts."
+          echo "Retry window ended without a running JustShare instance."
           exit 1
+```
