@@ -13,6 +13,8 @@ import { mapTechnicalError, formatDuration, truncateMiddle } from '../services/e
 import { COPY } from '../copy';
 
 import { QRCodeDisplay } from '../components/QRCodeDisplay';
+import { NearbyDiscovery } from '../components/NearbyDiscovery';
+import { QrScanner } from '../components/QrScanner';
 import { Button } from '../components/Button';
 import { Card } from '../components/Card';
 import { Stepper } from '../components/Stepper';
@@ -38,7 +40,7 @@ export function App() {
   const [transferProgress, setTransferProgress] = useState<TransferProgress | null>(null);
   const [completedFiles, setCompletedFiles] = useState<{ name: string; blob: Blob; verified: boolean }[]>([]);
   const [error, setError] = useState<string | null>(null);
-  const [receiveMode, setReceiveMode] = useState<'code' | 'qr'>('code');
+  const [receiveMode, setReceiveMode] = useState<'code' | 'qr' | 'nearby'>('code');
 
   // Cancel confirmation & countdown states
   const [showCancelConfirm, setShowCancelConfirm] = useState(false);
@@ -402,11 +404,88 @@ export function App() {
     }
   };
 
-  const startReceiving = (mode: 'code' | 'qr' = 'code') => {
+  const startReceiving = (mode: 'code' | 'qr' | 'nearby' = 'code') => {
     setError(null);
     setRole('receiver');
     setReceiveMode(mode);
     setScreenState('receive');
+  };
+
+  const handleNearbyPaired = async (payload: {
+    session_id: string;
+    pairing_code: string;
+    role: 'sender' | 'receiver';
+    peer_ephemeral_id: string;
+  }) => {
+    const currentDevice = deviceRef.current;
+    if (!currentDevice) return;
+
+    const sess: SessionInfo = {
+      session_id: payload.session_id,
+      pairing_code: payload.pairing_code,
+      expires_at: '',
+      state: 'PAIRED',
+    };
+    setSessionState(sess);
+
+    const sig = new SignalingClient();
+    sigRef.current = sig;
+
+    if (payload.role === 'sender') {
+      setRole('sender');
+      setScreenState('send');
+
+      sig.on('peer_joined', (msg: unknown) => {
+        const p = (msg as { payload: DeviceInfo }).payload;
+        setPeerDeviceState(p);
+      });
+      sig.on('peer_left', () => {
+        handlePeerLeft();
+      });
+      sig.on('transfer_response', (msg: unknown) => {
+        const p = (msg as { payload: { accepted: boolean } }).payload;
+        if (p && p.accepted) {
+          setScreenState('transfer');
+          startWebRTCSender();
+        } else {
+          setError('Transfer declined by receiver');
+          setScreenState('failed');
+        }
+      });
+      sig.on('error', (msg: unknown) => {
+        const p = (msg as { payload?: { message?: string } }).payload;
+        setError(p?.message || 'Signaling error');
+      });
+      sig.connect(sess.session_id, currentDevice.token);
+    } else {
+      setRole('receiver');
+      setScreenState('receive');
+
+      sig.on('peer_joined', (msg: unknown) => {
+        const p = (msg as { payload: DeviceInfo }).payload;
+        setPeerDeviceState(p);
+      });
+      sig.on('file_metadata', (msg: unknown) => {
+        const p = (msg as { payload: { files: FileInfo[]; total_size: number } }).payload;
+        setIncomingFiles(p.files);
+        setIncomingTotalSize(p.total_size);
+        const curDev = deviceRef.current;
+        if (curDev) {
+          updateSessionState(curDev.token, sess.session_id, 'AWAITING_APPROVAL').catch(() => {});
+        }
+      });
+      sig.on('signal', (msg: unknown) => {
+        const signalMsg = msg as { from: string; payload: { signal_type: string; data: unknown } };
+        const curDev = deviceRef.current;
+        if (signalMsg.from !== curDev?.device_id && rtcRef.current) {
+          rtcRef.current.handleSignal(signalMsg.payload);
+        }
+      });
+      sig.on('peer_left', () => {
+        handlePeerLeft();
+      });
+      sig.connect(sess.session_id, currentDevice.token);
+    }
   };
 
   const submitPairingCode = async (
@@ -668,6 +747,15 @@ export function App() {
                   {COPY.home.receiveButton}
                 </Button>
               </Card>
+
+              {/* NEARBY DISCOVERY ACTION */}
+              <Card secondary>
+                <h3 className="card-title">{COPY.home.nearbyTitle}</h3>
+                <p className="card-desc">{COPY.home.nearbyDesc}</p>
+                <Button variant="secondary" onClick={() => startReceiving('nearby')}>
+                  {COPY.home.nearbyButton}
+                </Button>
+              </Card>
             </div>
 
             {/* HOW IT WORKS (3 numbered steps with UI concepts) */}
@@ -867,18 +955,44 @@ export function App() {
                       </p>
                     )}
 
-                    <div style={{ marginTop: '24px' }}>
+                    <div style={{ display: 'flex', gap: '12px', marginTop: '24px' }}>
                       <Button variant="link" onClick={() => setReceiveMode('qr')}>
                         {COPY.receive.scanQrToggle}
+                      </Button>
+                      <Button variant="link" onClick={() => setReceiveMode('nearby')}>
+                        Search nearby
+                      </Button>
+                    </div>
+                  </div>
+                ) : receiveMode === 'qr' ? (
+                  <div style={{ marginTop: '16px', display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
+                    <QrScanner
+                      onScan={(scannedCode) => {
+                        setReceiveMode('code');
+                        setPairingInput(scannedCode);
+                        submitPairingCode(scannedCode);
+                      }}
+                      onClose={() => setReceiveMode('code')}
+                    />
+                    <div style={{ marginTop: '12px' }}>
+                      <Button variant="link" onClick={() => setReceiveMode('code')}>
+                        {COPY.receive.enterCodeToggle}
                       </Button>
                     </div>
                   </div>
                 ) : (
-                  <div style={{ marginTop: '16px', textAlign: 'center' }}>
-                    <p style={{ marginBottom: '16px' }}>{COPY.receive.scanQrInstruction}</p>
-                    <Button variant="link" onClick={() => setReceiveMode('code')}>
-                      {COPY.receive.enterCodeToggle}
-                    </Button>
+                  <div style={{ marginTop: '16px' }}>
+                    {device && (
+                      <NearbyDiscovery
+                        token={device.token}
+                        displayName={device.display_name}
+                        variant="standalone"
+                        onPaired={handleNearbyPaired}
+                        onSelectCode={() => setReceiveMode('code')}
+                        onSelectQr={() => setReceiveMode('qr')}
+                        onClose={() => setReceiveMode('code')}
+                      />
+                    )}
                   </div>
                 )}
               </Card>
