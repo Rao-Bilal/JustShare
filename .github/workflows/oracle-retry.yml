@@ -64,5 +64,5 @@ jobs:
             --image-id "ocid1.image.oc1.ap-mumbai-1.aaaaaaaa2jurqb3jm7hlpqw3au35loaqjkcozbyh7znn4jnfu5zbrgfulwia" \
             --subnet-id "ocid1.subnet.oc1.ap-mumbai-1.aaaaaaaaoskuzhy2z5afejah454cwisgrd2hgfdowi2ijb3p7bryo7gxg22a" \
             --assign-public-ip true \
-            --ssh-authorized-keys-file "$HOME/.ssh/id_rsa.pub" \
+            --ssh-authorized-keys-file "$HOME/.ssh/justshare.pub"
             --boot-volume-size-in-gbs 50
