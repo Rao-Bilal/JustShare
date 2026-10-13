@@ -1,17 +1,14 @@
 import qrcode from 'qrcode-generator';
-import { useMemo, useState } from 'react';
+import { useMemo } from 'react';
 import { buildPairingUrl, isLocalhostHostname } from '../services/pairingUrl';
-import { Button } from './Button';
-import { IconCheck, IconCopy } from './Icons';
+import { COPY } from '../copy';
 
 interface QRCodeDisplayProps {
   pairingCode: string;
-  showCopyLink?: boolean;
 }
 
-export function QRCodeDisplay({ pairingCode, showCopyLink = true }: QRCodeDisplayProps) {
+export function QRCodeDisplay({ pairingCode }: QRCodeDisplayProps) {
   const envOrigin = import.meta.env.VITE_PUBLIC_ORIGIN as string | undefined;
-  const [copiedLink, setCopiedLink] = useState(false);
 
   const url = useMemo(() => {
     return buildPairingUrl(window.location.origin, pairingCode, envOrigin);
@@ -33,46 +30,19 @@ export function QRCodeDisplay({ pairingCode, showCopyLink = true }: QRCodeDispla
     return isLocalhostHostname(window.location.hostname) && !envOrigin;
   }, [envOrigin]);
 
-  const handleCopyLink = async () => {
-    try {
-      await navigator.clipboard.writeText(url);
-      setCopiedLink(true);
-      setTimeout(() => setCopiedLink(false), 2000);
-    } catch (err) {
-      console.warn('Copy link failed:', err);
-    }
-  };
-
   if (!qrDataUrl) return null;
 
   return (
-    <div className="qr-display-container">
-      <div className="qr-frame">
+    <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
+      <div className="qr-box">
         <img
           src={qrDataUrl}
-          alt={`Scan QR code to join session ${pairingCode}`}
-          className="qr-image"
+          alt={`QR code for pairing session ${pairingCode}`}
         />
       </div>
-      <p className="qr-caption">
-        Point camera or QR scanner at the code
-      </p>
-
-      {showCopyLink && (
-        <Button
-          variant="secondary"
-          size="sm"
-          onClick={handleCopyLink}
-          icon={copiedLink ? <IconCheck size={14} /> : <IconCopy size={14} />}
-          className="qr-copy-btn"
-        >
-          {copiedLink ? 'Link Copied!' : 'Copy Pairing Link'}
-        </Button>
-      )}
-
       {isLocalhost && (
-        <div className="localhost-banner">
-          <strong>Localhost Notice:</strong> When testing across devices on Wi-Fi, open JustShare using your local network IP (e.g. <code>http://192.168.x.x:5173</code>), or enter the 6-digit code manually.
+        <div className="notice-box" style={{ marginTop: '12px' }}>
+          {COPY.send.localhostNotice}
         </div>
       )}
     </div>

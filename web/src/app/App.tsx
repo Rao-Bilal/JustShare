@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { createSession, getSession, joinSession, updateSessionState } from '../services/api';
-import { formatRemoteLog, RemoteDevLogger, RemoteLogPayload } from '../services/devLogger';
-import { getOrCreateDevice, renameDevice, resetDevice, supportsDirectoryUpload } from '../services/device';
+import { getOrCreateDevice, supportsDirectoryUpload } from '../services/device';
 import { formatBytes, formatEta, formatSpeed } from '../services/format';
 import { SignalingClient } from '../services/signaling';
 import { createTransferStorage, TransferStorage } from '../services/storage';
@@ -10,41 +9,25 @@ import { WebRTCConnection } from '../services/webrtc';
 import { AppScreen, DeviceInfo, FileInfo, SessionInfo, SessionState, TransferProgress } from '../types';
 import { decidePeerLeftAction } from '../services/peerLeft';
 import { determineInitialUrlAction } from '../services/pairingUrl';
+import { mapTechnicalError, formatDuration, truncateMiddle } from '../services/errorMapper';
+import { COPY } from '../copy';
+
 import { QRCodeDisplay } from '../components/QRCodeDisplay';
-import { NearbyDiscovery } from '../components/NearbyDiscovery';
-import {
-  IconLogo,
-  IconSun,
-  IconMoon,
-  IconEdit,
-  IconUpload,
-  IconDownload,
-  IconKeypad,
-  IconQrCode,
-  IconCopy,
-  IconCheck,
-  IconShield,
-  IconCheckCircle,
-  IconAlertCircle,
-  IconClock,
-  IconFolder,
-  IconArrowLeft,
-  IconRefreshCw,
-} from '../components/Icons';
 import { Button } from '../components/Button';
 import { Card } from '../components/Card';
+import { Stepper } from '../components/Stepper';
 import { CodeInput } from '../components/CodeInput';
-import { DeviceAvatar } from '../components/DeviceAvatar';
-import { DeviceEditModal } from '../components/DeviceEditModal';
 import { FileRow } from '../components/FileRow';
 import { ProgressBar } from '../components/ProgressBar';
-import { StatusChip } from '../components/StatusChip';
+import { StatusBadge } from '../components/StatusBadge';
+import { ErrorPanel } from '../components/ErrorPanel';
+import { ConfirmDialog } from '../components/ConfirmDialog';
 
 export function App() {
   const [device, setDevice] = useState<{ device_id: string; display_name: string; token: string } | null>(null);
   const [screen, setScreen] = useState<AppScreen>('home');
   const screenRef = useRef<AppScreen>('home');
-  const [, setRole] = useState<'sender' | 'receiver' | null>(null);
+  const [role, setRole] = useState<'sender' | 'receiver' | null>(null);
   const [session, setSession] = useState<SessionInfo | null>(null);
   const [peerDevice, setPeerDevice] = useState<DeviceInfo | null>(null);
   const [pairingInput, setPairingInput] = useState('');
@@ -55,19 +38,19 @@ export function App() {
   const [transferProgress, setTransferProgress] = useState<TransferProgress | null>(null);
   const [completedFiles, setCompletedFiles] = useState<{ name: string; blob: Blob; verified: boolean }[]>([]);
   const [error, setError] = useState<string | null>(null);
-  const [receiveMode, setReceiveMode] = useState<'nearby' | 'code' | 'qr'>('code');
+  const [receiveMode, setReceiveMode] = useState<'code' | 'qr'>('code');
 
-  // Theme & Device Name modal states
-  const [theme, setTheme] = useState<'light' | 'dark'>(() => {
-    const saved = localStorage.getItem('justshare_theme');
-    if (saved === 'dark' || saved === 'light') return saved;
-    return typeof window !== 'undefined' && window.matchMedia('(prefers-color-scheme: dark)').matches
-      ? 'dark'
-      : 'light';
-  });
-  const [isRenameModalOpen, setIsRenameModalOpen] = useState(false);
+  // Cancel confirmation & countdown states
+  const [showCancelConfirm, setShowCancelConfirm] = useState(false);
   const [copiedCode, setCopiedCode] = useState(false);
-  const [dragOver, setDragOver] = useState(false);
+  const [transferDurationSecs, setTransferDurationSecs] = useState<number | null>(null);
+  const transferStartTimeRef = useRef<number | null>(null);
+
+  // Expiration countdown
+  const [expirySecondsLeft, setExpirySecondsLeft] = useState<number | null>(null);
+
+  // Storage space warning
+  const [storageWarning, setStorageWarning] = useState<string | null>(null);
 
   const sigRef = useRef<SignalingClient | null>(null);
   const rtcRef = useRef<WebRTCConnection | null>(null);
@@ -82,16 +65,6 @@ export function App() {
   const selectedFilesRef = useRef<File[]>([]);
   const peerDeviceRef = useRef<DeviceInfo | null>(null);
   const hasAutoJoinedRef = useRef(false);
-
-  // Sync theme
-  useEffect(() => {
-    document.documentElement.setAttribute('data-theme', theme);
-    localStorage.setItem('justshare_theme', theme);
-  }, [theme]);
-
-  const toggleTheme = () => {
-    setTheme((prev) => (prev === 'light' ? 'dark' : 'light'));
-  };
 
   const setScreenState = (s: AppScreen) => {
     screenRef.current = s;
@@ -125,6 +98,23 @@ export function App() {
     peerDeviceRef.current = peer;
     setPeerDevice(peer);
   };
+
+  // Expiration countdown timer
+  useEffect(() => {
+    if (screen === 'send' && session?.expires_at) {
+      const targetTime = new Date(session.expires_at).getTime();
+      const updateLeft = () => {
+        const now = Date.now();
+        const diff = Math.max(0, Math.floor((targetTime - now) / 1000));
+        setExpirySecondsLeft(diff);
+      };
+      updateLeft();
+      const interval = setInterval(updateLeft, 1000);
+      return () => clearInterval(interval);
+    } else {
+      setExpirySecondsLeft(null);
+    }
+  }, [screen, session]);
 
   useEffect(() => {
     createTransferStorage()
@@ -162,8 +152,8 @@ export function App() {
         }
       })
       .catch((e: unknown) => {
-        const errorMsg = e instanceof Error ? e.message : 'Device init error';
-        setError('Device registration failed: ' + errorMsg);
+        const errorMsg = e instanceof Error ? e.message : 'Device registration failed';
+        setError(errorMsg);
         setJoining(false);
       });
   }, []);
@@ -199,6 +189,10 @@ export function App() {
     setIncomingTotalSize(0);
     setTransferProgress(null);
     setError(null);
+    setShowCancelConfirm(false);
+    setTransferDurationSecs(null);
+    transferStartTimeRef.current = null;
+    setStorageWarning(null);
   };
 
   const handlePeerLeft = () => {
@@ -217,19 +211,10 @@ export function App() {
     });
 
     if (decision.action === 'fail') {
-      console.warn('[PEER_LEFT] Peer disconnected during active transfer, setting screen to failed');
-      if (senderRef.current) {
-        senderRef.current.cancel('Peer disconnected');
-      }
-      if (receiverRef.current) {
-        receiverRef.current.cancel('Peer disconnected');
-      }
-      if (rtcRef.current) {
-        rtcRef.current.close();
-      }
-      if (sigRef.current) {
-        sigRef.current.disconnect();
-      }
+      if (senderRef.current) senderRef.current.cancel('Peer disconnected');
+      if (receiverRef.current) receiverRef.current.cancel('Peer disconnected');
+      if (rtcRef.current) rtcRef.current.close();
+      if (sigRef.current) sigRef.current.disconnect();
 
       setError(decision.error);
       setScreenState('failed');
@@ -242,54 +227,18 @@ export function App() {
     } else if (decision.action === 'go_home') {
       setError(decision.error);
       goHome();
-    } else {
-      console.log('[PEER_LEFT] Ignoring peer_left (transfer already finished or terminal)');
     }
-  };
-
-  const handleAuthFailure = async () => {
-    try {
-      const freshDevice = await resetDevice();
-      setDeviceState(freshDevice);
-      return freshDevice;
-    } catch {
-      return null;
-    }
-  };
-
-  const handleRenameDevice = async (newName: string) => {
-    const updated = await renameDevice(newName);
-    setDeviceState(updated);
   };
 
   // Sender flow
   const startSending = async () => {
-    let currentDevice = deviceRef.current;
-    if (!currentDevice) {
-      currentDevice = await handleAuthFailure();
-      if (!currentDevice) return;
-    }
+    const currentDevice = deviceRef.current;
+    if (!currentDevice) return;
 
     try {
       setError(null);
       setRole('sender');
-      let res;
-      try {
-        res = await createSession(currentDevice.token);
-      } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : '';
-        if (msg.includes('Authentication') || msg.includes('token') || msg.includes('401')) {
-          const fresh = await handleAuthFailure();
-          if (fresh) {
-            currentDevice = fresh;
-            res = await createSession(fresh.token);
-          } else {
-            throw err;
-          }
-        } else {
-          throw err;
-        }
-      }
+      const res = await createSession(currentDevice.token);
 
       const sess: SessionInfo = {
         session_id: res.session_id,
@@ -311,16 +260,11 @@ export function App() {
         handlePeerLeft();
       });
       sig.on('transfer_response', (msg: unknown) => {
-        console.log('[SIGNAL] transfer_response handler START');
         const payload = (msg as { payload: { accepted: boolean } }).payload;
-        console.log(`[SIGNAL] transfer_response accepted=${payload?.accepted}`);
         if (payload && payload.accepted) {
-          console.log('[SIGNAL] transfer_response handler invoking sender WebRTC initialization');
           setScreenState('transfer');
           startWebRTCSender();
-          console.log('[SIGNAL] transfer_response handler completed');
         } else {
-          console.log('[SIGNAL] transfer_response rejected');
           setError('Transfer declined by receiver');
           setScreenState('failed');
         }
@@ -355,30 +299,12 @@ export function App() {
           )
       );
 
-      const updated = [...prevFiles, ...uniqueAdditions];
-      console.log(`[TRANSFER][SEND] files updated: total=${updated.length} file(s) (+${uniqueAdditions.length})`);
-
-      if (sigRef.current && deviceRef.current) {
-        const logger = new RemoteDevLogger(sigRef.current, deviceRef.current.device_id);
-        uniqueAdditions.forEach((f) => {
-          logger.log('file_selected', {
-            fileName: f.webkitRelativePath || f.name,
-            fileSize: f.size,
-            totalChunks: f.size === 0 ? 0 : Math.ceil(f.size / 65536),
-          });
-        });
-      }
-
-      return updated;
+      return [...prevFiles, ...uniqueAdditions];
     });
   };
 
   const handleRemoveFile = (indexToRemove: number) => {
-    setSelectedFilesState((prev) => {
-      const updated = prev.filter((_, idx) => idx !== indexToRemove);
-      console.log(`[TRANSFER][SEND] file removed at index ${indexToRemove}, remaining=${updated.length}`);
-      return updated;
-    });
+    setSelectedFilesState((prev) => prev.filter((_, idx) => idx !== indexToRemove));
   };
 
   const sendFileMetadata = () => {
@@ -396,7 +322,6 @@ export function App() {
     }));
     const totalSize = curFiles.reduce((acc, f) => acc + f.size, 0);
 
-    console.log(`[TRANSFER][SEND] file_metadata sent (${curFiles.length} file(s), ${totalSize} bytes)`);
     curSig.send({
       type: 'file_metadata',
       payload: {
@@ -407,134 +332,13 @@ export function App() {
     setScreenState('send');
   };
 
-  const reconnectAttemptsRef = useRef<number>(0);
-  const isReconnectingRef = useRef<boolean>(false);
-  const MAX_RECONNECT_ATTEMPTS = 5;
-
-  const handleConnectionDrop = async () => {
-    const curSession = sessionRef.current;
-    const curDevice = deviceRef.current;
-    const curSig = sigRef.current;
-
-    if (!curSession || !curDevice || !curSig || screenRef.current !== 'transfer') {
-      return;
-    }
-
-    if (isReconnectingRef.current) {
-      console.log('[RECOVERY] Reconnection already in progress');
-      return;
-    }
-
-    if (reconnectAttemptsRef.current >= MAX_RECONNECT_ATTEMPTS) {
-      console.error('[RECOVERY] Max reconnect attempts exceeded');
-      setError('Connection lost: could not recover after maximum retries');
-      setScreenState('failed');
-      if (curDevice && curSession) {
-        updateSessionState(curDevice.token, curSession.session_id, 'FAILED').catch(() => {});
-      }
-      return;
-    }
-
-    isReconnectingRef.current = true;
-    reconnectAttemptsRef.current += 1;
-    console.log(`[RECOVERY] Attempting reconnection (${reconnectAttemptsRef.current}/${MAX_RECONNECT_ATTEMPTS})`);
-
-    setTransferProgress((prev) =>
-      prev ? { ...prev, state: 'reconnecting' } : null
-    );
-
-    try {
-      if (senderRef.current) {
-        senderRef.current.pause();
-        await updateSessionState(curDevice.token, curSession.session_id, 'PAUSED').catch(() => {});
-
-        if (rtcRef.current) {
-          rtcRef.current.close();
-        }
-        const rtc = new WebRTCConnection(curSig, true);
-        rtcRef.current = rtc;
-
-        curSig.on('signal', (msg: unknown) => {
-          const signalMsg = msg as { from: string; payload: { signal_type: string; data: unknown } };
-          if (signalMsg.from !== curDevice.device_id) {
-            rtc.handleSignal(signalMsg.payload);
-          }
-        });
-
-        rtc.onConnectionStateChange = (state) => {
-          if (state === 'failed' || state === 'disconnected') {
-            handleConnectionDrop();
-          }
-        };
-
-        const dc = rtc.getDataChannel();
-        if (dc) {
-          let recoveryStarted = false;
-          const onDcOpen = async () => {
-            if (recoveryStarted) return;
-            recoveryStarted = true;
-            console.log('[RECOVERY][SEND] Reconnected DataChannel open, resuming FileSender');
-            isReconnectingRef.current = false;
-            reconnectAttemptsRef.current = 0;
-            await updateSessionState(curDevice.token, curSession.session_id, 'TRANSFERRING').catch(() => {});
-            if (senderRef.current) {
-              senderRef.current.resume(dc);
-            }
-          };
-
-          if (dc.readyState === 'open') {
-            onDcOpen();
-          } else {
-            dc.addEventListener('open', onDcOpen, { once: true });
-          }
-        }
-
-        await rtc.createOffer();
-      } else if (receiverRef.current) {
-        if (rtcRef.current) {
-          rtcRef.current.close();
-        }
-        const rtc = new WebRTCConnection(curSig, false);
-        rtcRef.current = rtc;
-
-        curSig.on('signal', (msg: unknown) => {
-          const signalMsg = msg as { from: string; payload: { signal_type: string; data: unknown } };
-          if (signalMsg.from !== curDevice.device_id) {
-            rtc.handleSignal(signalMsg.payload);
-          }
-        });
-
-        rtc.onConnectionStateChange = (state) => {
-          if (state === 'failed' || state === 'disconnected') {
-            handleConnectionDrop();
-          }
-        };
-
-        rtc.onDataChannel = (dc) => {
-          console.log('[RECOVERY][RECEIVE] Reconnected DataChannel received, resuming FileReceiver');
-          isReconnectingRef.current = false;
-          reconnectAttemptsRef.current = 0;
-          if (receiverRef.current) {
-            receiverRef.current.resume(dc);
-          }
-        };
-      }
-    } catch (err) {
-      console.error('[RECOVERY] Reconnection attempt failed:', err);
-      isReconnectingRef.current = false;
-      setTimeout(() => handleConnectionDrop(), 2000);
-    }
-  };
-
   const startWebRTCSender = () => {
     const curSig = sigRef.current;
     const curSession = sessionRef.current;
     const curDevice = deviceRef.current;
     const curFiles = selectedFilesRef.current;
 
-    console.log('[TRANSFER][SEND] runSender START');
     if (!curSig || !curSession || !curDevice) {
-      console.error('[TRANSFER][SEND] Cannot start WebRTC sender: missing dependencies');
       setError('Internal error: WebRTC session not ready');
       setScreenState('failed');
       return;
@@ -553,8 +357,7 @@ export function App() {
 
       rtc.onConnectionStateChange = (state) => {
         if (state === 'failed' || state === 'disconnected') {
-          console.warn(`[WEBRTC][SEND] Connection state ${state}, triggering recovery`);
-          handleConnectionDrop();
+          handlePeerLeft();
         }
       };
 
@@ -564,23 +367,21 @@ export function App() {
         const runSender = () => {
           if (senderStarted) return;
           senderStarted = true;
-          console.log('[TRANSFER][SEND] DataChannel open, starting FileSender');
-          updateSessionState(curDevice.token, curSession.session_id, 'TRANSFERRING').catch((err) => {
-            console.error('[TRANSFER][SEND] Failed to update state to TRANSFERRING', err);
-          });
-          const devLogger = curSig && curDevice ? new RemoteDevLogger(curSig, curDevice.device_id) : undefined;
-          const sender = new FileSender(dc, curFiles, { logger: devLogger });
+          updateSessionState(curDevice.token, curSession.session_id, 'TRANSFERRING').catch(() => {});
+          const sender = new FileSender(dc, curFiles);
           senderRef.current = sender;
+          transferStartTimeRef.current = Date.now();
           sender.onProgress = setTransferProgress;
           sender.onComplete = () => {
-            console.log('[TRANSFER][SEND] FileSender completed');
+            if (transferStartTimeRef.current) {
+              setTransferDurationSecs((Date.now() - transferStartTimeRef.current) / 1000);
+            }
             setScreenState('completed');
           };
           sender.onError = (e) => {
             if (screenRef.current === 'failed' || screenRef.current === 'cancelled' || screenRef.current === 'completed') {
               return;
             }
-            console.error('[TRANSFER][SEND] FileSender error:', e);
             setError(e);
             setScreenState('failed');
           };
@@ -595,108 +396,17 @@ export function App() {
       }
 
       rtc.createOffer();
-    } catch (err) {
-      console.error('[TRANSFER][SEND] runSender FAILED:', err);
+    } catch {
       setError('WebRTC initialization failed');
       setScreenState('failed');
     }
   };
 
-  const startReceiving = (mode: 'nearby' | 'code' | 'qr' = 'code') => {
+  const startReceiving = (mode: 'code' | 'qr' = 'code') => {
     setError(null);
     setRole('receiver');
     setReceiveMode(mode);
     setScreenState('receive');
-  };
-
-  const handleNearbyPaired = async (payload: {
-    session_id: string;
-    pairing_code: string;
-    role: 'sender' | 'receiver';
-    peer_ephemeral_id: string;
-  }) => {
-    let currentDevice = deviceRef.current;
-    if (!currentDevice) {
-      currentDevice = await handleAuthFailure();
-      if (!currentDevice) {
-        setError('Device registration failed. Please refresh.');
-        return;
-      }
-    }
-    setDeviceState(currentDevice);
-
-    const sess: SessionInfo = {
-      session_id: payload.session_id,
-      pairing_code: payload.pairing_code,
-      expires_at: '',
-      state: 'PAIRED',
-    };
-    setSessionState(sess);
-
-    const sig = new SignalingClient();
-    sigRef.current = sig;
-
-    if (payload.role === 'sender') {
-      setRole('sender');
-      setScreenState('send');
-
-      sig.on('peer_joined', (msg: unknown) => {
-        const p = (msg as { payload: DeviceInfo }).payload;
-        setPeerDeviceState(p);
-      });
-      sig.on('peer_left', () => {
-        handlePeerLeft();
-      });
-      sig.on('transfer_response', (msg: unknown) => {
-        const p = (msg as { payload: { accepted: boolean } }).payload;
-        if (p && p.accepted) {
-          setScreenState('transfer');
-          startWebRTCSender();
-        } else {
-          setError('Transfer declined by receiver');
-          setScreenState('failed');
-        }
-      });
-      sig.on('error', (msg: unknown) => {
-        const p = (msg as { payload?: { message?: string } }).payload;
-        setError(p?.message || 'Signaling error');
-      });
-      sig.connect(sess.session_id, currentDevice.token);
-    } else {
-      setRole('receiver');
-      setScreenState('receive');
-
-      sig.on('peer_joined', (msg: unknown) => {
-        const p = (msg as { payload: DeviceInfo }).payload;
-        setPeerDeviceState(p);
-      });
-      sig.on('file_metadata', (msg: unknown) => {
-        const p = (msg as { payload: { files: FileInfo[]; total_size: number } }).payload;
-        setIncomingFiles(p.files);
-        setIncomingTotalSize(p.total_size);
-        const curDev = deviceRef.current;
-        if (curDev) {
-          updateSessionState(curDev.token, sess.session_id, 'AWAITING_APPROVAL').catch(() => {});
-        }
-      });
-      sig.on('signal', (msg: unknown) => {
-        const signalMsg = msg as { from: string; payload: { signal_type: string; data: unknown } };
-        const curDev = deviceRef.current;
-        if (signalMsg.from !== curDev?.device_id && rtcRef.current) {
-          rtcRef.current.handleSignal(signalMsg.payload);
-        }
-      });
-      sig.on('dev_log', (msg: unknown) => {
-        const p = (msg as { payload: RemoteLogPayload }).payload;
-        if (p) {
-          console.log(formatRemoteLog(p));
-        }
-      });
-      sig.on('peer_left', () => {
-        handlePeerLeft();
-      });
-      sig.connect(sess.session_id, currentDevice.token);
-    }
   };
 
   const submitPairingCode = async (
@@ -707,35 +417,15 @@ export function App() {
     setJoining(true);
     setError(null);
 
-    let currentDevice = targetDevice || deviceRef.current;
+    const currentDevice = targetDevice || deviceRef.current;
     if (!currentDevice) {
-      currentDevice = await handleAuthFailure();
-      if (!currentDevice) {
-        setError('Device registration failed. Please refresh.');
-        setJoining(false);
-        return;
-      }
+      setError('Device not initialized');
+      setJoining(false);
+      return;
     }
-    setDeviceState(currentDevice);
 
     try {
-      let res;
-      try {
-        res = await joinSession(currentDevice.token, codeToJoin);
-      } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : '';
-        if (msg.includes('Authentication') || msg.includes('token') || msg.includes('401')) {
-          const fresh = await handleAuthFailure();
-          if (fresh) {
-            currentDevice = fresh;
-            res = await joinSession(fresh.token, codeToJoin);
-          } else {
-            throw err;
-          }
-        } else {
-          throw err;
-        }
-      }
+      const res = await joinSession(currentDevice.token, codeToJoin);
 
       const sess: SessionInfo = {
         session_id: res.session_id,
@@ -754,6 +444,21 @@ export function App() {
         const payload = (msg as { payload: { files: FileInfo[]; total_size: number } }).payload;
         setIncomingFiles(payload.files);
         setIncomingTotalSize(payload.total_size);
+
+        // Check storage quota if available
+        if (navigator.storage && navigator.storage.estimate) {
+          navigator.storage.estimate().then((est) => {
+            if (est.quota !== undefined && est.usage !== undefined) {
+              const freeSpace = est.quota - est.usage;
+              if (freeSpace < payload.total_size) {
+                setStorageWarning(
+                  COPY.receive.storageWarning(formatBytes(freeSpace), formatBytes(payload.total_size))
+                );
+              }
+            }
+          }).catch(() => {});
+        }
+
         const curDev = deviceRef.current;
         if (curDev) {
           updateSessionState(curDev.token, sess.session_id, 'AWAITING_APPROVAL').catch(() => {});
@@ -765,13 +470,6 @@ export function App() {
         const curDev = deviceRef.current;
         if (signalMsg.from !== curDev?.device_id && rtcRef.current) {
           rtcRef.current.handleSignal(signalMsg.payload);
-        }
-      });
-
-      sig.on('dev_log', (msg: unknown) => {
-        const payload = (msg as { payload: RemoteLogPayload }).payload;
-        if (payload) {
-          console.log(formatRemoteLog(payload));
         }
       });
 
@@ -799,44 +497,41 @@ export function App() {
       payload: { accepted: true },
     });
 
-    updateSessionState(curDevice.token, curSession.session_id, 'CONNECTING').catch((err) => {
-      console.error('[TRANSFER][RECEIVE] Failed to update state to CONNECTING', err);
-    });
+    updateSessionState(curDevice.token, curSession.session_id, 'CONNECTING').catch(() => {});
 
     const rtc = new WebRTCConnection(curSig, false);
     rtcRef.current = rtc;
 
     rtc.onConnectionStateChange = (state) => {
       if (state === 'failed' || state === 'disconnected') {
-        handleConnectionDrop();
+        handlePeerLeft();
       }
     };
 
     rtc.onDataChannel = (dc) => {
       const receiver = new FileReceiver(dc, { storage: storageRef.current || undefined });
       receiverRef.current = receiver;
+      transferStartTimeRef.current = Date.now();
       let lastVerifyingFileIndex = -1;
       receiver.onProgress = (progress) => {
         setTransferProgress(progress);
         if (progress.state === 'verifying' && progress.currentFileIndex !== lastVerifyingFileIndex) {
           lastVerifyingFileIndex = progress.currentFileIndex;
-          updateSessionState(curDevice.token, curSession.session_id, 'VERIFYING').catch((err) => {
-            console.error('[TRANSFER][RECEIVE] Failed to update state to VERIFYING', err);
-          });
+          updateSessionState(curDevice.token, curSession.session_id, 'VERIFYING').catch(() => {});
         }
       };
       receiver.onComplete = (files) => {
+        if (transferStartTimeRef.current) {
+          setTransferDurationSecs((Date.now() - transferStartTimeRef.current) / 1000);
+        }
         setCompletedFiles(files);
         setScreenState('completed');
-        updateSessionState(curDevice.token, curSession.session_id, 'COMPLETED').catch((err) => {
-          console.error('[TRANSFER][RECEIVE] Failed to update state to COMPLETED', err);
-        });
+        updateSessionState(curDevice.token, curSession.session_id, 'COMPLETED').catch(() => {});
       };
       receiver.onError = (err) => {
         if (screenRef.current === 'failed' || screenRef.current === 'cancelled' || screenRef.current === 'completed') {
           return;
         }
-        console.error('[TRANSFER][RECEIVE] FileReceiver error:', err);
         setError(err);
         setScreenState('failed');
       };
@@ -860,13 +555,23 @@ export function App() {
     goHome();
   };
 
-  const cancelTransfer = () => {
+  const handleCancelClick = () => {
+    const percentage = transferProgress?.percentage || 0;
+    if (percentage > 10) {
+      setShowCancelConfirm(true);
+    } else {
+      executeCancel();
+    }
+  };
+
+  const executeCancel = () => {
     const curSession = sessionRef.current;
     const curDevice = deviceRef.current;
 
     if (senderRef.current) senderRef.current.cancel('User cancelled');
     if (receiverRef.current) receiverRef.current.cancel('User cancelled');
     if (curSession && curDevice) updateSessionState(curDevice.token, curSession.session_id, 'CANCELLED').catch(() => {});
+    setShowCancelConfirm(false);
     setScreenState('cancelled');
   };
 
@@ -877,7 +582,7 @@ export function App() {
       setCopiedCode(true);
       setTimeout(() => setCopiedCode(false), 2000);
     } catch {
-      // fallback
+      // ignore
     }
   };
 
@@ -887,48 +592,26 @@ export function App() {
     <>
       <header className="app-header">
         <button type="button" className="brand-button" onClick={goHome} aria-label="JustShare Home">
-          <div className="brand-icon-wrapper">
-            <IconLogo size={18} />
-          </div>
-          <span>JustShare</span>
+          <span>{COPY.header.brand}</span>
         </button>
 
-        <div className="header-actions">
+        <div className="header-right">
           {device && (
-            <button
-              type="button"
-              className="device-chip"
-              onClick={() => setIsRenameModalOpen(true)}
-              title="Click to rename your device"
-              aria-label={`Device: ${device.display_name}. Click to rename.`}
-            >
-              <DeviceAvatar name={device.display_name} size="sm" showBadge={false} />
-              <span className="device-chip-name">{device.display_name}</span>
-              <IconEdit size={14} className="device-chip-edit-icon" />
-            </button>
+            <div className="device-chip-static" title={device.display_name}>
+              <span className="device-chip-dot" aria-hidden="true" />
+              <span>{device.display_name}</span>
+            </div>
           )}
-
-          <button
-            type="button"
-            className="theme-toggle-btn"
-            onClick={toggleTheme}
-            aria-label={`Switch to ${theme === 'light' ? 'dark' : 'light'} mode`}
-            title={`Switch to ${theme === 'light' ? 'dark' : 'light'} mode`}
-          >
-            {theme === 'light' ? <IconMoon size={18} /> : <IconSun size={18} />}
-          </button>
+          {screen !== 'home' && (
+            <Button variant="link" onClick={goHome}>
+              {COPY.header.home}
+            </Button>
+          )}
         </div>
       </header>
 
       <main className="app-main">
-        {error && (
-          <div className="global-error-banner" role="alert">
-            <IconAlertCircle size={20} />
-            <span>{error}</span>
-          </div>
-        )}
-
-        {/* Hidden inputs for file/folder pickers */}
+        {/* Hidden file pickers */}
         <input
           ref={fileInputRef}
           id="file-input"
@@ -945,7 +628,7 @@ export function App() {
             ref={folderInputRef}
             id="folder-input"
             type="file"
-            // @ts-expect-error - webkitdirectory is standard in browsers but not yet in standard React HTMLInput types
+            // @ts-expect-error - webkitdirectory standard in browsers
             webkitdirectory=""
             directory=""
             multiple
@@ -957,28 +640,147 @@ export function App() {
           />
         )}
 
-        {/* Screen 1: Home (Direct Tool Interface) */}
+        {/* =========================================================================
+            SCREEN 1: HOME
+            ========================================================================= */}
         {screen === 'home' && (
-          <div className="screen-container home-tool-layout">
-            <div className="home-primary-grid">
-              {/* Primary Dropzone */}
-              <Card padding="none" className="dropzone-container">
+          <div className="screen-wrapper">
+            <div className="home-hero">
+              <h1>{COPY.home.title}</h1>
+              <p className="home-hero-subtitle">{COPY.home.subtitle}</p>
+            </div>
+
+            <div className="home-action-panels">
+              {/* PRIMARY ACTION: Send */}
+              <Card className="primary-send-panel">
+                <h2 className="card-title">{COPY.home.sendCardTitle}</h2>
+                <p className="card-desc">{COPY.home.sendCardDesc}</p>
+                <Button variant="primary" onClick={startSending}>
+                  {COPY.home.sendButton}
+                </Button>
+              </Card>
+
+              {/* SECONDARY ACTION: Receive */}
+              <Card secondary>
+                <h3 className="card-title">{COPY.home.receiveCardTitle}</h3>
+                <p className="card-desc">{COPY.home.receiveCardDesc}</p>
+                <Button variant="secondary" onClick={() => startReceiving('code')}>
+                  {COPY.home.receiveButton}
+                </Button>
+              </Card>
+            </div>
+
+            {/* HOW IT WORKS (3 numbered steps with UI concepts) */}
+            <section className="how-it-works-section" aria-labelledby="how-it-works-title">
+              <h3 id="how-it-works-title">{COPY.home.howItWorksTitle}</h3>
+              <div className="step-row">
+                <span className="step-num">1</span>
+                <div className="step-content">
+                  <h4>{COPY.home.step1Title}</h4>
+                  <p>{COPY.home.step1Desc}</p>
+                </div>
+              </div>
+              <div className="step-row">
+                <span className="step-num">2</span>
+                <div className="step-content">
+                  <h4>{COPY.home.step2Title}</h4>
+                  <p>{COPY.home.step2Desc}</p>
+                </div>
+              </div>
+              <div className="step-row">
+                <span className="step-num">3</span>
+                <div className="step-content">
+                  <h4>{COPY.home.step3Title}</h4>
+                  <p>{COPY.home.step3Desc}</p>
+                </div>
+              </div>
+            </section>
+
+            {/* VERIFIABLE PROOF FACTS */}
+            <div className="proof-list">
+              <div className="proof-item">
+                <span className="proof-bullet">✓</span>
+                <span>{COPY.home.proofDirect}</span>
+              </div>
+              <div className="proof-item">
+                <span className="proof-bullet">✓</span>
+                <span>{COPY.home.proofHash}</span>
+              </div>
+              <div className="proof-item">
+                <span className="proof-bullet">✓</span>
+                <span>{COPY.home.proofNoAccount}</span>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* =========================================================================
+            SCREEN 2: SEND (Waiting or Paired)
+            ========================================================================= */}
+        {screen === 'send' && session && (
+          <div className="screen-wrapper">
+            <Stepper currentStep={peerDevice ? 2 : 1} />
+
+            {!peerDevice ? (
+              /* State 2A: Waiting for receiver */
+              <Card className="pairing-container">
+                <h2>{COPY.send.waitingHeadline}</h2>
+                <p>{COPY.send.waitingInstruction}</p>
+
+                <div className="pairing-code-large">
+                  {session.pairing_code.split('').map((d, i) => (
+                    <div key={i} className="code-box-display">
+                      {d}
+                    </div>
+                  ))}
+                </div>
+
+                <Button variant="secondary" onClick={handleCopyPairingCode}>
+                  {copiedCode ? COPY.send.codeCopied : COPY.send.copyCode}
+                </Button>
+
+                <div className="qr-box-container">
+                  <QRCodeDisplay pairingCode={session.pairing_code} />
+                </div>
+
+                <div className="expiry-text">
+                  {expirySecondsLeft !== null && expirySecondsLeft > 0 ? (
+                    COPY.send.expiresIn(expirySecondsLeft)
+                  ) : expirySecondsLeft === 0 ? (
+                    <div>
+                      <span>{COPY.send.codeExpired} </span>
+                      <Button variant="link" onClick={startSending}>
+                        {COPY.send.generateNewCode}
+                      </Button>
+                    </div>
+                  ) : null}
+                </div>
+
+                <div style={{ marginTop: '16px' }}>
+                  <Button variant="link" onClick={goHome}>
+                    Cancel session
+                  </Button>
+                </div>
+              </Card>
+            ) : (
+              /* State 2B: Paired - Choose Files */
+              <Card>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '16px' }}>
+                  <span className="device-chip-dot" aria-hidden="true" />
+                  <h3>{COPY.send.pairedWith(peerDevice.display_name)}</h3>
+                </div>
+
                 <div
-                  className={`dropzone-area ${dragOver ? 'is-drag-over' : ''}`}
+                  className="dropzone-box"
                   tabIndex={0}
                   role="button"
                   aria-label="Drop files or click to choose files"
-                  onDragOver={(e) => {
-                    e.preventDefault();
-                    setDragOver(true);
-                  }}
-                  onDragLeave={() => setDragOver(false)}
+                  onClick={() => fileInputRef.current?.click()}
+                  onDragOver={(e) => e.preventDefault()}
                   onDrop={(e) => {
                     e.preventDefault();
-                    setDragOver(false);
                     handleFileSelect(e.dataTransfer.files);
                   }}
-                  onClick={() => fileInputRef.current?.click()}
                   onKeyDown={(e) => {
                     if (e.key === 'Enter' || e.key === ' ') {
                       e.preventDefault();
@@ -986,213 +788,30 @@ export function App() {
                     }
                   }}
                 >
-                  <div className="dropzone-icon">
-                    <IconUpload size={26} />
-                  </div>
-                  <h2 className="dropzone-title">Drop files or folders to send</h2>
-                  <p className="dropzone-subtitle">or click anywhere to browse</p>
-
-                  <div className="dropzone-actions" onClick={(e) => e.stopPropagation()}>
+                  <p>{COPY.send.chooseFilesPrompt}</p>
+                  <div style={{ display: 'flex', gap: '8px' }} onClick={(e) => e.stopPropagation()}>
                     <Button
                       variant="secondary"
-                      size="sm"
                       className="action-choose-files"
                       onClick={() => fileInputRef.current?.click()}
                     >
-                      Choose files
+                      {COPY.send.chooseFilesBtn}
                     </Button>
                     {supportsDirectoryUpload() && (
                       <Button
                         variant="secondary"
-                        size="sm"
                         className="action-choose-folder"
-                        icon={<IconFolder size={14} />}
                         onClick={() => folderInputRef.current?.click()}
                       >
-                        Choose folder
+                        {COPY.send.chooseFolderBtn}
                       </Button>
                     )}
                   </div>
                 </div>
-              </Card>
 
-              {/* Receive Quick Action Card */}
-              <Card padding="md" className="receive-quick-card">
-                <div className="section-header">
-                  <h3 className="section-title">Receive Files</h3>
-                  <StatusChip status="default" icon={<IconDownload size={14} />}>
-                    Direct P2P
-                  </StatusChip>
-                </div>
-
-                <div className="receive-options-list">
-                  <button
-                    type="button"
-                    className="receive-option-btn"
-                    onClick={() => startReceiving('code')}
-                  >
-                    <div className="receive-option-icon">
-                      <IconKeypad size={20} />
-                    </div>
-                    <div className="receive-option-info">
-                      <span className="receive-option-title">Enter 6-Digit Code</span>
-                      <span className="receive-option-desc">Connect with a sender’s temporary code</span>
-                    </div>
-                  </button>
-
-                  <button
-                    type="button"
-                    className="receive-option-btn"
-                    onClick={() => startReceiving('qr')}
-                  >
-                    <div className="receive-option-icon">
-                      <IconQrCode size={20} />
-                    </div>
-                    <div className="receive-option-info">
-                      <span className="receive-option-title">Scan QR Code</span>
-                      <span className="receive-option-desc">Pair immediately with a camera</span>
-                    </div>
-                  </button>
-                </div>
-              </Card>
-            </div>
-
-            {/* Staged Files Preview (if user selected files) */}
-            {selectedFiles.length > 0 && (
-              <Card padding="md" className="staged-files-card">
-                <div className="staged-files-header">
-                  <h3 className="section-title">Files Ready to Send</h3>
-                  <span className="staged-files-count">
-                    {selectedFiles.length} item{selectedFiles.length === 1 ? '' : 's'} · {formatBytes(totalStagedSize)}
-                  </span>
-                </div>
-
-                <div className="staged-files-list">
-                  {selectedFiles.map((file, idx) => (
-                    <FileRow
-                      key={idx}
-                      name={file.name}
-                      size={file.size}
-                      relativePath={file.webkitRelativePath}
-                      onRemove={() => handleRemoveFile(idx)}
-                    />
-                  ))}
-                </div>
-
-                <div className="staged-files-summary">
-                  <Button variant="ghost" onClick={() => setSelectedFilesState([])}>
-                    Clear all
-                  </Button>
-                  <Button variant="primary" size="lg" onClick={startSending}>
-                    Generate Code & Send
-                  </Button>
-                </div>
-              </Card>
-            )}
-
-            {/* Live Nearby Discovery Section on Home */}
-            <div className="nearby-live-section">
-              <div className="section-header">
-                <h3 className="section-title">Nearby Devices on Network</h3>
-                <StatusChip status="info" pulse>
-                  Searching Wi-Fi
-                </StatusChip>
-              </div>
-
-              {device && (
-                <NearbyDiscovery
-                  token={device.token}
-                  displayName={device.display_name}
-                  variant="embedded"
-                  onPaired={handleNearbyPaired}
-                  onSelectCode={() => startReceiving('code')}
-                  onSelectQr={() => startReceiving('qr')}
-                  onTokenRefreshed={(newToken) => {
-                    if (deviceRef.current) {
-                      setDeviceState({ ...deviceRef.current, token: newToken });
-                    }
-                  }}
-                />
-              )}
-            </div>
-          </div>
-        )}
-
-        {/* Screen 2: Sender Waiting Screen */}
-        {screen === 'send' && session && (
-          <div className="screen-container">
-            <div className="section-header">
-              <Button variant="ghost" size="sm" icon={<IconArrowLeft size={16} />} onClick={goHome}>
-                Cancel Session
-              </Button>
-              <StatusChip status="info" pulse>
-                Waiting for receiver
-              </StatusChip>
-            </div>
-
-            {!peerDevice ? (
-              <Card padding="lg">
-                <div className="sender-waiting-grid">
-                  {/* Left Column: 6-Digit Code */}
-                  <div className="code-display-box">
-                    <div>
-                      <h3 style={{ fontSize: '1.25rem', fontWeight: 700, marginBottom: '4px' }}>
-                        Pairing Code
-                      </h3>
-                      <p style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>
-                        Enter this 6-digit code on the receiving device
-                      </p>
-                    </div>
-
-                    <div className="code-large-banner">
-                      {session.pairing_code.split('').map((digit, i) => (
-                        <div key={i} className="code-large-digit">
-                          {digit}
-                        </div>
-                      ))}
-                    </div>
-
-                    <Button
-                      variant="secondary"
-                      icon={copiedCode ? <IconCheck size={16} /> : <IconCopy size={16} />}
-                      onClick={handleCopyPairingCode}
-                    >
-                      {copiedCode ? 'Code Copied!' : 'Copy Code'}
-                    </Button>
-
-                    <div className="code-expiry-badge">
-                      <IconClock size={14} />
-                      <span>Code expires in 10 minutes</span>
-                    </div>
-                  </div>
-
-                  {/* Right Column: QR Code */}
-                  <div className="qr-display-container">
-                    <QRCodeDisplay pairingCode={session.pairing_code} />
-                  </div>
-                </div>
-              </Card>
-            ) : (
-              /* Receiver Connected - Send Confirmation */
-              <Card padding="md">
-                <div className="section-header">
-                  <div className="peer-identity-chip">
-                    <DeviceAvatar name={peerDevice.display_name} size="md" />
-                    <div>
-                      <span className="peer-name">{peerDevice.display_name}</span>
-                      <span style={{ display: 'block', fontSize: '0.8rem', color: 'var(--text-muted)' }}>
-                        Connected Receiver
-                      </span>
-                    </div>
-                  </div>
-                  <StatusChip status="success" icon={<IconCheck size={14} />}>
-                    Connected
-                  </StatusChip>
-                </div>
-
-                {selectedFiles.length > 0 ? (
-                  <div style={{ marginTop: '1.5rem', display: 'flex', flexDirection: 'column', gap: '1rem' }}>
-                    <div className="staged-files-list">
+                {selectedFiles.length > 0 && (
+                  <div style={{ marginTop: '24px' }}>
+                    <div className="file-list">
                       {selectedFiles.map((file, idx) => (
                         <FileRow
                           key={idx}
@@ -1203,14 +822,13 @@ export function App() {
                         />
                       ))}
                     </div>
-                    <Button variant="primary" size="lg" onClick={sendFileMetadata}>
-                      Send {selectedFiles.length} File{selectedFiles.length === 1 ? '' : 's'} to {peerDevice.display_name}
-                    </Button>
-                  </div>
-                ) : (
-                  <div style={{ marginTop: '1.5rem', textAlign: 'center' }}>
-                    <Button variant="primary" size="lg" onClick={() => fileInputRef.current?.click()}>
-                      Choose Files to Send
+
+                    <p style={{ margin: '16px 0', fontWeight: 600 }}>
+                      {COPY.send.totalSize(selectedFiles.length, formatBytes(totalStagedSize))}
+                    </p>
+
+                    <Button variant="primary" onClick={sendFileMetadata}>
+                      {COPY.send.sendToPeer(peerDevice.display_name)}
                     </Button>
                   </div>
                 )}
@@ -1219,49 +837,19 @@ export function App() {
           </div>
         )}
 
-        {/* Screen 3: Receive Screen (Code / QR / Nearby Mode) */}
+        {/* =========================================================================
+            SCREEN 3: RECEIVE (Code Entry or Incoming Approval)
+            ========================================================================= */}
         {screen === 'receive' && (
-          <div className="screen-container">
+          <div className="screen-wrapper">
             {!session ? (
-              <Card padding="lg">
-                <div className="section-header" style={{ marginBottom: '1.5rem' }}>
-                  <Button variant="ghost" size="sm" icon={<IconArrowLeft size={16} />} onClick={goHome}>
-                    Back
-                  </Button>
-                  <div style={{ display: 'flex', gap: '6px' }}>
-                    <Button
-                      variant={receiveMode === 'code' ? 'primary' : 'secondary'}
-                      size="sm"
-                      onClick={() => setReceiveMode('code')}
-                    >
-                      6-Digit Code
-                    </Button>
-                    <Button
-                      variant={receiveMode === 'qr' ? 'primary' : 'secondary'}
-                      size="sm"
-                      onClick={() => setReceiveMode('qr')}
-                    >
-                      Scan QR
-                    </Button>
-                    <Button
-                      variant={receiveMode === 'nearby' ? 'primary' : 'secondary'}
-                      size="sm"
-                      onClick={() => setReceiveMode('nearby')}
-                    >
-                      Nearby
-                    </Button>
-                  </div>
-                </div>
+              /* Code Entry / Scan QR */
+              <Card>
+                <h2>{COPY.receive.title}</h2>
+                <p>{COPY.receive.instruction}</p>
 
-                {receiveMode === 'code' && (
-                  <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '1.5rem' }}>
-                    <div style={{ textAlign: 'center' }}>
-                      <h3 style={{ fontSize: '1.25rem', fontWeight: 700 }}>Enter 6-Digit Code</h3>
-                      <p style={{ fontSize: '0.85rem', color: 'var(--text-muted)', marginTop: '4px' }}>
-                        Enter the pairing code displayed on the sender’s screen
-                      </p>
-                    </div>
-
+                {receiveMode === 'code' ? (
+                  <div style={{ marginTop: '16px' }}>
                     <CodeInput
                       value={pairingInput}
                       onChange={(val) => {
@@ -1270,83 +858,65 @@ export function App() {
                       }}
                       onSubmit={(code) => submitPairingCode(code)}
                       disabled={joining}
-                      error={error}
+                      error={error ? mapTechnicalError(error).headline : null}
                     />
 
                     {joining && (
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '8px', color: 'var(--text-muted)' }}>
-                        <span className="btn-spinner" />
-                        <span>Connecting to sender…</span>
-                      </div>
+                      <p style={{ marginTop: '12px', color: 'var(--text-muted)' }}>
+                        {COPY.receive.joining}
+                      </p>
                     )}
-                  </div>
-                )}
 
-                {receiveMode === 'qr' && (
-                  <div style={{ textAlign: 'center', padding: '1rem 0' }}>
-                    <div style={{ marginBottom: '1rem', color: 'var(--accent-primary)' }}>
-                      <IconQrCode size={48} />
+                    <div style={{ marginTop: '24px' }}>
+                      <Button variant="link" onClick={() => setReceiveMode('qr')}>
+                        {COPY.receive.scanQrToggle}
+                      </Button>
                     </div>
-                    <h3 style={{ fontSize: '1.25rem', fontWeight: 700 }}>Scan QR Code</h3>
-                    <p style={{ fontSize: '0.9rem', color: 'var(--text-secondary)', maxWidth: '380px', margin: '0.5rem auto 1.5rem' }}>
-                      Point your phone’s camera at the QR code shown on the sender’s device to open the session automatically.
-                    </p>
                   </div>
-                )}
-
-                {receiveMode === 'nearby' && device && (
-                  <NearbyDiscovery
-                    token={device.token}
-                    displayName={device.display_name}
-                    variant="standalone"
-                    onPaired={handleNearbyPaired}
-                    onSelectCode={() => setReceiveMode('code')}
-                    onSelectQr={() => setReceiveMode('qr')}
-                    onClose={goHome}
-                  />
+                ) : (
+                  <div style={{ marginTop: '16px', textAlign: 'center' }}>
+                    <p style={{ marginBottom: '16px' }}>{COPY.receive.scanQrInstruction}</p>
+                    <Button variant="link" onClick={() => setReceiveMode('code')}>
+                      {COPY.receive.enterCodeToggle}
+                    </Button>
+                  </div>
                 )}
               </Card>
             ) : incomingFiles.length === 0 ? (
-              /* Connected, waiting for sender to pick files */
-              <Card padding="lg" style={{ textAlign: 'center' }}>
-                <div style={{ margin: '1rem auto' }}>
-                  <span className="btn-spinner" style={{ width: 28, height: 28, borderWidth: 3 }} />
-                </div>
-                <h3 style={{ fontSize: '1.2rem', fontWeight: 600 }}>
-                  Connected to {peerDevice?.display_name || 'Sender'}
-                </h3>
-                <p style={{ fontSize: '0.85rem', color: 'var(--text-muted)', marginTop: '4px' }}>
-                  Waiting for the sender to select files…
-                </p>
+              /* Connected, waiting for sender to select files */
+              <Card style={{ textAlign: 'center' }}>
+                <h3>Connected to {peerDevice?.display_name || 'sender'}</h3>
+                <p style={{ marginTop: '8px' }}>Waiting for the sender to choose files...</p>
               </Card>
             ) : (
-              /* Incoming Transfer Approval Card */
-              <Card padding="lg">
-                <div className="section-header">
-                  <div className="peer-identity-chip">
-                    <DeviceAvatar name={peerDevice?.display_name || 'Sender'} size="md" />
-                    <div>
-                      <span className="peer-name">{peerDevice?.display_name || 'Sender'}</span>
-                      <span style={{ display: 'block', fontSize: '0.8rem', color: 'var(--text-muted)' }}>
-                        Wants to send {incomingFiles.length} file{incomingFiles.length === 1 ? '' : 's'} ({formatBytes(incomingTotalSize)})
-                      </span>
-                    </div>
-                  </div>
-                  <StatusChip status="info">Incoming Transfer</StatusChip>
-                </div>
+              /* Incoming Approval Card */
+              <Card>
+                <h2>
+                  {COPY.receive.incomingTitle(
+                    peerDevice?.display_name || 'Sender',
+                    incomingFiles.length,
+                    formatBytes(incomingTotalSize)
+                  )}
+                </h2>
 
-                <div className="staged-files-list" style={{ margin: '1.5rem 0' }}>
+                {storageWarning && (
+                  <div className="notice-box" style={{ margin: '16px 0', borderLeft: '4px solid var(--status-warning)' }}>
+                    {storageWarning}
+                  </div>
+                )}
+
+                <div className="file-list">
                   {incomingFiles.map((file, idx) => (
                     <FileRow key={idx} name={file.name} size={file.size} />
                   ))}
                 </div>
 
-                <div style={{ display: 'flex', gap: '12px', justifyContent: 'flex-end' }}>
-                  <Button variant="secondary" onClick={rejectTransfer}>
-                    Decline
+                <div style={{ display: 'flex', gap: '12px', marginTop: '24px', alignItems: 'center' }}>
+                  <Button variant="primary" onClick={acceptTransfer}>
+                    {COPY.receive.accept}
                   </Button>
-                  <Button variant="primary" size="lg" onClick={acceptTransfer}>
-                    Accept & Download
+                  <Button variant="secondary" onClick={rejectTransfer}>
+                    {COPY.receive.decline}
                   </Button>
                 </div>
               </Card>
@@ -1354,186 +924,192 @@ export function App() {
           </div>
         )}
 
-        {/* Screen 4: Active Transfer Progress */}
+        {/* =========================================================================
+            SCREEN 4: ACTIVE TRANSFER
+            ========================================================================= */}
         {screen === 'transfer' && (
-          <div className="screen-container">
-            <Card padding="lg">
-              <div className="transfer-header">
-                <div className="peer-identity-chip">
-                  <DeviceAvatar name={peerDevice?.display_name || 'Peer'} size="md" />
-                  <div>
-                    <span className="peer-name">{peerDevice?.display_name || 'Peer'}</span>
-                    <span style={{ display: 'block', fontSize: '0.8rem', color: 'var(--text-muted)' }}>
-                      {transferProgress?.state === 'reconnecting'
-                        ? 'Reconnecting…'
-                        : transferProgress?.state === 'verifying'
-                        ? 'Verifying integrity…'
-                        : 'Transferring data…'}
-                    </span>
-                  </div>
-                </div>
+          <div className="screen-wrapper">
+            <Card className="transfer-box">
+              {/* Progress State Title */}
+              <div>
+                <h2>
+                  {transferProgress?.state === 'verifying'
+                    ? COPY.transfer.stateVerifying
+                    : transferProgress?.state === 'reconnecting'
+                    ? 'Reconnecting...'
+                    : role === 'sender'
+                    ? COPY.transfer.stateSending(peerDevice?.display_name || 'receiver')
+                    : COPY.transfer.stateReceiving(peerDevice?.display_name || 'sender')}
+                </h2>
 
-                <StatusChip status="info" icon={<IconShield size={14} />}>
-                  Direct · Encrypted
-                </StatusChip>
+                {transferProgress && (
+                  <p style={{ marginTop: '4px' }}>
+                    {COPY.transfer.fileCounter(
+                      transferProgress.currentFileIndex + 1,
+                      transferProgress.totalFiles
+                    )}
+                    : <strong title={transferProgress.currentFile}>{truncateMiddle(transferProgress.currentFile, 32)}</strong>
+                  </p>
+                )}
               </div>
 
+              {/* Progress Bar & Indicators (Never 0 B/s or ETA 0s during hashing) */}
               {transferProgress ? (
-                <div style={{ margin: '1.5rem 0' }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '8px' }}>
-                    <span style={{ fontSize: '0.95rem', fontWeight: 600 }}>
-                      {transferProgress.currentFile}
-                    </span>
-                    <span style={{ fontSize: '0.9rem', color: 'var(--text-muted)' }}>
-                      File {transferProgress.currentFileIndex + 1} of {transferProgress.totalFiles}
-                    </span>
-                  </div>
-
+                <div>
                   <ProgressBar
                     value={transferProgress.percentage}
-                    size="lg"
-                    status={transferProgress.state === 'reconnecting' ? 'warning' : 'default'}
+                    indeterminate={transferProgress.state === 'verifying'}
                   />
 
-                  <div className="transfer-stats-grid">
-                    <div className="stat-box">
-                      <span className="stat-label">Progress</span>
-                      <span className="stat-value">
-                        {formatBytes(transferProgress.bytesTransferred)} / {formatBytes(transferProgress.totalBytes)}
-                      </span>
+                  {transferProgress.state === 'verifying' ? (
+                    <p style={{ marginTop: '12px', fontSize: '0.875rem' }}>
+                      {COPY.transfer.stateVerifyingDesc}
+                    </p>
+                  ) : (
+                    <div className="transfer-meta-grid">
+                      <div>
+                        <span className="meta-item-label">Transferred</span>
+                        <span className="meta-item-val tabular-numbers">
+                          {formatBytes(transferProgress.bytesTransferred)} / {formatBytes(transferProgress.totalBytes)} ({transferProgress.percentage.toFixed(0)}%)
+                        </span>
+                      </div>
+                      <div>
+                        <span className="meta-item-label">Speed</span>
+                        <span className="meta-item-val tabular-numbers">
+                          {formatSpeed(transferProgress.speed)}
+                        </span>
+                      </div>
+                      <div>
+                        <span className="meta-item-label">Time Remaining</span>
+                        <span className="meta-item-val tabular-numbers">
+                          {formatEta(transferProgress.eta)}
+                        </span>
+                      </div>
                     </div>
-
-                    <div className="stat-box">
-                      <span className="stat-label">Speed</span>
-                      <span className="stat-value">{formatSpeed(transferProgress.speed)}</span>
-                    </div>
-
-                    <div className="stat-box">
-                      <span className="stat-label">Estimated Time</span>
-                      <span className="stat-value">{formatEta(transferProgress.eta)}</span>
-                    </div>
-                  </div>
+                  )}
                 </div>
               ) : (
-                <div style={{ padding: '2rem 0', textAlign: 'center' }}>
-                  <span className="btn-spinner" style={{ width: 24, height: 24 }} />
-                  <p style={{ fontSize: '0.9rem', color: 'var(--text-muted)', marginTop: '8px' }}>
-                    Establishing direct WebRTC peer connection…
-                  </p>
+                <div>
+                  <ProgressBar indeterminate />
+                  <p style={{ marginTop: '8px' }}>{COPY.transfer.stateConnecting}</p>
                 </div>
               )}
 
-              <div style={{ display: 'flex', justifyContent: 'flex-end', paddingTop: '1rem', borderTop: '1px solid var(--border-default)' }}>
-                <Button variant="danger" onClick={cancelTransfer}>
-                  Cancel Transfer
+              {/* Quiet destructive outline cancel button */}
+              <div style={{ marginTop: '16px' }}>
+                <Button variant="destructive" onClick={handleCancelClick}>
+                  {COPY.transfer.cancel}
                 </Button>
               </div>
             </Card>
           </div>
         )}
 
-        {/* Screen 5: Transfer Completed */}
+        {/* =========================================================================
+            SCREEN 5: COMPLETED
+            ========================================================================= */}
         {screen === 'completed' && (
-          <div className="screen-container">
-            <Card padding="none" className="result-screen-card">
-              <div className="result-icon-large result-icon-success">
-                <IconCheckCircle size={36} />
-              </div>
+          <div className="screen-wrapper">
+            <Card>
+              {role === 'receiver' ? (
+                <>
+                  <h2>{COPY.completed.receiverTitle}</h2>
+                  <p style={{ marginTop: '4px' }}>{COPY.completed.receiverSubtitle}</p>
+                  {transferDurationSecs !== null && (
+                    <p style={{ marginTop: '2px', fontSize: '0.875rem', color: 'var(--text-muted)' }}>
+                      {COPY.completed.timeElapsed(formatDuration(transferDurationSecs))}
+                    </p>
+                  )}
 
-              <div>
-                <h2 className="result-title">Transfer Completed!</h2>
-                <p className="result-desc">
-                  All files were transferred and cryptographically verified with SHA-256 integrity.
-                </p>
-              </div>
-
-              {completedFiles.length > 0 && (
-                <div className="completed-files-list">
-                  {completedFiles.map((file, i) => (
-                    <div key={i} className="download-row">
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-                        <IconCheckCircle size={18} style={{ color: 'var(--success)' }} />
-                        <span style={{ fontWeight: 600, fontSize: '0.9rem' }}>{file.name}</span>
+                  <div className="file-list" style={{ marginTop: '20px' }}>
+                    {completedFiles.map((file, i) => (
+                      <div key={i} className="file-row">
+                        <span className="file-row-name" title={file.name}>
+                          {file.name}
+                        </span>
+                        <div className="file-row-meta">
+                          <StatusBadge status={file.verified ? 'success' : 'warning'}>
+                            {file.verified ? COPY.completed.hashVerifiedBadge : COPY.completed.hashFailedBadge}
+                          </StatusBadge>
+                          <Button
+                            variant="secondary"
+                            onClick={() => {
+                              const url = URL.createObjectURL(file.blob);
+                              const a = document.createElement('a');
+                              a.href = url;
+                              a.download = file.name;
+                              a.click();
+                              URL.revokeObjectURL(url);
+                            }}
+                          >
+                            {COPY.completed.saveFile}
+                          </Button>
+                        </div>
                       </div>
-                      <Button
-                        variant="secondary"
-                        size="sm"
-                        icon={<IconDownload size={14} />}
-                        onClick={() => {
-                          const url = URL.createObjectURL(file.blob);
-                          const a = document.createElement('a');
-                          a.href = url;
-                          a.download = file.name;
-                          a.click();
-                          URL.revokeObjectURL(url);
-                        }}
-                      >
-                        Download
-                      </Button>
-                    </div>
-                  ))}
-                </div>
-              )}
+                    ))}
+                  </div>
 
-              <div style={{ display: 'flex', gap: '12px', marginTop: '1rem' }}>
-                <Button variant="secondary" onClick={goHome}>
-                  Send More Files
-                </Button>
-                <Button variant="primary" onClick={goHome}>
-                  Done
-                </Button>
-              </div>
+                  <div style={{ marginTop: '24px' }}>
+                    <Button variant="link" onClick={goHome}>
+                      {COPY.completed.receiveAnother}
+                    </Button>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <h2>{COPY.completed.senderTitle(peerDevice?.display_name || 'receiver')}</h2>
+                  <p style={{ marginTop: '4px' }}>{COPY.completed.senderSubtitle}</p>
+                  {transferDurationSecs !== null && (
+                    <p style={{ marginTop: '2px', fontSize: '0.875rem', color: 'var(--text-muted)' }}>
+                      {COPY.completed.timeElapsed(formatDuration(transferDurationSecs))}
+                    </p>
+                  )}
+
+                  <div style={{ marginTop: '24px' }}>
+                    <Button variant="primary" onClick={goHome}>
+                      {COPY.completed.sendAnother}
+                    </Button>
+                  </div>
+                </>
+              )}
             </Card>
           </div>
         )}
 
-        {/* Screen 6: Failed or Cancelled */}
+        {/* =========================================================================
+            SCREEN 6: FAILED OR CANCELLED (Friendly single error message)
+            ========================================================================= */}
         {(screen === 'failed' || screen === 'cancelled') && (
-          <div className="screen-container">
-            <Card padding="none" className="result-screen-card">
-              <div className="result-icon-large result-icon-error">
-                <IconAlertCircle size={36} />
-              </div>
-
-              <div>
-                <h2 className="result-title">
-                  {screen === 'cancelled' ? 'Transfer Cancelled' : 'Transfer Failed'}
-                </h2>
-                <p className="result-desc">
-                  {error ||
-                    (screen === 'cancelled'
-                      ? 'The file transfer was stopped by user request.'
-                      : 'An unexpected connection or transfer error occurred.')}
-                </p>
-              </div>
-
-              <div style={{ display: 'flex', gap: '12px', marginTop: '1rem' }}>
-                <Button variant="secondary" icon={<IconRefreshCw size={14} />} onClick={goHome}>
-                  Try Again
-                </Button>
-                <Button variant="primary" onClick={goHome}>
-                  Return Home
-                </Button>
-              </div>
-            </Card>
+          <div className="screen-wrapper">
+            {(() => {
+              const friendly = mapTechnicalError(error);
+              return (
+                <ErrorPanel
+                  headline={screen === 'cancelled' ? COPY.errors.transferCancelled.headline : friendly.headline}
+                  cause={screen === 'cancelled' ? COPY.errors.transferCancelled.cause : friendly.cause}
+                  nextStep={screen === 'cancelled' ? COPY.errors.transferCancelled.nextStep : friendly.nextStep}
+                  rawDetails={screen === 'failed' ? friendly.rawDetails : undefined}
+                  onTryAgain={screen === 'failed' ? (role === 'sender' ? startSending : () => startReceiving('code')) : undefined}
+                  onHome={goHome}
+                />
+              );
+            })()}
           </div>
         )}
       </main>
 
       <footer className="app-footer">
-        <IconShield size={14} />
-        <span>End-to-end encrypted · Direct WebRTC transfer · Zero server storage</span>
+        {COPY.footer.securityNote}
       </footer>
 
-      {/* Friendly Name Rename Modal */}
-      {device && (
-        <DeviceEditModal
-          isOpen={isRenameModalOpen}
-          currentName={device.display_name}
-          onSave={handleRenameDevice}
-          onClose={() => setIsRenameModalOpen(false)}
-        />
-      )}
+      {/* Cancel Confirmation Dialog */}
+      <ConfirmDialog
+        isOpen={showCancelConfirm}
+        title={COPY.transfer.cancelConfirmTitle}
+        description={COPY.transfer.cancelConfirmDesc}
+        onConfirm={executeCancel}
+        onCancel={() => setShowCancelConfirm(false)}
+      />
     </>
   );
 }
