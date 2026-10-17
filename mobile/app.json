@@ -1,0 +1,38 @@
+{
+  "expo": {
+    "name": "JustShare",
+    "slug": "justshare",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "automatic",
+    "newArchEnabled": true,
+    "splash": {
+      "resizeMode": "contain",
+      "backgroundColor": "#0d1117"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.justshare.app"
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#0d1117"
+      },
+      "package": "com.justshare.app"
+    },
+    "plugins": [
+      "expo-router",
+      "expo-asset",
+      "expo-secure-store",
+      "expo-status-bar",
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Allow JustShare to scan QR codes for pairing."
+        }
+      ],
+      "@config-plugins/react-native-webrtc"
+    ],
+    "scheme": "justshare"
+  }
+}
