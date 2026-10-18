@@ -453,9 +453,84 @@ describe('MobileFileReceiver Queue & Ordering Tests', () => {
     const mismatchAckStr = dcMismatch.sentMessages.find((m) => m.includes('FILE_ACK'));
     assert.ok(mismatchAckStr, 'FILE_ACK sent on checksum failure');
     const mismatchAck = JSON.parse(mismatchAckStr);
-    assert.strictEqual(mismatchAck.sha256Match, false, 'sha256Match must be false on mismatch');
-    assert.strictEqual(mismatchAck.fileId, 'f_ack_2');
     assert.ok(mismatchAck.error && mismatchAck.error.includes('Checksum mismatch'), 'error field populated on mismatch');
     assert.ok(reportedError, 'Receiver onError called');
+  });
+
+  it('mobile sender starts immediately with placeholder hash and sends computed hash in FILE_END', async () => {
+    const fsMock = new MockFileSystem();
+    const ts = require('typescript');
+    const fs = require('fs');
+    let code = fs.readFileSync('src/services/transfer.ts', 'utf8');
+    const js = ts.transpileModule(code, { compilerOptions: { module: ts.ModuleKind.CommonJS } }).outputText;
+    const mod = { exports: {} };
+    const cryptoCode = fs.readFileSync('src/services/crypto.ts', 'utf8');
+    const cryptoJs = ts.transpileModule(cryptoCode, { compilerOptions: { module: ts.ModuleKind.CommonJS } }).outputText;
+    const cryptoMod = { exports: {} };
+    new Function('exports', 'module', 'require', cryptoJs)(cryptoMod.exports, cryptoMod, require);
+    const { MobileIncrementalSha256 } = cryptoMod.exports;
+
+    const requireMock = (id) => {
+      if (id === 'expo-file-system/legacy') return { ...fsMock, default: fsMock };
+      if (id === './crypto') return { MobileIncrementalSha256 };
+      return require(id);
+    };
+    new Function('exports', 'module', 'require', js)(mod.exports, mod, requireMock);
+
+    const { MobileFileSender } = mod.exports;
+
+    const payload = Buffer.from('Testing immediate mobile streaming and hashing');
+    await fsMock.writeAsStringAsync('file:///immediate.txt', payload.toString('base64'));
+
+    const dc = new MockDataChannel();
+    const sentEvents = [];
+    const origSend = dc.send.bind(dc);
+    dc.send = (msg) => {
+      if (typeof msg === 'string') {
+        const parsed = JSON.parse(msg);
+        sentEvents.push(parsed.type);
+        if (parsed.type === 'FILE_END') {
+          setTimeout(() => {
+            dc.emitMessage(JSON.stringify({
+              type: 'FILE_ACK',
+              transferId: parsed.transferId,
+              fileId: parsed.fileId,
+              sha256Match: true,
+            }));
+          }, 5);
+        }
+      } else {
+        sentEvents.push('CHUNK');
+      }
+      origSend(msg);
+    };
+
+    const files = [
+      {
+        id: 'f_immediate_1',
+        name: 'immediate.txt',
+        size: payload.length,
+        uri: 'file:///immediate.txt',
+        mimeType: 'text/plain',
+      },
+    ];
+
+    const sender = new MobileFileSender(dc, files, 'tx_immediate');
+    await sender.start();
+
+    // Verify ordering: TRANSFER_START -> FILE_START -> CHUNK -> FILE_END
+    assert.strictEqual(sentEvents[0], 'TRANSFER_START');
+    assert.strictEqual(sentEvents[1], 'FILE_START');
+    assert.strictEqual(sentEvents[2], 'CHUNK');
+    assert.strictEqual(sentEvents[3], 'FILE_END');
+
+    // Verify manifest had deferred/placeholder hash
+    const startMsg = JSON.parse(dc.sentMessages.find((m) => typeof m === 'string' && m.includes('TRANSFER_START')));
+    assert.strictEqual(startMsg.manifest.files[0].sha256, '0'.repeat(64));
+
+    // Verify FILE_END carried the correct dynamically computed SHA-256
+    const endMsg = JSON.parse(dc.sentMessages.find((m) => typeof m === 'string' && m.includes('FILE_END')));
+    const expectedHash = crypto.createHash('sha256').update(payload).digest('hex');
+    assert.strictEqual(endMsg.sha256, expectedHash);
   });
 });

@@ -38,6 +38,7 @@ export const BACKPRESSURE_HIGH_WATERMARK = 1024 * 1024; // 1 MB
 export const BACKPRESSURE_LOW_WATERMARK = 256 * 1024; // 256 KB
 export const DEFAULT_ACK_TIMEOUT_MS = 60000; // 60s
 export const VERIFYING_KEEPALIVE_INTERVAL_MS = 5000; // 5s
+export const FLUSH_CHUNK_BUFFER_BYTES = 512 * 1024; // 512 KB bounded batch write
 
 /**
  * Validates filename to prevent path traversal.
@@ -200,12 +201,14 @@ export class MobileFileSender {
     }
 
     try {
-      // Step 1: Precompute file SHA-256 hashes and create Manifest
+      // Step 1: Create Manifest immediately with streaming SHA-256 placeholder
       const manifestFiles: ManifestFileEntry[] = [];
       for (const file of this.files) {
         if (this.cancelled) return;
         const totalChunks = file.size === 0 ? 0 : Math.ceil(file.size / CHUNK_SIZE);
-        const sha256 = await calculateNativeFileSha256(file.uri, file.size);
+        const placeholderHash = file.size === 0
+          ? 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
+          : '0'.repeat(64);
 
         manifestFiles.push({
           id: file.id,
@@ -213,7 +216,7 @@ export class MobileFileSender {
           size: file.size,
           mimeType: file.mimeType,
           totalChunks,
-          sha256,
+          sha256: placeholderHash,
         });
       }
 
@@ -224,7 +227,7 @@ export class MobileFileSender {
         files: manifestFiles,
       };
 
-      // Step 2: Send TRANSFER_START
+      // Step 2: Send TRANSFER_START immediately (no pre-transfer hashing delay)
       const startMsg: TransferStartMessage = {
         type: 'TRANSFER_START',
         transferId: this.transferId,
@@ -234,7 +237,7 @@ export class MobileFileSender {
       console.log('[TRANSFER][DIAGNOSTIC][SEND] Stringified TRANSFER_START message:', JSON.stringify(startMsg));
       this.dc.send(JSON.stringify(startMsg));
 
-      // Step 3: Stream each file chunk by chunk (bounded memory)
+      // Step 3: Stream each file chunk by chunk (bounded memory & hash-while-sending)
       for (let i = 0; i < this.files.length; i++) {
         if (this.cancelled) return;
 
@@ -254,6 +257,8 @@ export class MobileFileSender {
         };
         this.dc.send(JSON.stringify(fileStartMsg));
 
+        const senderHasher = new MobileIncrementalSha256();
+
         // Read slices directly from disk one 64 KB chunk at a time
         for (let j = 0; j < totalChunks; j++) {
           if (this.cancelled) return;
@@ -263,6 +268,9 @@ export class MobileFileSender {
           const chunkLen = end - start;
 
           const chunkData = await readNativeFileChunk(file.uri, start, chunkLen);
+
+          // Update streaming hash incrementally while sending
+          senderHasher.update(chunkData);
 
           // Build chunk header
           const header: ChunkHeader = {
@@ -289,11 +297,17 @@ export class MobileFileSender {
           this.reportProgress(i, file.name, end, file.size, 'sending');
         }
 
-        // Send FILE_END and wait for FILE_ACK from receiver
+        // Final hash computed incrementally during transmission
+        const finalSenderHash = file.size === 0
+          ? 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
+          : senderHasher.digest().toLowerCase();
+
+        // Send FILE_END with computed hash and wait for FILE_ACK from receiver
         const fileEndMsg: FileEndMessage = {
           type: 'FILE_END',
           transferId: this.transferId,
           fileId: file.id,
+          sha256: finalSenderHash,
         };
         this.dc.send(JSON.stringify(fileEndMsg));
 
@@ -396,6 +410,14 @@ export class MobileFileReceiver {
   private startTime = 0;
   private cancelled = false;
   private messageQueue: Promise<void> = Promise.resolve();
+
+  // Bounded in-memory chunk batching
+  private pendingChunkBuffers: Uint8Array[] = [];
+  private pendingChunkBytes = 0;
+
+  // Throttled progress reporting
+  private lastReportedBytes = 0;
+  private lastReportedTime = 0;
 
   public onProgress: ((progress: TransferProgress) => void) | null = null;
   public onComplete: ((files: Array<{ name: string; uri: string; size: number }>) => void) | null = null;
@@ -500,6 +522,21 @@ export class MobileFileReceiver {
       case 'FILE_END': {
         if (!this.currentFileEntry || !this.currentTargetUri || !this.currentHasher) return;
 
+        // 1. Flush any remaining buffered chunks to disk
+        await this.flushChunkBuffer();
+
+        // 2. Send immediate VERIFYING keepalive to prevent sender ACK timeout during checksum verification
+        try {
+          if (this.dc && this.dc.readyState === 'open' && this.activeTransferId) {
+            const verifyingMsg: FileVerifyingMessage = {
+              type: 'VERIFYING',
+              transferId: this.activeTransferId,
+              fileId: msg.fileId,
+            };
+            this.dc.send(JSON.stringify(verifyingMsg));
+          }
+        } catch {}
+
         // Verify bytes written matches manifest expected size
         const expectedSize = this.currentFileEntry.size;
         if (this.currentBytesWritten !== expectedSize) {
@@ -535,22 +572,28 @@ export class MobileFileReceiver {
           throw new Error(errMsg);
         }
 
-        // Verify SHA-256 computed on the fly across all streamed chunks
+        // Verify streaming SHA-256 computed on the fly across all arrived chunks
         const calculatedSha = this.currentHasher.digest().toLowerCase();
-        const expectedSha = this.currentFileEntry.sha256.toLowerCase();
+        const expectedSha = (msg.sha256 && typeof msg.sha256 === 'string' && /^[a-f0-9]{64}$/i.test(msg.sha256))
+          ? msg.sha256.toLowerCase()
+          : this.currentFileEntry.sha256.toLowerCase();
 
-        // Diagnostic re-read from disk
-        let diskSha = 'unknown';
-        try {
-          diskSha = await calculateNativeFileSha256(this.currentTargetUri, onDiskSize);
-        } catch (e: any) {
-          diskSha = `error: ${e?.message}`;
+        // For large files (> 20 MB), avoid synchronous whole-file re-reading since currentHasher
+        // verified every chunk as it arrived; for small files or tests, verify against disk as well.
+        let diskSha = calculatedSha;
+        if (onDiskSize <= 20 * 1024 * 1024) {
+          try {
+            diskSha = await calculateNativeFileSha256(this.currentTargetUri, onDiskSize);
+          } catch (e: any) {
+            diskSha = `error: ${e?.message}`;
+          }
         }
 
         console.log(
-          `[TRANSFER][DIAGNOSTIC][FILE_END] file: ${this.currentFileEntry.name}\n` +
+          `[TRANSFER][RECEIVE][FILE_END] file: ${this.currentFileEntry.name}\n` +
           `  calculatedSha:   ${calculatedSha}\n` +
-          `  manifestSha:     ${expectedSha}\n` +
+          `  manifestSha:     ${this.currentFileEntry.sha256}\n` +
+          `  expectedSha:     ${expectedSha}\n` +
           `  diskSha:         ${diskSha}\n` +
           `  bytesHashed:     ${this.currentBytesWritten}\n` +
           `  onDiskSize:      ${onDiskSize}\n` +
@@ -617,48 +660,85 @@ export class MobileFileReceiver {
 
     const chunkData = new Uint8Array(buffer, 4 + headerLen);
 
-    const first8Hex = Array.from(chunkData.slice(0, 8))
-      .map((b) => b.toString(16).padStart(2, '0'))
-      .join('');
-    console.log(
-      `[TRANSFER][DIAGNOSTIC][CHUNK] index: ${header.index}, totalChunks: ${header.totalChunks}, payload length: ${chunkData.byteLength}, first 8 bytes: ${first8Hex}`
-    );
+    if (header.index % 500 === 0 || header.index === header.totalChunks - 1) {
+      console.log(
+        `[TRANSFER][RECEIVE][CHUNK] index: ${header.index + 1}/${header.totalChunks}, payload length: ${chunkData.byteLength}`
+      );
+    }
 
     if (this.currentTargetUri && this.currentHasher) {
-      // 1. Update streaming SHA-256 and byte counters in arrival order before awaited disk write
+      // 1. Update streaming SHA-256 and byte counters in arrival order before disk write
       this.currentHasher.update(chunkData);
       this.currentBytesWritten += chunkData.byteLength;
 
-      // 2. Append binary chunk directly to disk
-      const base64Chunk = uint8ArrayToBase64(chunkData);
-      await FileSystem.writeAsStringAsync(this.currentTargetUri, base64Chunk, {
-        encoding: FileSystem.EncodingType.Base64,
-        append: true,
-      });
+      // 2. Buffer chunk in memory and flush when buffer threshold is reached or on final chunk
+      this.pendingChunkBuffers.push(chunkData);
+      this.pendingChunkBytes += chunkData.byteLength;
+
+      if (this.pendingChunkBytes >= FLUSH_CHUNK_BUFFER_BYTES || header.index === header.totalChunks - 1) {
+        await this.flushChunkBuffer();
+      }
     }
 
     this.bytesTransferred += chunkData.byteLength;
 
+    // Throttle progress updates to UI: notify every ~1MB or on final chunk
+    const isFinalChunk = header.index === header.totalChunks - 1;
     if (this.onProgress && this.manifest && this.currentFileEntry) {
-      const elapsedSec = (Date.now() - this.startTime) / 1000;
-      const speedBps = elapsedSec > 0 ? this.bytesTransferred / elapsedSec : 0;
-      const percent =
-        this.manifest.totalSize > 0
-          ? Math.round((this.bytesTransferred / this.manifest.totalSize) * 100)
-          : 0;
+      const now = Date.now();
+      if (
+        isFinalChunk ||
+        this.bytesTransferred - this.lastReportedBytes >= 1024 * 1024 ||
+        now - this.lastReportedTime >= 250
+      ) {
+        this.lastReportedBytes = this.bytesTransferred;
+        this.lastReportedTime = now;
+        const elapsedSec = (now - this.startTime) / 1000;
+        const speedBps = elapsedSec > 0 ? this.bytesTransferred / elapsedSec : 0;
+        const percent =
+          this.manifest.totalSize > 0
+            ? Math.round((this.bytesTransferred / this.manifest.totalSize) * 100)
+            : 0;
 
-      this.onProgress({
-        fileIndex: 0,
-        fileName: this.currentFileEntry.name,
-        fileBytesTransferred: this.bytesTransferred,
-        fileTotalBytes: this.currentFileEntry.size,
-        totalBytesTransferred: this.bytesTransferred,
-        totalBytes: this.manifest.totalSize,
-        percent,
-        speedBps,
-        status: 'receiving',
-      });
+        this.onProgress({
+          fileIndex: 0,
+          fileName: this.currentFileEntry.name,
+          fileBytesTransferred: this.bytesTransferred,
+          fileTotalBytes: this.currentFileEntry.size,
+          totalBytesTransferred: this.bytesTransferred,
+          totalBytes: this.manifest.totalSize,
+          percent,
+          speedBps,
+          status: 'receiving',
+        });
+      }
     }
+  }
+
+  private async flushChunkBuffer(): Promise<void> {
+    if (!this.currentTargetUri || this.pendingChunkBuffers.length === 0) return;
+    
+    // Combine buffered chunks into a single contiguous Uint8Array
+    let combined: Uint8Array;
+    if (this.pendingChunkBuffers.length === 1) {
+      combined = this.pendingChunkBuffers[0];
+    } else {
+      combined = new Uint8Array(this.pendingChunkBytes);
+      let offset = 0;
+      for (const buf of this.pendingChunkBuffers) {
+        combined.set(buf, offset);
+        offset += buf.byteLength;
+      }
+    }
+
+    this.pendingChunkBuffers = [];
+    this.pendingChunkBytes = 0;
+
+    const base64Chunk = uint8ArrayToBase64(combined);
+    await FileSystem.writeAsStringAsync(this.currentTargetUri, base64Chunk, {
+      encoding: FileSystem.EncodingType.Base64,
+      append: true,
+    });
   }
 
   private sendError(code: string, message: string): void {

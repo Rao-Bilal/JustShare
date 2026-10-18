@@ -17,6 +17,7 @@ import {
   TransferStartMessage,
 } from '../types';
 import { createStreamingHasher } from './crypto';
+import { RemoteDevLogger } from './devLogger';
 import { MemoryTransferStorage } from './storage/memory';
 import { TransferStorage } from './storage/types';
 

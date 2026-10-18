@@ -1,31 +1,44 @@
-import { Stack } from 'expo-router';
+import { Tabs } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
+import { theme } from '../src/theme';
 
 export default function RootLayout() {
   return (
     <>
-      <StatusBar style="light" />
-      <Stack
+      <StatusBar style="dark" />
+      <Tabs
         screenOptions={{
-          headerStyle: {
-            backgroundColor: '#0d1117',
+          headerShown: false,
+          tabBarStyle: {
+            backgroundColor: theme.colors.surface,
+            borderTopColor: theme.colors.border,
+            borderTopWidth: 1,
+            elevation: 4,
+            height: 60,
+            paddingBottom: 8,
+            paddingTop: 6,
           },
-          headerTintColor: '#f0f6fc',
-          headerTitleStyle: {
+          tabBarActiveTintColor: theme.colors.primary,
+          tabBarInactiveTintColor: theme.colors.textTertiary,
+          tabBarLabelStyle: {
+            fontSize: 12,
             fontWeight: '600',
-          },
-          contentStyle: {
-            backgroundColor: '#0d1117',
           },
         }}
       >
-        <Stack.Screen
+        <Tabs.Screen
           name="index"
           options={{
-            title: 'JustShare',
+            title: 'Home',
           }}
         />
-      </Stack>
+        <Tabs.Screen
+          name="history"
+          options={{
+            title: 'History',
+          }}
+        />
+      </Tabs>
     </>
   );
 }

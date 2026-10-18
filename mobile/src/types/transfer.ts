@@ -44,6 +44,7 @@ export interface FileEndMessage {
   type: 'FILE_END';
   transferId: string;
   fileId: string;
+  sha256?: string;
 }
 
 export interface FileAckMessage {

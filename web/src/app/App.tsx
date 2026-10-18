@@ -22,7 +22,7 @@ import { ConfirmDialog } from '../components/ConfirmDialog';
 import { DeviceEditModal } from '../components/DeviceEditModal';
 import { ShareManagementModal } from '../components/ShareManagementModal';
 import { FileManagerDashboard, HistoryItem } from '../components/FileManagerDashboard';
-import { renameDevice } from '../services/device';
+import { getOrCreateDevice, renameDevice, supportsDirectoryUpload } from '../services/device';
 
 import { TransferScreen } from '../components/TransferScreen';
 import { mapScreenToMainView } from '../services/transferState';

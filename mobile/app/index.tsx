@@ -9,51 +9,57 @@ import {
   TextInput,
   Modal,
   Alert,
+  RefreshControl,
 } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import QRCode from 'react-native-qrcode-svg';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import * as DocumentPicker from 'expo-document-picker';
-import * as Sharing from 'expo-sharing';
+import { router } from 'expo-router';
+
+import { theme } from '../src/theme';
 import { getOrCreateDevice } from '../src/services/device';
 import { StoredDevice } from '../src/services/storage';
 import { getConfig } from '../src/config';
 import { createSession, joinSession, SessionResponse } from '../src/services/api';
 import { SignalingClient } from '../src/services/signaling';
 import { MobileWebRTCConnection } from '../src/services/webrtc';
-import {
-  MobileFileSender,
-  MobileFileReceiver,
-} from '../src/services/transfer';
+import { MobileFileSender, MobileFileReceiver } from '../src/services/transfer';
 import { NativeFile, TransferProgress } from '../src/types/transfer';
-import {
-  NearbyDiscoveryManager,
-  NearbyDiscoveredDevice,
-  NearbyDiscoveryStatus,
-  NearbyIncomingRequest,
-} from '../src/services/nearby';
-import { NearbyPairedPayload } from '../src/services/nearbySignaling';
 import { extractPairingCode, buildMobilePairingUrl } from '../src/services/pairingUrl';
-
-type Tab = 'nearby' | 'code' | 'qr';
+import {
+  HistoryItem,
+  loadHistory,
+  createHistoryItem,
+  addHistoryItems,
+  markHistoryItemSaved,
+} from '../src/services/history';
+import { saveFileToDevice } from '../src/services/fileSaver';
+import {
+  UserRole,
+  getVisibleControlsForRole,
+  truncateFilename,
+  formatBytes,
+  calculateProgressPercentage,
+  assertCanSend,
+} from '../src/services/uiHelpers';
 
 export default function HomeScreen() {
   const [device, setDevice] = useState<StoredDevice | null>(null);
   const [loading, setLoading] = useState(true);
-  const [activeTab, setActiveTab] = useState<Tab>('nearby');
+  const [refreshing, setRefreshing] = useState(false);
 
-  // 6-digit Code & Session state
+  // Active Flow State: 'idle' | 'send' | 'receive'
+  const [activeFlow, setActiveFlow] = useState<'idle' | 'send' | 'receive'>('idle');
+  const [activeRole, setActiveRole] = useState<UserRole>('idle');
+
+  // Session & Connection state
   const [pairingCodeInput, setPairingCodeInput] = useState('');
   const [createdSession, setCreatedSession] = useState<SessionResponse | null>(null);
   const [isCreatingSession, setIsCreatingSession] = useState(false);
   const [isJoiningSession, setIsJoiningSession] = useState(false);
   const [pairedSessionId, setPairedSessionId] = useState<string | null>(null);
-  const [pairedPeerRole, setPairedPeerRole] = useState<string | null>(null);
-
-  // Nearby Discovery state
-  const [nearbyStatus, setNearbyStatus] = useState<NearbyDiscoveryStatus>('idle');
-  const [discoveredDevices, setDiscoveredDevices] = useState<NearbyDiscoveredDevice[]>([]);
-  const [incomingRequest, setIncomingRequest] = useState<NearbyIncomingRequest | null>(null);
-  const nearbyManagerRef = useRef<NearbyDiscoveryManager | null>(null);
+  const [peerDevice, setPeerDevice] = useState<{ device_id: string; display_name: string } | null>(null);
 
   // WebRTC & Transfer state
   const [webrtcConn, setWebrtcConn] = useState<MobileWebRTCConnection | null>(null);
@@ -64,28 +70,39 @@ export default function HomeScreen() {
   const selectedFilesRef = useRef<NativeFile[]>([]);
   const [isTransferring, setIsTransferring] = useState(false);
   const [transferStatusText, setTransferStatusText] = useState<string>('');
-  const [peerDevice, setPeerDevice] = useState<{ device_id: string; display_name: string } | null>(null);
 
-  // Incoming transfer metadata approval state
+  // Transfer Completion Banner / Result
+  const [completionResult, setCompletionResult] = useState<{
+    success: boolean;
+    message: string;
+    filesCount: number;
+  } | null>(null);
+
+  // Incoming transfer metadata approval state (Receiver only)
   const [incomingTransferRequest, setIncomingTransferRequest] = useState<{
     files: Array<{ id: string; name: string; size: number; type: string }>;
     totalSize: number;
   } | null>(null);
   const [isWaitingForApproval, setIsWaitingForApproval] = useState(false);
 
-  // Active sender/receiver instances
+  // Active sender/receiver instances & guards
   const activeSenderRef = useRef<MobileFileSender | null>(null);
   const activeReceiverRef = useRef<MobileFileReceiver | null>(null);
   const isAcceptingRef = useRef(false);
   const isJoiningRef = useRef(false);
+  const autoArchiveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Camera QR Scanner state
   const [isScannerOpen, setIsScannerOpen] = useState(false);
   const [cameraPermission, requestCameraPermission] = useCameraPermissions();
   const isProcessingScanRef = useRef(false);
 
+  // Recent transfers history (last 3 for Home)
+  const [recentTransfers, setRecentTransfers] = useState<HistoryItem[]>([]);
+  const [savingHistoryId, setSavingHistoryId] = useState<string | null>(null);
+
+  // Initialize device identity
   const initDevice = useCallback(async () => {
-    setLoading(true);
     try {
       const dev = await getOrCreateDevice();
       setDevice(dev);
@@ -93,192 +110,287 @@ export default function HomeScreen() {
       Alert.alert('Initialization Error', err?.message || 'Failed to initialize device');
     } finally {
       setLoading(false);
+      setRefreshing(false);
     }
+  }, []);
+
+  const refreshRecentHistory = useCallback(async () => {
+    const all = await loadHistory();
+    setRecentTransfers(all.slice(0, 3));
   }, []);
 
   useEffect(() => {
     initDevice();
-  }, [initDevice]);
+    refreshRecentHistory();
+  }, [initDevice, refreshRecentHistory]);
 
-  // Setup Nearby Discovery Manager
+  // Clean up auto-archive timer on unmount
   useEffect(() => {
-    if (!device) return;
-
-    const manager = new NearbyDiscoveryManager({
-      onStatusChange: (status) => setNearbyStatus(status),
-      onDeviceListUpdate: (devices) => setDiscoveredDevices(devices),
-      onIncomingRequest: (request) => setIncomingRequest(request),
-      onPaired: (payload: NearbyPairedPayload) => {
-        setPairedSessionId(payload.session_id);
-        setPairedPeerRole(payload.role);
-        Alert.alert('Device Paired!', `Paired with nearby peer as ${payload.role}. Session: ${payload.session_id.substring(0, 8)}...`);
-      },
-    });
-
-    nearbyManagerRef.current = manager;
-
     return () => {
-      manager.stopDiscovery();
-      nearbyManagerRef.current = null;
+      if (autoArchiveTimerRef.current) {
+        clearTimeout(autoArchiveTimerRef.current);
+      }
     };
-  }, [device]);
+  }, []);
 
-  // Start or Stop Nearby Discovery based on tab
-  useEffect(() => {
-    if (!device || !nearbyManagerRef.current) return;
-
-    if (activeTab === 'nearby') {
-      nearbyManagerRef.current.startDiscovery(device.token, device.displayName);
-    } else {
-      nearbyManagerRef.current.stopDiscovery();
+  // Reset Session & Return to Idle
+  const handleResetSession = useCallback(() => {
+    if (activeSenderRef.current) {
+      activeSenderRef.current.cancel();
+      activeSenderRef.current = null;
     }
-  }, [activeTab, device]);
-
-  // Start WebRTC DataChannel file sender upon peer approval
-  const startWebRTCSender = useCallback((sig: SignalingClient, sessionId: string, filesToSend: NativeFile[]) => {
-    if (!device) return;
+    if (activeReceiverRef.current) {
+      activeReceiverRef.current.cancel();
+      activeReceiverRef.current = null;
+    }
     if (webrtcConn) {
       webrtcConn.close();
+      setWebrtcConn(null);
     }
-    setTransferStatusText('Connecting WebRTC...');
-    const conn = new MobileWebRTCConnection(sig, true, device.deviceId);
-
-    conn.onConnectionStateChange = (state) => {
-      setTransferStatusText(`P2P: ${state}`);
-    };
-
-    const dc = conn.getDataChannel();
-    if (dc) {
-      let senderStarted = false;
-      const runSender = () => {
-        if (senderStarted) return;
-        senderStarted = true;
-        setIsTransferring(true);
-        setTransferStatusText('Transferring...');
-        const sender = new MobileFileSender(dc, filesToSend);
-        activeSenderRef.current = sender;
-
-        sender.onProgress = (prog) => {
-          setTransferProgress(prog);
-        };
-        sender.onComplete = () => {
-          setIsTransferring(false);
-          activeSenderRef.current = null;
-          setTransferStatusText('Transfer Complete');
-          Alert.alert('Success', 'All files sent and verified successfully!');
-        };
-        sender.onError = (err) => {
-          setIsTransferring(false);
-          activeSenderRef.current = null;
-          setTransferStatusText('Transfer Failed');
-          Alert.alert('Transfer Error', err);
-        };
-        sender.start();
-      };
-
-      if (dc.readyState === 'open') {
-        runSender();
-      } else {
-        if (dc.addEventListener) {
-          dc.addEventListener('open', runSender, { once: true });
-        } else {
-          dc.onopen = runSender;
-        }
-      }
-    }
-
-    conn.createOffer();
-    setWebrtcConn(conn);
-  }, [device]);
-
-  // Setup Signaling Connection for Session
-  const setupSignaling = useCallback((sessionId: string, isSender: boolean, initialPeer?: { device_id: string; display_name: string }) => {
-    if (!device) return;
-
     if (signaling) {
       signaling.disconnect();
-    }
-    if (webrtcConn) {
-      webrtcConn.close();
+      setSignaling(null);
     }
 
-    if (initialPeer) {
-      setPeerDevice(initialPeer);
-    }
+    setActiveFlow('idle');
+    setActiveRole('idle');
+    setPairedSessionId(null);
+    setCreatedSession(null);
+    setPeerDevice(null);
+    setPairingCodeInput('');
+    setSelectedFiles([]);
+    selectedFilesRef.current = [];
+    setReceivedFiles([]);
+    setIsTransferring(false);
+    setIsWaitingForApproval(false);
+    setIncomingTransferRequest(null);
+    setTransferProgress(null);
+    setTransferStatusText('');
+    setCompletionResult(null);
+    isAcceptingRef.current = false;
+    isJoiningRef.current = false;
+    isProcessingScanRef.current = false;
+  }, [webrtcConn, signaling]);
 
-    const sig = new SignalingClient();
-
-    sig.on('peer_joined', (msg: any) => {
-      if (msg.payload) {
-        setPeerDevice(msg.payload);
+  // Schedule moving completed transfer to history and return to idle after ~4 seconds
+  const scheduleAutoArchive = useCallback(
+    (result: { success: boolean; message: string; filesCount: number }) => {
+      setCompletionResult(result);
+      if (autoArchiveTimerRef.current) {
+        clearTimeout(autoArchiveTimerRef.current);
       }
-    });
+      autoArchiveTimerRef.current = setTimeout(() => {
+        handleResetSession();
+        refreshRecentHistory();
+      }, 4000);
+    },
+    [handleResetSession, refreshRecentHistory]
+  );
 
-    sig.on('peer_left', () => {
-      setTransferStatusText('Peer disconnected');
-      Alert.alert('Peer Left', 'The remote peer has disconnected.');
-    });
+  // Pull-to-refresh on Home: resets stale UI state without interrupting active transfers
+  const handlePullToRefresh = useCallback(async () => {
+    if (isTransferring) return; // Guard: Never interrupt an ongoing transfer
+    setRefreshing(true);
+    handleResetSession();
+    await initDevice();
+    await refreshRecentHistory();
+  }, [isTransferring, handleResetSession, initDevice, refreshRecentHistory]);
 
-    if (isSender) {
-      // SENDER: Listen for receiver's accept/decline response
-      sig.on('transfer_response', (msg: any) => {
-        setIsWaitingForApproval(false);
-        const payload = msg?.payload;
-        if (payload?.accepted) {
-          const filesToSend = selectedFilesRef.current;
-          if (!filesToSend || filesToSend.length === 0) {
-            setTransferStatusText('Choose files first');
-            Alert.alert('No Files', 'Choose files first');
-            return;
-          }
-          setTransferStatusText('Transfer Accepted! Initializing P2P...');
-          startWebRTCSender(sig, sessionId, filesToSend);
+  // Start WebRTC DataChannel file sender upon peer approval
+  const startWebRTCSender = useCallback(
+    (sig: SignalingClient, sessionId: string, filesToSend: NativeFile[]) => {
+      if (!device) return;
+      if (webrtcConn) {
+        webrtcConn.close();
+      }
+      setTransferStatusText('Connecting WebRTC...');
+      const conn = new MobileWebRTCConnection(sig, true, device.deviceId);
+
+      conn.onConnectionStateChange = (state) => {
+        setTransferStatusText(`P2P: ${state}`);
+      };
+
+      const dc = conn.getDataChannel();
+      if (dc) {
+        let senderStarted = false;
+        const runSender = () => {
+          if (senderStarted) return;
+          senderStarted = true;
+          setIsTransferring(true);
+          setTransferStatusText('Transferring...');
+          const sender = new MobileFileSender(dc, filesToSend);
+          activeSenderRef.current = sender;
+
+          sender.onProgress = (prog) => {
+            setTransferProgress(prog);
+          };
+
+          sender.onComplete = async () => {
+            setIsTransferring(false);
+            activeSenderRef.current = null;
+            setTransferStatusText('Transfer Complete');
+
+            // Persist sent items to history
+            const historyEntries: HistoryItem[] = filesToSend.map((f) =>
+              createHistoryItem({
+                name: f.name,
+                size: f.size,
+                direction: 'sent',
+                peerName: peerDevice?.display_name || 'Receiver',
+                status: 'completed',
+              })
+            );
+            await addHistoryItems(historyEntries);
+
+            scheduleAutoArchive({
+              success: true,
+              message: `Sent ${filesToSend.length} file(s) successfully!`,
+              filesCount: filesToSend.length,
+            });
+          };
+
+          sender.onError = async (err) => {
+            setIsTransferring(false);
+            activeSenderRef.current = null;
+            setTransferStatusText('Transfer Failed');
+
+            // Persist failed attempt to history
+            if (filesToSend.length > 0) {
+              const failedEntries: HistoryItem[] = filesToSend.map((f) =>
+                createHistoryItem({
+                  name: f.name,
+                  size: f.size,
+                  direction: 'sent',
+                  peerName: peerDevice?.display_name || 'Receiver',
+                  status: 'failed',
+                })
+              );
+              await addHistoryItems(failedEntries);
+            }
+
+            Alert.alert('Transfer Error', err);
+          };
+
+          sender.start();
+        };
+
+        if (dc.readyState === 'open') {
+          runSender();
         } else {
-          setIsTransferring(false);
-          setTransferStatusText('Transfer Declined');
-          Alert.alert('Transfer Declined', 'The receiver declined the file transfer request.');
+          if (dc.addEventListener) {
+            dc.addEventListener('open', runSender, { once: true });
+          } else {
+            dc.onopen = runSender;
+          }
         }
-      });
-    } else {
-      // RECEIVER: Listen for sender's file_metadata
-      sig.on('file_metadata', (msg: any) => {
+      }
+
+      conn.createOffer();
+      setWebrtcConn(conn);
+    },
+    [device, webrtcConn, peerDevice, scheduleAutoArchive]
+  );
+
+  // Setup Signaling Connection for Session
+  const setupSignaling = useCallback(
+    (sessionId: string, isSender: boolean, initialPeer?: { device_id: string; display_name: string }) => {
+      if (!device) return;
+
+      if (signaling) {
+        signaling.disconnect();
+      }
+      if (webrtcConn) {
+        webrtcConn.close();
+      }
+
+      if (initialPeer) {
+        setPeerDevice(initialPeer);
+      }
+
+      const sig = new SignalingClient();
+
+      sig.on('peer_joined', (msg: any) => {
         if (msg.payload) {
-          setIncomingTransferRequest({
-            files: msg.payload.files || [],
-            totalSize: msg.payload.total_size || 0,
-          });
+          setPeerDevice(msg.payload);
         }
       });
-    }
 
-    sig.on('error', (err: any) => {
-      setTransferStatusText('Signaling Error');
-      Alert.alert('Signaling Error', err?.message || 'WebSocket signaling error');
-    });
+      sig.on('peer_left', () => {
+        setTransferStatusText('Peer disconnected');
+        Alert.alert('Peer Left', 'The remote peer has disconnected.');
+        handleResetSession();
+      });
 
-    sig.connect(sessionId, device.token);
-    setSignaling(sig);
-  }, [device, signaling, webrtcConn, startWebRTCSender]);
+      if (isSender) {
+        // SENDER: Listen for receiver's accept/decline response
+        sig.on('transfer_response', (msg: any) => {
+          setIsWaitingForApproval(false);
+          const payload = msg?.payload;
+          if (payload?.accepted) {
+            const filesToSend = selectedFilesRef.current;
+            if (!filesToSend || filesToSend.length === 0) {
+              setTransferStatusText('Choose files first');
+              Alert.alert('No Files', 'Choose files first');
+              return;
+            }
+            setTransferStatusText('Transfer Accepted! Initializing P2P...');
+            startWebRTCSender(sig, sessionId, filesToSend);
+          } else {
+            setIsTransferring(false);
+            setTransferStatusText('Transfer Declined');
+            Alert.alert('Transfer Declined', 'The receiver declined the file transfer request.');
+          }
+        });
+      } else {
+        // RECEIVER: Listen for sender's file_metadata
+        sig.on('file_metadata', (msg: any) => {
+          if (msg.payload) {
+            setIncomingTransferRequest({
+              files: msg.payload.files || [],
+              totalSize: msg.payload.total_size || 0,
+            });
+          }
+        });
+      }
 
-  // Create 6-digit Code Session (Mobile as Host)
-  const handleCreateSession = async () => {
+      sig.on('error', (err: any) => {
+        setTransferStatusText('Signaling Error');
+        Alert.alert('Signaling Error', err?.message || 'WebSocket signaling error');
+      });
+
+      sig.connect(sessionId, device.token);
+      setSignaling(sig);
+    },
+    [device, signaling, webrtcConn, startWebRTCSender, handleResetSession]
+  );
+
+  // Sender starts: generates 6-digit code / QR session
+  const handleStartSenderFlow = async () => {
     if (!device) return;
     setIsCreatingSession(true);
+    setActiveFlow('send');
+    setActiveRole('sender');
     try {
       const session = await createSession(device.token);
       setCreatedSession(session);
       setPairedSessionId(session.session_id);
-      setPairedPeerRole('host');
       setTransferStatusText('Waiting for peer to join...');
       setupSignaling(session.session_id, true);
     } catch (err: any) {
-      Alert.alert('Error', err?.message || 'Failed to create session');
+      Alert.alert('Session Error', err?.message || 'Failed to create session');
+      handleResetSession();
     } finally {
       setIsCreatingSession(false);
     }
   };
 
-  // Join Session via 6-digit code (Mobile as Joiner)
+  // Receiver starts: shows code input & QR scanner trigger
+  const handleStartReceiverFlow = () => {
+    setActiveFlow('receive');
+    setActiveRole('receiver');
+  };
+
+  // Receiver joins session via 6-digit code
   const handleJoinSession = async (codeToJoin?: string) => {
     if (!device) return;
     if (isJoiningRef.current) return;
@@ -294,12 +406,12 @@ export default function HomeScreen() {
     try {
       const res = await joinSession(device.token, code);
       setPairedSessionId(res.session_id);
-      setPairedPeerRole('receiver');
+      setActiveFlow('receive');
+      setActiveRole('receiver');
       setIsScannerOpen(false);
       isProcessingScanRef.current = false;
-      setTransferStatusText('Connected to Host');
+      setTransferStatusText('Connected to Sender');
       setupSignaling(res.session_id, false, res.sender);
-      Alert.alert('Session Joined!', `Connected to: ${res.sender.display_name}`);
     } catch (err: any) {
       Alert.alert('Join Failed', err?.message || 'Could not join session with this code.');
     } finally {
@@ -309,8 +421,13 @@ export default function HomeScreen() {
     }
   };
 
-  // File Picker
+  // File Picker (Strict Sender Guard)
   const handlePickFiles = async () => {
+    if (activeRole !== 'sender') {
+      Alert.alert('Action Denied', 'Receivers cannot select files to send.');
+      return;
+    }
+
     try {
       const result = await DocumentPicker.getDocumentAsync({
         multiple: true,
@@ -336,7 +453,6 @@ export default function HomeScreen() {
     }
   };
 
-  // Remove individual file from selection
   const handleRemoveFile = (indexToRemove: number) => {
     setSelectedFiles((prev) => {
       const updated = prev.filter((_, idx) => idx !== indexToRemove);
@@ -345,10 +461,16 @@ export default function HomeScreen() {
     });
   };
 
-  // Dispatch File Metadata via Signaling to prompt receiver approval
+  // Send files metadata to prompt receiver approval (Strict Sender Guard)
   const handleSendFiles = async () => {
-    if (!signaling || selectedFiles.length === 0) {
-      Alert.alert('No Files', 'Please select at least one file to send.');
+    const canSendCheck = assertCanSend(activeRole, selectedFiles);
+    if (!canSendCheck.allowed) {
+      Alert.alert('Cannot Send', canSendCheck.reason);
+      return;
+    }
+
+    if (!signaling) {
+      Alert.alert('Not Connected', 'Signaling connection is not ready.');
       return;
     }
 
@@ -372,8 +494,9 @@ export default function HomeScreen() {
     });
   };
 
-  // Receiver accepts incoming files
+  // Receiver accepts incoming files (Strict Receiver Guard)
   const handleAcceptIncomingTransfer = () => {
+    if (activeRole !== 'receiver') return;
     if (!signaling || !device || !incomingTransferRequest) return;
     if (isAcceptingRef.current) return;
     isAcceptingRef.current = true;
@@ -404,21 +527,54 @@ export default function HomeScreen() {
         setTransferProgress(prog);
       };
 
-      receiver.onComplete = (files) => {
+      receiver.onComplete = async (files) => {
         setIsTransferring(false);
         activeReceiverRef.current = null;
         setIncomingTransferRequest(null);
         isAcceptingRef.current = false;
         setReceivedFiles((prev) => [...prev, ...files]);
         setTransferStatusText('Transfer Complete');
-        Alert.alert('Transfer Complete', `Received ${files.length} file(s) successfully!`);
+
+        // Persist received items to history
+        const historyEntries: HistoryItem[] = files.map((f) =>
+          createHistoryItem({
+            name: f.name,
+            size: f.size,
+            direction: 'received',
+            peerName: peerDevice?.display_name || 'Sender',
+            status: 'completed',
+            uri: f.uri,
+          })
+        );
+        await addHistoryItems(historyEntries);
+
+        scheduleAutoArchive({
+          success: true,
+          message: `Received ${files.length} file(s) successfully!`,
+          filesCount: files.length,
+        });
       };
 
-      receiver.onError = (err) => {
+      receiver.onError = async (err) => {
         setIsTransferring(false);
         activeReceiverRef.current = null;
         isAcceptingRef.current = false;
         setTransferStatusText('Receive Failed');
+
+        // Record failure in history
+        if (incomingTransferRequest) {
+          const failedEntries: HistoryItem[] = incomingTransferRequest.files.map((f) =>
+            createHistoryItem({
+              name: f.name,
+              size: f.size,
+              direction: 'received',
+              peerName: peerDevice?.display_name || 'Sender',
+              status: 'failed',
+            })
+          );
+          await addHistoryItems(failedEntries);
+        }
+
         Alert.alert('Receive Error', err);
       };
     };
@@ -441,35 +597,32 @@ export default function HomeScreen() {
 
   // Cancel ongoing transfer
   const handleCancelTransfer = () => {
-    Alert.alert(
-      'Cancel Transfer',
-      'Are you sure you want to cancel the transfer?',
-      [
-        { text: 'No', style: 'cancel' },
-        {
-          text: 'Yes, Cancel',
-          style: 'destructive',
-          onPress: () => {
-            if (activeSenderRef.current) {
-              activeSenderRef.current.cancel();
-              activeSenderRef.current = null;
-            }
-            if (activeReceiverRef.current) {
-              activeReceiverRef.current.cancel();
-              activeReceiverRef.current = null;
-            }
-            setIsTransferring(false);
-            setIsWaitingForApproval(false);
-            isAcceptingRef.current = false;
-            setTransferProgress(null);
-            setTransferStatusText('Transfer Cancelled');
-          },
+    Alert.alert('Cancel Transfer', 'Are you sure you want to cancel the transfer?', [
+      { text: 'No', style: 'cancel' },
+      {
+        text: 'Yes, Cancel',
+        style: 'destructive',
+        onPress: () => {
+          if (activeSenderRef.current) {
+            activeSenderRef.current.cancel();
+            activeSenderRef.current = null;
+          }
+          if (activeReceiverRef.current) {
+            activeReceiverRef.current.cancel();
+            activeReceiverRef.current = null;
+          }
+          setIsTransferring(false);
+          setIsWaitingForApproval(false);
+          isAcceptingRef.current = false;
+          setTransferProgress(null);
+          setTransferStatusText('Transfer Cancelled');
+          handleResetSession();
         },
-      ]
-    );
+      },
+    ]);
   };
 
-  // QR Code Barcode Scanned handler
+  // QR Scanning
   const handleBarCodeScanned = ({ data }: { data: string }) => {
     if (!isScannerOpen || isProcessingScanRef.current || isJoiningRef.current) return;
     isProcessingScanRef.current = true;
@@ -477,452 +630,452 @@ export default function HomeScreen() {
 
     try {
       const code = extractPairingCode(data);
-
       if (code) {
         setPairingCodeInput(code);
         handleJoinSession(code);
       } else {
-        Alert.alert(
-          'Invalid QR Code',
-          'This QR code does not contain a valid 6-digit JustShare pairing code.',
-          [{ text: 'OK', onPress: () => { isProcessingScanRef.current = false; } }]
-        );
+        Alert.alert('Invalid QR Code', 'This QR code does not contain a valid 6-digit code.', [
+          { text: 'OK', onPress: () => { isProcessingScanRef.current = false; } },
+        ]);
       }
     } catch {
-      Alert.alert(
-        'QR Error',
-        'Could not read pairing code from QR code.',
-        [{ text: 'OK', onPress: () => { isProcessingScanRef.current = false; } }]
-      );
+      Alert.alert('QR Error', 'Could not read pairing code from QR code.', [
+        { text: 'OK', onPress: () => { isProcessingScanRef.current = false; } },
+      ]);
     }
   };
 
   const handleOpenScanner = async () => {
-    isProcessingScanRef.current = false;
-    if (!cameraPermission?.granted) {
-      const permission = await requestCameraPermission();
-      if (!permission.granted) {
-        Alert.alert('Permission Required', 'Camera access is required to scan QR codes.');
+    if (!cameraPermission || !cameraPermission.granted) {
+      const { granted } = await requestCameraPermission();
+      if (!granted) {
+        Alert.alert('Permission Required', 'Camera permission is needed to scan QR codes.');
         return;
       }
     }
+    isProcessingScanRef.current = false;
     setIsScannerOpen(true);
   };
+
+  // Save received file from Home recent list to user-visible device storage
+  const handleSaveRecentFile = async (item: HistoryItem) => {
+    if (!item.uri) return;
+    setSavingHistoryId(item.id);
+    try {
+      const res = await saveFileToDevice(item.uri, item.name);
+      if (res.success) {
+        await markHistoryItemSaved(item.id);
+        await refreshRecentHistory();
+        Alert.alert('Saved!', 'File saved to device successfully.');
+      } else if (!res.cancelled) {
+        Alert.alert('Save Failed', res.error || 'Failed to save file.');
+      }
+    } finally {
+      setSavingHistoryId(null);
+    }
+  };
+
+  // Visible controls helper
+  const isPeerConnected = Boolean(pairedSessionId && peerDevice);
+  const controls = getVisibleControlsForRole(activeRole, isPeerConnected);
 
   if (loading || !device) {
     return (
       <View style={styles.centerContainer}>
-        <ActivityIndicator size="large" color="#58a6ff" />
+        <ActivityIndicator size="large" color={theme.colors.primary} />
         <Text style={styles.loadingText}>Initializing device identity...</Text>
       </View>
     );
   }
 
   return (
-    <View style={styles.root}>
-      {/* Header */}
+    <SafeAreaView style={styles.safeArea}>
+      {/* COMPACT HEADER */}
       <View style={styles.header}>
-        <Text style={styles.appName}>JustShare</Text>
-        <View style={styles.deviceBadge}>
-          <View style={styles.dotOnline} />
-          <Text style={styles.deviceBadgeText} numberOfLines={1}>
-            {device.displayName}
-          </Text>
-        </View>
-      </View>
-
-      {/* Paired Banner & Transfer Control Panel */}
-      {pairedSessionId && (
-        <View style={styles.pairedBanner}>
-          <View style={styles.rowBetween}>
-            <Text style={styles.pairedBannerTitle}>Session Connected</Text>
-            <Text style={styles.deviceBadgeText}>{transferStatusText || 'Connected'}</Text>
-          </View>
-          <Text style={styles.pairedBannerText}>
-            {peerDevice ? `Peer: ${peerDevice.display_name} • ` : ''}ID: {pairedSessionId.substring(0, 8)}...
-          </Text>
-
-          {/* INCOMING TRANSFER APPROVAL DIALOG (Receiver) */}
-          {incomingTransferRequest && (
-            <View style={styles.incomingModalBox}>
-              <Text style={styles.incomingTitle}>Incoming File Transfer</Text>
-              <Text style={styles.incomingSubtitle}>
-                {peerDevice ? peerDevice.display_name : 'Sender'} wants to send you {incomingTransferRequest.files.length} file(s) ({Math.round(incomingTransferRequest.totalSize / 1024)} KB):
-              </Text>
-
-              <ScrollView style={{ maxHeight: 120, marginVertical: 8 }}>
-                {incomingTransferRequest.files.map((file, idx) => (
-                  <View key={file.id || idx} style={styles.incomingFileItem}>
-                    <Text style={styles.incomingFileName} numberOfLines={1}>
-                      • {file.name}
-                    </Text>
-                    <Text style={styles.incomingFileSize}>
-                      {Math.round(file.size / 1024)} KB
-                    </Text>
-                  </View>
-                ))}
-              </ScrollView>
-
-              <View style={styles.buttonRow}>
-                <TouchableOpacity
-                  style={[styles.actionButton, styles.buttonGreen, { flex: 1 }]}
-                  onPress={handleAcceptIncomingTransfer}
-                >
-                  <Text style={styles.buttonText}>Accept</Text>
-                </TouchableOpacity>
-                <TouchableOpacity
-                  style={[styles.actionButton, styles.buttonRed, { flex: 1 }]}
-                  onPress={handleDeclineIncomingTransfer}
-                >
-                  <Text style={styles.buttonText}>Decline</Text>
-                </TouchableOpacity>
-              </View>
-            </View>
-          )}
-
-          {/* FILE SELECTION & SENDER CONTROLS */}
-          <View style={{ marginTop: 12 }}>
-            <TouchableOpacity
-              style={[styles.smallButton, styles.buttonBlue, { marginBottom: 8 }]}
-              onPress={handlePickFiles}
-              disabled={isTransferring}
-            >
-              <Text style={styles.smallButtonText}>+ Add Files to Send</Text>
-            </TouchableOpacity>
-
-            {/* List of Selected Files with Remove Button */}
-            {selectedFiles.length > 0 && (
-              <View style={styles.selectedFilesBox}>
-                <Text style={styles.selectedHeader}>
-                  Selected Files ({selectedFiles.length}) • Total: {Math.round(selectedFiles.reduce((acc, f) => acc + f.size, 0) / 1024)} KB
-                </Text>
-                {selectedFiles.map((f, idx) => (
-                  <View key={f.id || idx} style={styles.fileRow}>
-                    <View style={{ flex: 1, marginRight: 8 }}>
-                      <Text style={styles.fileNameText} numberOfLines={1}>
-                        {f.name}
-                      </Text>
-                      <Text style={styles.fileSizeText}>
-                        {Math.round(f.size / 1024)} KB
-                      </Text>
-                    </View>
-                    {!isTransferring && (
-                      <TouchableOpacity
-                        style={styles.removeFileButton}
-                        onPress={() => handleRemoveFile(idx)}
-                      >
-                        <Text style={styles.removeFileButtonText}>✕</Text>
-                      </TouchableOpacity>
-                    )}
-                  </View>
-                ))}
-
-                <TouchableOpacity
-                  style={[styles.actionButton, styles.buttonGreen, { marginTop: 10 }]}
-                  onPress={handleSendFiles}
-                  disabled={isTransferring || isWaitingForApproval}
-                >
-                  {isWaitingForApproval ? (
-                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
-                      <ActivityIndicator size="small" color="#fff" />
-                      <Text style={styles.buttonText}>Awaiting Peer Approval...</Text>
-                    </View>
-                  ) : isTransferring ? (
-                    <ActivityIndicator size="small" color="#fff" />
-                  ) : (
-                    <Text style={styles.buttonText}>Send {selectedFiles.length} File(s) Now</Text>
-                  )}
-                </TouchableOpacity>
-              </View>
-            )}
-          </View>
-
-          {/* PROGRESS BAR & CANCEL BUTTON */}
-          {transferProgress && (
-            <View style={{ marginTop: 12 }}>
-              <View style={styles.rowBetween}>
-                <Text style={{ color: '#f0f6fc', fontSize: 13, fontWeight: '600' }}>
-                  {transferProgress.fileName}
-                </Text>
-                <Text style={{ color: '#58a6ff', fontSize: 13, fontWeight: '700' }}>
-                  {transferProgress.percent}%
-                </Text>
-              </View>
-
-              <View
-                style={{
-                  height: 6,
-                  backgroundColor: '#21262d',
-                  borderRadius: 3,
-                  marginTop: 6,
-                  overflow: 'hidden',
-                }}
-              >
-                <View
-                  style={{
-                    height: '100%',
-                    width: `${transferProgress.percent}%`,
-                    backgroundColor: '#238636',
-                  }}
-                />
-              </View>
-              <View style={[styles.rowBetween, { marginTop: 4 }]}>
-                <Text style={{ color: '#8b949e', fontSize: 11 }}>
-                  {Math.round(transferProgress.totalBytesTransferred / 1024)} KB /{' '}
-                  {Math.round(transferProgress.totalBytes / 1024)} KB
-                  {transferProgress.speedBps > 0 && ` (${Math.round(transferProgress.speedBps / 1024)} KB/s)`}
-                </Text>
-                {isTransferring && (
-                  <TouchableOpacity onPress={handleCancelTransfer}>
-                    <Text style={{ color: '#da3633', fontSize: 12, fontWeight: '700' }}>Cancel</Text>
-                  </TouchableOpacity>
-                )}
-              </View>
-            </View>
-          )}
-
-          {/* RECEIVED FILES */}
-          {receivedFiles.length > 0 && (
-            <View style={{ marginTop: 12 }}>
-              <Text style={{ color: '#3fb950', fontSize: 13, fontWeight: '700', marginBottom: 6 }}>
-                Received Files ({receivedFiles.length}):
-              </Text>
-              {receivedFiles.map((file, idx) => (
-                <View key={idx} style={[styles.rowBetween, { paddingVertical: 4 }]}>
-                  <Text style={{ color: '#f0f6fc', fontSize: 12, flex: 1, marginRight: 8 }} numberOfLines={1}>
-                    • {file.name} ({Math.round(file.size / 1024)} KB)
-                  </Text>
-                  <TouchableOpacity
-                    style={[styles.smallButton, styles.buttonBlue]}
-                    onPress={() => Sharing.shareAsync(file.uri)}
-                  >
-                    <Text style={{ color: '#fff', fontSize: 11 }}>Save / Share</Text>
-                  </TouchableOpacity>
-                </View>
-              ))}
-            </View>
-          )}
-        </View>
-      )}
-
-      {/* Tabs */}
-      <View style={styles.tabContainer}>
-        <TouchableOpacity
-          style={[styles.tabButton, activeTab === 'nearby' && styles.tabButtonActive]}
-          onPress={() => setActiveTab('nearby')}
-        >
-          <Text style={[styles.tabText, activeTab === 'nearby' && styles.tabTextActive]}>
-            Nearby
-          </Text>
-        </TouchableOpacity>
-
-        <TouchableOpacity
-          style={[styles.tabButton, activeTab === 'code' && styles.tabButtonActive]}
-          onPress={() => setActiveTab('code')}
-        >
-          <Text style={[styles.tabText, activeTab === 'code' && styles.tabTextActive]}>
-            Pair Code
-          </Text>
-        </TouchableOpacity>
-
-        <TouchableOpacity
-          style={[styles.tabButton, activeTab === 'qr' && styles.tabButtonActive]}
-          onPress={() => setActiveTab('qr')}
-        >
-          <Text style={[styles.tabText, activeTab === 'qr' && styles.tabTextActive]}>
-            QR Code
-          </Text>
-        </TouchableOpacity>
-      </View>
-
-      {/* Tab Content */}
-      <ScrollView contentContainerStyle={styles.contentContainer}>
-        {/* NEARBY DISCOVERY TAB */}
-        {activeTab === 'nearby' && (
-          <View style={styles.card}>
-            <View style={styles.rowBetween}>
-              <Text style={styles.cardTitle}>Nearby Devices</Text>
-              <ActivityIndicator
-                animating={nearbyStatus === 'searching'}
-                size="small"
-                color="#58a6ff"
-              />
-            </View>
-
-            <Text style={styles.cardSubtitle}>
-              Devices on the same network running JustShare appear here automatically.
+        <View style={styles.headerBrandRow}>
+          <Text style={styles.brandTitle}>JustShare</Text>
+          <View style={styles.deviceChip}>
+            <View style={styles.onlineDot} />
+            <Text style={styles.deviceChipText} numberOfLines={1}>
+              {device.displayName}
             </Text>
+          </View>
+        </View>
+      </View>
 
-            {/* Incoming Request Dialog */}
-            {incomingRequest && (
-              <View style={styles.requestAlert}>
-                <Text style={styles.requestAlertTitle}>Incoming Connection Request</Text>
-                <Text style={styles.requestAlertText}>
-                  {incomingRequest.fromDevice.name} wants to connect with you.
-                </Text>
-                <View style={styles.requestButtonRow}>
-                  <TouchableOpacity
-                    style={[styles.actionButton, styles.buttonGreen]}
-                    onPress={() => {
-                      nearbyManagerRef.current?.respondToIncomingRequest(true);
-                      setIncomingRequest(null);
-                    }}
-                  >
-                    <Text style={styles.buttonText}>Accept</Text>
-                  </TouchableOpacity>
-                  <TouchableOpacity
-                    style={[styles.actionButton, styles.buttonRed]}
-                    onPress={() => {
-                      nearbyManagerRef.current?.respondToIncomingRequest(false);
-                      setIncomingRequest(null);
-                    }}
-                  >
-                    <Text style={styles.buttonText}>Decline</Text>
-                  </TouchableOpacity>
-                </View>
-              </View>
-            )}
-
-            {/* Device List */}
-            {discoveredDevices.length === 0 ? (
-              <View style={styles.emptyBox}>
-                <Text style={styles.emptyText}>
-                  {nearbyStatus === 'searching'
-                    ? 'Scanning local Wi-Fi for peers...'
-                    : 'No devices found nearby. Ensure other devices are on the same Wi-Fi.'}
-                </Text>
-              </View>
-            ) : (
-              discoveredDevices.map((dev) => (
-                <View key={dev.id} style={styles.peerRow}>
-                  <View style={styles.peerInfo}>
-                    <Text style={styles.peerName}>{dev.name}</Text>
-                    <Text style={styles.peerType}>Type: {dev.type}</Text>
-                  </View>
-                  <TouchableOpacity
-                    style={[styles.smallButton, styles.buttonBlue]}
-                    onPress={() => nearbyManagerRef.current?.requestPair(dev.id)}
-                  >
-                    <Text style={styles.smallButtonText}>Connect</Text>
-                  </TouchableOpacity>
-                </View>
-              ))
-            )}
+      <ScrollView
+        contentContainerStyle={styles.scrollContent}
+        refreshControl={
+          <RefreshControl
+            refreshing={refreshing}
+            onRefresh={handlePullToRefresh}
+            colors={[theme.colors.primary]}
+            tintColor={theme.colors.primary}
+            enabled={!isTransferring}
+          />
+        }
+      >
+        {/* COMPLETION BANNER (Auto-archives after ~4s) */}
+        {completionResult && (
+          <View style={styles.completionBanner}>
+            <Text style={styles.completionTitle}>✓ Transfer Complete</Text>
+            <Text style={styles.completionSubtitle}>{completionResult.message}</Text>
+            <Text style={styles.completionTimerText}>Archiving to History in a few seconds...</Text>
           </View>
         )}
 
-        {/* 6-DIGIT CODE TAB */}
-        {activeTab === 'code' && (
-          <View style={styles.card}>
-            <Text style={styles.cardTitle}>Pair with 6-Digit Code</Text>
-            <Text style={styles.cardSubtitle}>
-              Generate a code to receive files, or enter a sender's code to connect.
-            </Text>
-
-            {/* Generate Code Box */}
-            <View style={styles.subCard}>
-              <Text style={styles.subCardTitle}>Your Pairing Code</Text>
-              {createdSession ? (
-                <View style={styles.codeDisplayBox}>
-                  <Text style={styles.codeBig}>{createdSession.pairing_code}</Text>
-                  <Text style={styles.codeExpiry}>
-                    Expires in 10 minutes. Share this with your peer.
-                  </Text>
-                </View>
-              ) : (
-                <TouchableOpacity
-                  style={[styles.actionButton, styles.buttonGreen]}
-                  onPress={handleCreateSession}
-                  disabled={isCreatingSession}
-                >
-                  {isCreatingSession ? (
-                    <ActivityIndicator size="small" color="#fff" />
-                  ) : (
-                    <Text style={styles.buttonText}>Generate New Code</Text>
-                  )}
-                </TouchableOpacity>
-              )}
-            </View>
-
-            {/* Enter Code Box */}
-            <View style={styles.subCard}>
-              <Text style={styles.subCardTitle}>Enter Peer's Code</Text>
-              <TextInput
-                style={styles.input}
-                placeholder="6-digit code (e.g. 123456)"
-                placeholderTextColor="#8b949e"
-                value={pairingCodeInput}
-                onChangeText={setPairingCodeInput}
-                maxLength={6}
-                keyboardType="numeric"
-                autoCapitalize="none"
-              />
-              <TouchableOpacity
-                style={[styles.actionButton, styles.buttonBlue]}
-                onPress={() => handleJoinSession()}
-                disabled={isJoiningSession || pairingCodeInput.length !== 6}
-              >
-                {isJoiningSession ? (
-                  <ActivityIndicator size="small" color="#fff" />
-                ) : (
-                  <Text style={styles.buttonText}>Join Session</Text>
-                )}
+        {/* ACTIVE SESSION / TRANSFER AREA (Rendered in isolated card when active) */}
+        {pairedSessionId ? (
+          <View style={styles.sessionCard}>
+            <View style={styles.sessionHeaderRow}>
+              <View>
+                <Text style={styles.sessionTitle}>
+                  {activeRole === 'sender' ? 'Sender Session' : 'Receiver Session'}
+                </Text>
+                <Text style={styles.sessionPeerSubtitle}>
+                  {peerDevice ? `Connected with: ${peerDevice.display_name}` : 'Waiting for peer...'}
+                </Text>
+              </View>
+              <TouchableOpacity style={styles.disconnectButton} onPress={handleResetSession}>
+                <Text style={styles.disconnectButtonText}>Disconnect</Text>
               </TouchableOpacity>
             </View>
-          </View>
-        )}
 
-        {/* QR CODE TAB */}
-        {activeTab === 'qr' && (
-          <View style={styles.card}>
-            <Text style={styles.cardTitle}>QR Code Pairing</Text>
-            <Text style={styles.cardSubtitle}>
-              Display your session QR code or scan a code from your laptop / another device.
-            </Text>
+            {/* SENDER SCREEN: Code + QR before peer joins */}
+            {activeRole === 'sender' && !peerDevice && createdSession && (
+              <View style={styles.codeBox}>
+                <Text style={styles.codeLabel}>Share 6-Digit Code with Peer</Text>
+                <Text style={styles.codeText}>{createdSession.pairing_code}</Text>
 
-            {/* QR Scanner Trigger */}
-            <TouchableOpacity
-              style={[styles.actionButton, styles.buttonBlue, { marginBottom: 20 }]}
-              onPress={handleOpenScanner}
-            >
-              <Text style={styles.buttonText}>Open Camera to Scan QR</Text>
-            </TouchableOpacity>
-
-            {/* Display QR Code */}
-            <View style={styles.subCard}>
-              <Text style={styles.subCardTitle}>Your QR Code</Text>
-              {createdSession ? (
-                <View style={styles.qrContainer}>
+                <View style={styles.qrWrapper}>
                   <QRCode
                     value={buildMobilePairingUrl(getConfig().backendUrl, createdSession.pairing_code)}
-                    size={200}
-                    color="#000"
-                    backgroundColor="#fff"
+                    size={160}
+                    color="#0f172a"
+                    backgroundColor="#ffffff"
                   />
-                  <Text style={styles.qrCodeLabel}>Code: {createdSession.pairing_code}</Text>
-                  <Text style={{ fontSize: 11, color: '#57606a', marginTop: 4, textAlign: 'center' }}>
-                    Scan with JustShare on your laptop or another phone
+                  <Text style={styles.qrHint}>Or have the receiver scan this QR code</Text>
+                </View>
+              </View>
+            )}
+
+            {/* SENDER SCREEN: File Picking & Send Controls (Only after peer joined) */}
+            {activeRole === 'sender' && peerDevice && (
+              <View style={{ marginTop: theme.spacing.md }}>
+                <TouchableOpacity
+                  style={styles.dashedUploadArea}
+                  onPress={handlePickFiles}
+                  disabled={isTransferring}
+                >
+                  <Text style={{ fontSize: 28, marginBottom: 4 }}>📄</Text>
+                  <Text style={styles.dashedUploadTitle}>+ Choose Files to Send</Text>
+                  <Text style={styles.dashedUploadSubtitle}>Tap to browse documents, images, and files</Text>
+                </TouchableOpacity>
+
+                {selectedFiles.length > 0 && (
+                  <View style={styles.selectedFilesList}>
+                    <Text style={styles.selectedHeader}>
+                      Selected Files ({selectedFiles.length}) • Total: {formatBytes(selectedFiles.reduce((acc, f) => acc + f.size, 0))}
+                    </Text>
+                    {selectedFiles.map((file, idx) => (
+                      <View key={file.id || idx} style={styles.fileRow}>
+                        <View style={{ flex: 1, marginRight: theme.spacing.sm }}>
+                          <Text style={styles.fileNameText} numberOfLines={1}>
+                            {truncateFilename(file.name, 28)}
+                          </Text>
+                          <Text style={styles.fileSizeText}>{formatBytes(file.size)}</Text>
+                        </View>
+                        {!isTransferring && (
+                          <TouchableOpacity
+                            style={styles.removeFileBtn}
+                            onPress={() => handleRemoveFile(idx)}
+                          >
+                            <Text style={styles.removeFileBtnText}>✕</Text>
+                          </TouchableOpacity>
+                        )}
+                      </View>
+                    ))}
+
+                    <TouchableOpacity
+                      style={[styles.primaryButton, isTransferring && { opacity: 0.7 }]}
+                      onPress={handleSendFiles}
+                      disabled={isTransferring || isWaitingForApproval}
+                    >
+                      {isWaitingForApproval ? (
+                        <View style={styles.loadingRow}>
+                          <ActivityIndicator size="small" color="#fff" />
+                          <Text style={styles.primaryButtonText}>Awaiting Approval...</Text>
+                        </View>
+                      ) : isTransferring ? (
+                        <ActivityIndicator size="small" color="#fff" />
+                      ) : (
+                        <Text style={styles.primaryButtonText}>
+                          Send to {peerDevice.display_name} ({selectedFiles.length})
+                        </Text>
+                      )}
+                    </TouchableOpacity>
+                  </View>
+                )}
+              </View>
+            )}
+
+            {/* RECEIVER SCREEN: Connected State & Accept/Decline (Never shows send/pick controls) */}
+            {activeRole === 'receiver' && (
+              <View style={{ marginTop: theme.spacing.md }}>
+                {incomingTransferRequest ? (
+                  <View style={styles.approvalBox}>
+                    <Text style={styles.approvalTitle}>Incoming Transfer</Text>
+                    <Text style={styles.approvalSubtitle}>
+                      {peerDevice ? peerDevice.display_name : 'Sender'} wants to send you {incomingTransferRequest.files.length} file(s) ({formatBytes(incomingTransferRequest.totalSize)}):
+                    </Text>
+
+                    <ScrollView style={{ maxHeight: 110, marginVertical: 8 }}>
+                      {incomingTransferRequest.files.map((file, idx) => (
+                        <View key={file.id || idx} style={styles.approvalItem}>
+                          <Text style={styles.approvalFileName} numberOfLines={1}>
+                            • {truncateFilename(file.name, 28)}
+                          </Text>
+                          <Text style={styles.approvalFileSize}>{formatBytes(file.size)}</Text>
+                        </View>
+                      ))}
+                    </ScrollView>
+
+                    <View style={styles.buttonRow}>
+                      <TouchableOpacity
+                        style={[styles.actionBtn, styles.btnGreen]}
+                        onPress={handleAcceptIncomingTransfer}
+                      >
+                        <Text style={styles.btnTextWhite}>Accept</Text>
+                      </TouchableOpacity>
+                      <TouchableOpacity
+                        style={[styles.actionBtn, styles.btnRed]}
+                        onPress={handleDeclineIncomingTransfer}
+                      >
+                        <Text style={styles.btnTextWhite}>Decline</Text>
+                      </TouchableOpacity>
+                    </View>
+                  </View>
+                ) : (
+                  <View style={styles.receiverIdleState}>
+                    <Text style={styles.receiverIdleText}>
+                      Connected to {peerDevice ? peerDevice.display_name : 'Host'}. Waiting for files...
+                    </Text>
+                  </View>
+                )}
+              </View>
+            )}
+
+            {/* PROGRESS ROW (Percentage inside the row, never overflowing) */}
+            {transferProgress && (
+              <View style={styles.progressContainer}>
+                <View style={styles.progressHeaderRow}>
+                  <Text style={styles.progressFileName} numberOfLines={1}>
+                    {truncateFilename(transferProgress.fileName, 24)}
+                  </Text>
+                  <Text style={styles.progressPercentText}>
+                    {calculateProgressPercentage(transferProgress.fileBytesTransferred, transferProgress.fileTotalBytes)}%
                   </Text>
                 </View>
-              ) : (
-                <TouchableOpacity
-                  style={[styles.actionButton, styles.buttonGreen]}
-                  onPress={handleCreateSession}
-                  disabled={isCreatingSession}
-                >
-                  {isCreatingSession ? (
-                    <ActivityIndicator size="small" color="#fff" />
-                  ) : (
-                    <Text style={styles.buttonText}>Generate Session for QR</Text>
+
+                <View style={styles.progressBarTrack}>
+                  <View
+                    style={[
+                      styles.progressBarFill,
+                      {
+                        width: `${calculateProgressPercentage(transferProgress.totalBytesTransferred, transferProgress.totalBytes)}%`,
+                      },
+                    ]}
+                  />
+                </View>
+
+                <View style={styles.progressFooterRow}>
+                  <Text style={styles.progressBytesText}>
+                    {formatBytes(transferProgress.totalBytesTransferred)} / {formatBytes(transferProgress.totalBytes)}
+                    {transferProgress.speedBps > 0 && ` (${formatBytes(transferProgress.speedBps)}/s)`}
+                  </Text>
+                  {isTransferring && (
+                    <TouchableOpacity onPress={handleCancelTransfer}>
+                      <Text style={styles.cancelText}>Cancel</Text>
+                    </TouchableOpacity>
                   )}
+                </View>
+              </View>
+            )}
+          </View>
+        ) : (
+          /* IDLE HOME DASHBOARD */
+          <>
+            {/* CENTRAL QUICK SHARE CARD */}
+            <View style={styles.centralHeroCard}>
+              <Text style={styles.heroTitle}>Direct Device Transfer</Text>
+              <Text style={styles.heroSubtitle}>
+                Transfer files directly peer-to-peer over your local network with SHA-256 integrity verification.
+              </Text>
+            </View>
+
+            {/* ROW OF ACTION TILES: Send, Receive, History, QR Scan */}
+            <View style={styles.tilesGrid}>
+              {/* Tile 1: Send */}
+              <TouchableOpacity
+                style={[styles.actionTile, styles.tilePrimary]}
+                activeOpacity={0.8}
+                onPress={handleStartSenderFlow}
+                disabled={isCreatingSession}
+              >
+                <View style={styles.tileIconCircle}>
+                  <Text style={{ fontSize: 22 }}>↗</Text>
+                </View>
+                <Text style={styles.tileTitle}>Send</Text>
+                <Text style={styles.tileDesc}>Host & send</Text>
+              </TouchableOpacity>
+
+              {/* Tile 2: Receive */}
+              <TouchableOpacity
+                style={styles.actionTile}
+                activeOpacity={0.8}
+                onPress={handleStartReceiverFlow}
+              >
+                <View style={[styles.tileIconCircle, { backgroundColor: theme.colors.accentGreenLight }]}>
+                  <Text style={{ fontSize: 22 }}>↙</Text>
+                </View>
+                <Text style={styles.tileTitle}>Receive</Text>
+                <Text style={styles.tileDesc}>Join session</Text>
+              </TouchableOpacity>
+
+              {/* Tile 3: History */}
+              <TouchableOpacity
+                style={styles.actionTile}
+                activeOpacity={0.8}
+                onPress={() => router.push('/history')}
+              >
+                <View style={[styles.tileIconCircle, { backgroundColor: theme.colors.surfaceAlt }]}>
+                  <Text style={{ fontSize: 22 }}>📋</Text>
+                </View>
+                <Text style={styles.tileTitle}>History</Text>
+                <Text style={styles.tileDesc}>All records</Text>
+              </TouchableOpacity>
+
+              {/* Tile 4: QR Scan */}
+              <TouchableOpacity
+                style={styles.actionTile}
+                activeOpacity={0.8}
+                onPress={handleOpenScanner}
+              >
+                <View style={[styles.tileIconCircle, { backgroundColor: theme.colors.primaryLight }]}>
+                  <Text style={{ fontSize: 22 }}>📷</Text>
+                </View>
+                <Text style={styles.tileTitle}>Scan QR</Text>
+                <Text style={styles.tileDesc}>Quick pair</Text>
+              </TouchableOpacity>
+            </View>
+
+            {/* RECEIVE SHEET / CARD (When Receive tile tapped) */}
+            {activeFlow === 'receive' && (
+              <View style={styles.receiveInputCard}>
+                <View style={styles.sessionHeaderRow}>
+                  <Text style={styles.sessionTitle}>Join Session to Receive</Text>
+                  <TouchableOpacity onPress={() => setActiveFlow('idle')}>
+                    <Text style={{ color: theme.colors.textSecondary, fontSize: 13 }}>Cancel</Text>
+                  </TouchableOpacity>
+                </View>
+                <Text style={styles.cardSubtitle}>
+                  Enter the 6-digit code shown on the sender device, or scan their QR code.
+                </Text>
+
+                <TextInput
+                  style={styles.codeInput}
+                  placeholder="6-digit code (e.g. 123456)"
+                  placeholderTextColor={theme.colors.textTertiary}
+                  value={pairingCodeInput}
+                  onChangeText={setPairingCodeInput}
+                  maxLength={6}
+                  keyboardType="numeric"
+                  autoCapitalize="none"
+                />
+
+                <View style={styles.buttonRow}>
+                  <TouchableOpacity
+                    style={[styles.primaryButton, { flex: 1 }]}
+                    onPress={() => handleJoinSession()}
+                    disabled={isJoiningSession || pairingCodeInput.trim().length !== 6}
+                  >
+                    {isJoiningSession ? (
+                      <ActivityIndicator size="small" color="#fff" />
+                    ) : (
+                      <Text style={styles.primaryButtonText}>Connect to Sender</Text>
+                    )}
+                  </TouchableOpacity>
+
+                  <TouchableOpacity
+                    style={[styles.outlineButton, { minWidth: 100 }]}
+                    onPress={handleOpenScanner}
+                  >
+                    <Text style={styles.outlineButtonText}>📷 Scan</Text>
+                  </TouchableOpacity>
+                </View>
+              </View>
+            )}
+
+            {/* RECENT TRANSFERS LIST (Last 3 with 'See all') */}
+            <View style={styles.recentSection}>
+              <View style={styles.recentHeaderRow}>
+                <Text style={styles.recentSectionTitle}>Recent Transfers</Text>
+                <TouchableOpacity onPress={() => router.push('/history')}>
+                  <Text style={styles.seeAllText}>See all →</Text>
                 </TouchableOpacity>
+              </View>
+
+              {recentTransfers.length === 0 ? (
+                <View style={styles.recentEmptyBox}>
+                  <Text style={styles.recentEmptyText}>No recent transfers yet</Text>
+                </View>
+              ) : (
+                recentTransfers.map((item) => {
+                  const isSent = item.direction === 'sent';
+                  const isCompleted = item.status === 'completed';
+
+                  return (
+                    <View key={item.id} style={styles.recentItemCard}>
+                      <View style={styles.recentItemLeft}>
+                        <View
+                          style={[
+                            styles.recentIconCircle,
+                            isCompleted ? styles.badgeGreen : styles.badgeRed,
+                          ]}
+                        >
+                          <Text style={{ fontSize: 16 }}>{isSent ? '↗' : '✓'}</Text>
+                        </View>
+                        <View style={{ flex: 1, marginRight: theme.spacing.sm }}>
+                          <Text style={styles.recentItemName} numberOfLines={1}>
+                            {truncateFilename(item.name, 24)}
+                          </Text>
+                          <Text style={styles.recentItemMeta}>
+                            {formatBytes(item.size)} • {isSent ? `To ${item.peerName}` : `From ${item.peerName}`}
+                          </Text>
+                        </View>
+                      </View>
+
+                      {!isSent && isCompleted && item.uri && (
+                        <TouchableOpacity
+                          style={[styles.saveChip, item.savedToDevice && styles.savedChip]}
+                          onPress={() => handleSaveRecentFile(item)}
+                          disabled={savingHistoryId === item.id || item.savedToDevice}
+                        >
+                          <Text style={[styles.saveChipText, item.savedToDevice && styles.savedChipText]}>
+                            {item.savedToDevice ? '✓ Saved' : savingHistoryId === item.id ? '...' : 'Save'}
+                          </Text>
+                        </TouchableOpacity>
+                      )}
+                    </View>
+                  );
+                })
               )}
             </View>
-          </View>
+          </>
         )}
       </ScrollView>
 
-      {/* Camera Scanner Modal */}
+      {/* CAMERA QR SCANNER MODAL */}
       <Modal visible={isScannerOpen} animationType="slide">
         <View style={styles.modalRoot}>
           <CameraView
@@ -953,356 +1106,519 @@ export default function HomeScreen() {
           </View>
         </View>
       </Modal>
-    </View>
+    </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
-  root: {
+  safeArea: {
     flex: 1,
-    backgroundColor: '#0d1117',
+    backgroundColor: theme.colors.background,
   },
   centerContainer: {
     flex: 1,
-    backgroundColor: '#0d1117',
+    backgroundColor: theme.colors.background,
     justifyContent: 'center',
     alignItems: 'center',
-    padding: 20,
   },
   loadingText: {
-    color: '#8b949e',
-    marginTop: 12,
-    fontSize: 14,
+    ...theme.typography.bodyMedium,
+    color: theme.colors.textSecondary,
+    marginTop: theme.spacing.md,
   },
   header: {
+    paddingHorizontal: theme.spacing.xl,
+    paddingTop: theme.spacing.sm,
+    paddingBottom: theme.spacing.md,
+    backgroundColor: theme.colors.surface,
+    borderBottomWidth: 1,
+    borderBottomColor: theme.colors.border,
+  },
+  headerBrandRow: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    paddingHorizontal: 20,
-    paddingTop: 50,
-    paddingBottom: 16,
-    backgroundColor: '#161b22',
-    borderBottomWidth: 1,
-    borderBottomColor: '#30363d',
   },
-  appName: {
-    fontSize: 20,
-    fontWeight: '700',
-    color: '#f0f6fc',
+  brandTitle: {
+    ...theme.typography.titleLarge,
+    color: theme.colors.textPrimary,
+    letterSpacing: -0.5,
   },
-  deviceBadge: {
+  deviceChip: {
     flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: '#21262d',
-    paddingVertical: 5,
-    paddingHorizontal: 10,
-    borderRadius: 14,
-    maxWidth: 180,
+    backgroundColor: theme.colors.surfaceAlt,
+    paddingHorizontal: theme.spacing.md,
+    paddingVertical: theme.spacing.xs,
+    borderRadius: theme.radii.full,
+    maxWidth: 160,
   },
-  dotOnline: {
+  onlineDot: {
     width: 8,
     height: 8,
     borderRadius: 4,
-    backgroundColor: '#3fb950',
+    backgroundColor: theme.colors.accentGreen,
     marginRight: 6,
   },
-  deviceBadgeText: {
-    color: '#c9d1d9',
-    fontSize: 12,
-    fontWeight: '500',
+  deviceChipText: {
+    ...theme.typography.labelSmall,
+    color: theme.colors.textSecondary,
   },
-  pairedBanner: {
-    backgroundColor: 'rgba(35, 134, 54, 0.2)',
-    borderColor: '#238636',
+  scrollContent: {
+    padding: theme.spacing.xl,
+    paddingBottom: theme.spacing.xxxl,
+  },
+  completionBanner: {
+    backgroundColor: theme.colors.accentGreenLight,
+    borderColor: theme.colors.accentGreen,
     borderWidth: 1,
-    margin: 16,
-    marginBottom: 0,
-    padding: 12,
-    borderRadius: 8,
+    borderRadius: theme.radii.lg,
+    padding: theme.spacing.md,
+    marginBottom: theme.spacing.lg,
   },
-  pairedBannerTitle: {
-    color: '#3fb950',
-    fontWeight: '700',
-    fontSize: 14,
+  completionTitle: {
+    ...theme.typography.titleSmall,
+    color: theme.colors.accentGreen,
   },
-  pairedBannerText: {
-    color: '#8b949e',
-    fontSize: 12,
+  completionSubtitle: {
+    ...theme.typography.bodyMedium,
+    color: theme.colors.textPrimary,
     marginTop: 2,
   },
-  incomingModalBox: {
-    backgroundColor: '#1c2128',
-    borderColor: '#388bfd',
-    borderWidth: 1,
-    borderRadius: 8,
-    padding: 12,
-    marginTop: 12,
+  completionTimerText: {
+    ...theme.typography.bodySmall,
+    color: theme.colors.textSecondary,
+    marginTop: 4,
   },
-  incomingTitle: {
-    color: '#58a6ff',
-    fontWeight: '700',
-    fontSize: 14,
+  centralHeroCard: {
+    backgroundColor: theme.colors.surface,
+    borderRadius: theme.radii.xl,
+    padding: theme.spacing.xl,
+    marginBottom: theme.spacing.lg,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    ...theme.shadows.card,
+  },
+  heroTitle: {
+    ...theme.typography.titleMedium,
+    color: theme.colors.textPrimary,
     marginBottom: 4,
   },
-  incomingSubtitle: {
-    color: '#c9d1d9',
-    fontSize: 12,
-    lineHeight: 16,
+  heroSubtitle: {
+    ...theme.typography.bodyMedium,
+    color: theme.colors.textSecondary,
+    lineHeight: 20,
   },
-  incomingFileItem: {
+  tilesGrid: {
     flexDirection: 'row',
     justifyContent: 'space-between',
-    paddingVertical: 3,
+    marginBottom: theme.spacing.xl,
   },
-  incomingFileName: {
-    color: '#f0f6fc',
-    fontSize: 12,
+  actionTile: {
     flex: 1,
-    marginRight: 6,
+    backgroundColor: theme.colors.surface,
+    borderRadius: theme.radii.lg,
+    padding: theme.spacing.md,
+    marginHorizontal: 4,
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    minHeight: 104,
+    justifyContent: 'center',
+    ...theme.shadows.card,
   },
-  incomingFileSize: {
-    color: '#8b949e',
-    fontSize: 11,
+  tilePrimary: {
+    borderColor: theme.colors.primaryLight,
+  },
+  tileIconCircle: {
+    width: 44,
+    height: 44,
+    borderRadius: theme.radii.full,
+    backgroundColor: theme.colors.primaryLight,
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginBottom: theme.spacing.xs,
+  },
+  tileTitle: {
+    ...theme.typography.labelMedium,
+    color: theme.colors.textPrimary,
+  },
+  tileDesc: {
+    ...theme.typography.bodySmall,
+    color: theme.colors.textTertiary,
+    fontSize: 10,
+  },
+  receiveInputCard: {
+    backgroundColor: theme.colors.surface,
+    borderRadius: theme.radii.lg,
+    padding: theme.spacing.lg,
+    marginBottom: theme.spacing.xl,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    ...theme.shadows.card,
+  },
+  cardSubtitle: {
+    ...theme.typography.bodyMedium,
+    color: theme.colors.textSecondary,
+    marginBottom: theme.spacing.md,
+  },
+  codeInput: {
+    backgroundColor: theme.colors.surfaceAlt,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    borderRadius: theme.radii.md,
+    paddingHorizontal: theme.spacing.lg,
+    paddingVertical: theme.spacing.md,
+    fontSize: 18,
+    fontWeight: '700',
+    color: theme.colors.textPrimary,
+    textAlign: 'center',
+    marginBottom: theme.spacing.md,
+    minHeight: 48,
   },
   buttonRow: {
     flexDirection: 'row',
-    gap: 8,
-    marginTop: 8,
+    gap: theme.spacing.sm,
   },
-  selectedFilesBox: {
-    backgroundColor: '#0d1117',
-    borderColor: '#30363d',
+  primaryButton: {
+    backgroundColor: theme.colors.primary,
+    borderRadius: theme.radii.md,
+    minHeight: 48,
+    justifyContent: 'center',
+    alignItems: 'center',
+    paddingHorizontal: theme.spacing.lg,
+  },
+  primaryButtonText: {
+    ...theme.typography.labelMedium,
+    color: theme.colors.textInverse,
+  },
+  outlineButton: {
+    backgroundColor: theme.colors.surface,
+    borderColor: theme.colors.border,
     borderWidth: 1,
-    borderRadius: 8,
-    padding: 10,
-    marginTop: 6,
+    borderRadius: theme.radii.md,
+    minHeight: 48,
+    justifyContent: 'center',
+    alignItems: 'center',
+    paddingHorizontal: theme.spacing.md,
+  },
+  outlineButtonText: {
+    ...theme.typography.labelMedium,
+    color: theme.colors.textPrimary,
+  },
+  sessionCard: {
+    backgroundColor: theme.colors.surface,
+    borderRadius: theme.radii.xl,
+    padding: theme.spacing.lg,
+    marginBottom: theme.spacing.xl,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    ...theme.shadows.card,
+  },
+  sessionHeaderRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'flex-start',
+    marginBottom: theme.spacing.md,
+  },
+  sessionTitle: {
+    ...theme.typography.titleSmall,
+    color: theme.colors.textPrimary,
+  },
+  sessionPeerSubtitle: {
+    ...theme.typography.bodySmall,
+    color: theme.colors.textSecondary,
+    marginTop: 2,
+  },
+  disconnectButton: {
+    paddingHorizontal: theme.spacing.md,
+    paddingVertical: theme.spacing.xs,
+    borderRadius: theme.radii.sm,
+    backgroundColor: theme.colors.accentRedLight,
+    minHeight: 36,
+    justifyContent: 'center',
+  },
+  disconnectButtonText: {
+    ...theme.typography.labelSmall,
+    color: theme.colors.accentRed,
+  },
+  codeBox: {
+    alignItems: 'center',
+    backgroundColor: theme.colors.surfaceAlt,
+    borderRadius: theme.radii.lg,
+    padding: theme.spacing.lg,
+  },
+  codeLabel: {
+    ...theme.typography.labelMedium,
+    color: theme.colors.textSecondary,
+    marginBottom: 4,
+  },
+  codeText: {
+    ...theme.typography.codeLarge,
+    color: theme.colors.primary,
+    marginVertical: theme.spacing.xs,
+  },
+  qrWrapper: {
+    marginTop: theme.spacing.md,
+    alignItems: 'center',
+    padding: theme.spacing.md,
+    backgroundColor: theme.colors.surface,
+    borderRadius: theme.radii.md,
+  },
+  qrHint: {
+    ...theme.typography.bodySmall,
+    color: theme.colors.textTertiary,
+    marginTop: theme.spacing.sm,
+  },
+  dashedUploadArea: {
+    borderWidth: 2,
+    borderStyle: 'dashed',
+    borderColor: theme.colors.borderDashed,
+    borderRadius: theme.radii.lg,
+    padding: theme.spacing.xl,
+    alignItems: 'center',
+    backgroundColor: theme.colors.surfaceAlt,
+  },
+  dashedUploadTitle: {
+    ...theme.typography.titleSmall,
+    color: theme.colors.primary,
+  },
+  dashedUploadSubtitle: {
+    ...theme.typography.bodySmall,
+    color: theme.colors.textSecondary,
+    marginTop: 2,
+  },
+  selectedFilesList: {
+    marginTop: theme.spacing.md,
   },
   selectedHeader: {
-    color: '#c9d1d9',
-    fontSize: 12,
-    fontWeight: '600',
-    marginBottom: 6,
+    ...theme.typography.labelSmall,
+    color: theme.colors.textSecondary,
+    marginBottom: theme.spacing.sm,
   },
   fileRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    justifyContent: 'space-between',
-    paddingVertical: 4,
-    borderBottomWidth: 1,
-    borderBottomColor: '#21262d',
+    backgroundColor: theme.colors.surfaceAlt,
+    borderRadius: theme.radii.md,
+    padding: theme.spacing.sm,
+    marginBottom: theme.spacing.xs,
   },
   fileNameText: {
-    color: '#f0f6fc',
-    fontSize: 12,
-    fontWeight: '500',
+    ...theme.typography.bodyMedium,
+    color: theme.colors.textPrimary,
   },
   fileSizeText: {
-    color: '#8b949e',
-    fontSize: 11,
+    ...theme.typography.bodySmall,
+    color: theme.colors.textTertiary,
   },
-  removeFileButton: {
-    paddingHorizontal: 8,
-    paddingVertical: 4,
-    borderRadius: 4,
-    backgroundColor: 'rgba(218, 54, 51, 0.2)',
+  removeFileBtn: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    justifyContent: 'center',
+    alignItems: 'center',
   },
-  removeFileButtonText: {
-    color: '#da3633',
-    fontSize: 12,
+  removeFileBtnText: {
+    color: theme.colors.accentRed,
     fontWeight: '700',
   },
-  tabContainer: {
-    flexDirection: 'row',
-    backgroundColor: '#161b22',
-    marginHorizontal: 16,
-    marginTop: 16,
-    borderRadius: 8,
-    padding: 4,
+  approvalBox: {
+    backgroundColor: theme.colors.accentAmberLight,
+    borderRadius: theme.radii.lg,
+    padding: theme.spacing.md,
     borderWidth: 1,
-    borderColor: '#30363d',
+    borderColor: theme.colors.accentAmber,
   },
-  tabButton: {
-    flex: 1,
-    paddingVertical: 10,
-    alignItems: 'center',
-    borderRadius: 6,
+  approvalTitle: {
+    ...theme.typography.titleSmall,
+    color: theme.colors.accentAmber,
   },
-  tabButtonActive: {
-    backgroundColor: '#21262d',
-  },
-  tabText: {
-    color: '#8b949e',
-    fontWeight: '600',
-    fontSize: 14,
-  },
-  tabTextActive: {
-    color: '#f0f6fc',
-  },
-  contentContainer: {
-    padding: 16,
-  },
-  card: {
-    backgroundColor: '#161b22',
-    borderColor: '#30363d',
-    borderWidth: 1,
-    borderRadius: 12,
-    padding: 20,
-  },
-  rowBetween: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-  },
-  cardTitle: {
-    fontSize: 18,
-    fontWeight: '700',
-    color: '#f0f6fc',
-    marginBottom: 4,
-  },
-  cardSubtitle: {
-    fontSize: 13,
-    color: '#8b949e',
-    marginBottom: 16,
-    lineHeight: 18,
-  },
-  subCard: {
-    backgroundColor: '#0d1117',
-    borderColor: '#21262d',
-    borderWidth: 1,
-    borderRadius: 8,
-    padding: 16,
-    marginBottom: 16,
-  },
-  subCardTitle: {
-    fontSize: 14,
-    fontWeight: '600',
-    color: '#c9d1d9',
-    marginBottom: 10,
-  },
-  emptyBox: {
-    padding: 24,
-    alignItems: 'center',
-  },
-  emptyText: {
-    color: '#8b949e',
-    textAlign: 'center',
-    fontSize: 13,
-    lineHeight: 18,
-  },
-  peerRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    paddingVertical: 12,
-    borderBottomWidth: 1,
-    borderBottomColor: '#21262d',
-  },
-  peerInfo: {
-    flex: 1,
-  },
-  peerName: {
-    color: '#f0f6fc',
-    fontSize: 15,
-    fontWeight: '600',
-  },
-  peerType: {
-    color: '#8b949e',
-    fontSize: 12,
+  approvalSubtitle: {
+    ...theme.typography.bodyMedium,
+    color: theme.colors.textPrimary,
     marginTop: 2,
   },
-  smallButton: {
-    paddingVertical: 6,
-    paddingHorizontal: 14,
-    borderRadius: 6,
+  approvalItem: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    paddingVertical: 2,
   },
-  smallButtonText: {
-    color: '#ffffff',
-    fontSize: 13,
-    fontWeight: '600',
+  approvalFileName: {
+    ...theme.typography.bodySmall,
+    color: theme.colors.textPrimary,
+    flex: 1,
   },
-  actionButton: {
-    paddingVertical: 12,
-    paddingHorizontal: 20,
-    borderRadius: 8,
+  approvalFileSize: {
+    ...theme.typography.bodySmall,
+    color: theme.colors.textSecondary,
+  },
+  actionBtn: {
+    flex: 1,
+    minHeight: 44,
+    borderRadius: theme.radii.md,
+    justifyContent: 'center',
     alignItems: 'center',
+  },
+  btnGreen: {
+    backgroundColor: theme.colors.accentGreen,
+  },
+  btnRed: {
+    backgroundColor: theme.colors.accentRed,
+  },
+  btnTextWhite: {
+    ...theme.typography.labelMedium,
+    color: theme.colors.textInverse,
+  },
+  receiverIdleState: {
+    backgroundColor: theme.colors.surfaceAlt,
+    borderRadius: theme.radii.lg,
+    padding: theme.spacing.lg,
+    alignItems: 'center',
+  },
+  receiverIdleText: {
+    ...theme.typography.bodyMedium,
+    color: theme.colors.textSecondary,
+    textAlign: 'center',
+  },
+  progressContainer: {
+    marginTop: theme.spacing.lg,
+    backgroundColor: theme.colors.surfaceAlt,
+    borderRadius: theme.radii.md,
+    padding: theme.spacing.md,
+  },
+  progressHeaderRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: theme.spacing.xs,
+  },
+  progressFileName: {
+    ...theme.typography.labelMedium,
+    color: theme.colors.textPrimary,
+    flex: 1,
+    marginRight: theme.spacing.sm,
+  },
+  progressPercentText: {
+    ...theme.typography.labelMedium,
+    color: theme.colors.primary,
+  },
+  progressBarTrack: {
+    height: 8,
+    backgroundColor: theme.colors.surfaceMuted,
+    borderRadius: 4,
+    overflow: 'hidden',
+  },
+  progressBarFill: {
+    height: '100%',
+    backgroundColor: theme.colors.primary,
+  },
+  progressFooterRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginTop: theme.spacing.xs,
+  },
+  progressBytesText: {
+    ...theme.typography.bodySmall,
+    color: theme.colors.textSecondary,
+  },
+  cancelText: {
+    ...theme.typography.labelSmall,
+    color: theme.colors.accentRed,
+  },
+  recentSection: {
+    marginTop: theme.spacing.sm,
+  },
+  recentHeaderRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: theme.spacing.md,
+  },
+  recentSectionTitle: {
+    ...theme.typography.titleSmall,
+    color: theme.colors.textPrimary,
+  },
+  seeAllText: {
+    ...theme.typography.labelSmall,
+    color: theme.colors.primary,
+  },
+  recentEmptyBox: {
+    backgroundColor: theme.colors.surface,
+    borderRadius: theme.radii.lg,
+    padding: theme.spacing.xl,
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+  },
+  recentEmptyText: {
+    ...theme.typography.bodyMedium,
+    color: theme.colors.textTertiary,
+  },
+  recentItemCard: {
+    backgroundColor: theme.colors.surface,
+    borderRadius: theme.radii.lg,
+    padding: theme.spacing.md,
+    marginBottom: theme.spacing.sm,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    ...theme.shadows.card,
+  },
+  recentItemLeft: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    flex: 1,
+  },
+  recentIconCircle: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginRight: theme.spacing.md,
+  },
+  badgeGreen: {
+    backgroundColor: theme.colors.accentGreenLight,
+  },
+  badgeRed: {
+    backgroundColor: theme.colors.accentRedLight,
+  },
+  recentItemName: {
+    ...theme.typography.bodyMedium,
+    fontWeight: '600',
+    color: theme.colors.textPrimary,
+  },
+  recentItemMeta: {
+    ...theme.typography.bodySmall,
+    color: theme.colors.textSecondary,
+    marginTop: 2,
+  },
+  saveChip: {
+    backgroundColor: theme.colors.primaryLight,
+    paddingHorizontal: theme.spacing.md,
+    paddingVertical: theme.spacing.xs,
+    borderRadius: theme.radii.sm,
+    minHeight: 32,
     justifyContent: 'center',
   },
-  buttonGreen: {
-    backgroundColor: '#238636',
+  savedChip: {
+    backgroundColor: theme.colors.accentGreenLight,
   },
-  buttonBlue: {
-    backgroundColor: '#1f6feb',
+  saveChipText: {
+    ...theme.typography.labelSmall,
+    color: theme.colors.primary,
   },
-  buttonRed: {
-    backgroundColor: '#da3633',
+  savedChipText: {
+    color: theme.colors.accentGreen,
   },
-  buttonText: {
-    color: '#ffffff',
-    fontSize: 14,
-    fontWeight: '600',
-  },
-  input: {
-    backgroundColor: '#161b22',
-    borderColor: '#30363d',
-    borderWidth: 1,
-    borderRadius: 8,
-    padding: 12,
-    color: '#f0f6fc',
-    fontSize: 18,
-    textAlign: 'center',
-    letterSpacing: 4,
-    marginBottom: 12,
-  },
-  codeDisplayBox: {
-    alignItems: 'center',
-    paddingVertical: 12,
-  },
-  codeBig: {
-    fontSize: 32,
-    fontWeight: '800',
-    color: '#58a6ff',
-    letterSpacing: 6,
-  },
-  codeExpiry: {
-    color: '#8b949e',
-    fontSize: 12,
-    marginTop: 6,
-  },
-  requestAlert: {
-    backgroundColor: 'rgba(56, 139, 253, 0.15)',
-    borderColor: '#388bfd',
-    borderWidth: 1,
-    borderRadius: 8,
-    padding: 14,
-    marginBottom: 16,
-  },
-  requestAlertTitle: {
-    color: '#58a6ff',
-    fontWeight: '700',
-    fontSize: 14,
-    marginBottom: 4,
-  },
-  requestAlertText: {
-    color: '#c9d1d9',
-    fontSize: 13,
-    marginBottom: 12,
-  },
-  requestButtonRow: {
+  loadingRow: {
     flexDirection: 'row',
-    gap: 10,
-  },
-  qrContainer: {
     alignItems: 'center',
-    paddingVertical: 12,
-    backgroundColor: '#ffffff',
-    borderRadius: 12,
-  },
-  qrCodeLabel: {
-    color: '#0d1117',
-    fontSize: 16,
-    fontWeight: '700',
-    marginTop: 10,
-    letterSpacing: 2,
+    gap: 8,
   },
   modalRoot: {
     flex: 1,
@@ -1310,32 +1626,31 @@ const styles = StyleSheet.create({
   },
   scannerOverlay: {
     flex: 1,
-    backgroundColor: 'rgba(0,0,0,0.5)',
     justifyContent: 'space-between',
-    alignItems: 'center',
-    paddingVertical: 50,
+    padding: theme.spacing.xxxl,
+    backgroundColor: 'rgba(0,0,0,0.4)',
   },
   scannerHeader: {
     flexDirection: 'row',
     justifyContent: 'space-between',
-    width: '100%',
-    paddingHorizontal: 20,
     alignItems: 'center',
+    marginTop: theme.spacing.xxl,
   },
   scannerTitle: {
-    color: '#ffffff',
     fontSize: 18,
     fontWeight: '700',
+    color: '#fff',
   },
   closeButton: {
+    paddingHorizontal: theme.spacing.md,
+    paddingVertical: theme.spacing.xs,
     backgroundColor: 'rgba(255,255,255,0.2)',
-    paddingVertical: 6,
-    paddingHorizontal: 12,
-    borderRadius: 6,
+    borderRadius: theme.radii.sm,
+    minHeight: 36,
+    justifyContent: 'center',
   },
   closeButtonText: {
-    color: '#ffffff',
-    fontSize: 14,
+    color: '#fff',
     fontWeight: '600',
   },
   scannerTarget: {
@@ -1343,13 +1658,14 @@ const styles = StyleSheet.create({
     height: 240,
     borderWidth: 2,
     borderColor: '#58a6ff',
-    borderRadius: 16,
+    borderRadius: theme.radii.xl,
+    alignSelf: 'center',
     backgroundColor: 'transparent',
   },
   scannerHint: {
-    color: '#ffffff',
-    fontSize: 14,
+    color: '#fff',
     textAlign: 'center',
-    paddingHorizontal: 40,
+    fontSize: 13,
+    marginBottom: theme.spacing.xl,
   },
 });
