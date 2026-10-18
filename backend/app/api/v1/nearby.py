@@ -7,10 +7,8 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import Any
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
-from sqlalchemy import select
 
 from app.core.config import get_settings
 from app.core.security import decode_device_token, generate_pairing_code
@@ -23,6 +21,7 @@ logger = logging.getLogger(__name__)
 # Discovery TTL in seconds (60-90s requirement)
 PRESENCE_TTL_SECONDS = 90.0
 
+
 @dataclass
 class NearbyPeer:
     ephemeral_id: str
@@ -33,6 +32,7 @@ class NearbyPeer:
     websocket: WebSocket
     last_seen: float = field(default_factory=time.time)
 
+
 @dataclass
 class PendingPairRequest:
     request_id: str
@@ -41,6 +41,7 @@ class PendingPairRequest:
     target_ephemeral_id: str
     target_device_id: str
     created_at: float = field(default_factory=time.time)
+
 
 class NearbyDiscoveryManager:
     """
@@ -242,7 +243,12 @@ class NearbyDiscoveryManager:
         async with self._lock:
             req = self._pending_requests.pop(request_id, None)
             if not req:
-                await websocket.send_json({"type": "error", "payload": {"code": "INVALID_REQUEST_ID", "message": "Request expired or invalid"}})
+                await websocket.send_json(
+                    {
+                        "type": "error",
+                        "payload": {"code": "INVALID_REQUEST_ID", "message": "Request expired or invalid"},
+                    }
+                )
                 return None
 
             responder_eph = self._ws_to_ephemeral.get(websocket)
@@ -409,7 +415,12 @@ async def nearby_websocket_endpoint(websocket: WebSocket, token: str = Query(...
                 await websocket.send_json({"type": "pong"})
 
             else:
-                await websocket.send_json({"type": "error", "payload": {"code": "UNKNOWN_MESSAGE_TYPE", "message": f"Unknown message type: {msg_type}"}})
+                await websocket.send_json(
+                    {
+                        "type": "error",
+                        "payload": {"code": "UNKNOWN_MESSAGE_TYPE", "message": f"Unknown message type: {msg_type}"},
+                    }
+                )
 
     except WebSocketDisconnect:
         pass

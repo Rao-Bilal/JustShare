@@ -1,8 +1,6 @@
 import pytest
 from httpx import AsyncClient
-from starlette.websockets import WebSocketDisconnect
 
-from app.api.v1.nearby import discovery_manager
 from app.main import app
 
 

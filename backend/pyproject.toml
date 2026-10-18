@@ -33,6 +33,7 @@ pythonpath = ["."]
 [tool.ruff]
 line-length = 140
 target-version = "py311"
+extend-exclude = ["build", "dist"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
