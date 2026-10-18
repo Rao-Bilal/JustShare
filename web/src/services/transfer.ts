@@ -16,8 +16,7 @@ import {
   TransferProgress,
   TransferStartMessage,
 } from '../types';
-import { sha256File } from './crypto';
-import { RemoteDevLogger } from './devLogger';
+import { createStreamingHasher } from './crypto';
 import { MemoryTransferStorage } from './storage/memory';
 import { TransferStorage } from './storage/types';
 
@@ -277,52 +276,15 @@ export class FileSender {
           return;
         }
         const file = this.files[i];
-        const fileStartTime = performance.now();
         const totalChunks = file.size === 0 ? 0 : Math.ceil(file.size / CHUNK_SIZE);
         const fileId = `file_${i}_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
 
-        this.logger?.log('hash_started', {
-          transferId: this.transferId,
-          fileId,
-          fileName: file.name,
-          fileSize: file.size,
-          totalChunks,
-        });
-
-        this.updateProgress(i, 'verifying');
-
-        let lastProgressReportPercent = 0;
-        const hash = await sha256File(file, (processed, total) => {
-          if (total > 0 && this.logger) {
-            const pct = Math.floor((processed / total) * 100);
-            if (pct >= lastProgressReportPercent + 10 || pct === 100) {
-              lastProgressReportPercent = pct;
-              this.logger.log('hash_progress', {
-                transferId: this.transferId,
-                fileId,
-                fileName: file.name,
-                fileSize: file.size,
-                percent: pct,
-              });
-            }
-          }
-        });
-
-        if (this.cancelled || this.isPaused || this.abortedError) {
-          if (this.abortedError) throw this.abortedError;
-          return;
-        }
-
-        const hashElapsedMs = Math.round(performance.now() - fileStartTime);
-        this.hashes.set(fileId, hash);
-
-        this.logger?.log('hash_completed', {
-          transferId: this.transferId,
-          fileId,
-          fileName: file.name,
-          fileSize: file.size,
-          elapsedMs: hashElapsedMs,
-        });
+        // Immediate manifest creation: deferred streaming SHA-256 placeholder
+        // Hash will be computed incrementally on the fly while streaming chunks,
+        // and transmitted in FILE_END for final receiver verification.
+        const hash = file.size === 0
+          ? 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
+          : '0'.repeat(64);
 
         manifestFiles.push({
           id: fileId,
@@ -581,6 +543,7 @@ export class FileSender {
 
       console.log(`[TRANSFER][SEND] Transmitting ${chunksToSend.length}/${totalChunks} chunks for '${file.name}'`);
 
+      const fileHasher = await createStreamingHasher();
       let firstChunkLogged = false;
       let lastChunkLoggedIndex = -1;
 
@@ -594,6 +557,10 @@ export class FileSender {
         const end = Math.min(start + CHUNK_SIZE, file.size);
         const chunkBlob = file.slice(start, end);
         const chunkData = await chunkBlob.arrayBuffer();
+        const chunkUint8 = new Uint8Array(chunkData);
+
+        // Incremental streaming hash calculated directly while sending
+        fileHasher.update(chunkUint8);
 
         const header: ChunkHeader = {
           transferId: this.transferId,
@@ -614,7 +581,7 @@ export class FileSender {
         // header bytes
         payload.set(headerBytes, 4);
         // chunk data
-        payload.set(new Uint8Array(chunkData), 4 + headerBytes.length);
+        payload.set(chunkUint8, 4 + headerBytes.length);
 
         await sendChunkWithBackpressure(this.dc, payload.buffer);
 
@@ -660,11 +627,18 @@ export class FileSender {
         }
       }
 
-      console.log(`[TRANSFER][SEND] Sending FILE_END for file ${i + 1} (${file.name})`);
+      // Final sender hash computed dynamically across all sent chunks
+      const finalSenderHash = file.size === 0
+        ? 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
+        : fileHasher.digest().toLowerCase();
+      this.hashes.set(fileId, finalSenderHash);
+
+      console.log(`[TRANSFER][SEND] Sending FILE_END for file ${i + 1} (${file.name}) with final SHA-256 ${finalSenderHash}`);
       const fileEndMsg: FileEndMessage = {
         type: 'FILE_END',
         transferId: this.transferId,
         fileId,
+        sha256: finalSenderHash,
       };
       this.dc.send(JSON.stringify(fileEndMsg));
 
@@ -1065,7 +1039,7 @@ export class FileReceiver {
             if (!this.activeTransferId || msg.transferId !== this.activeTransferId) {
               throw new Error('FILE_END transferId mismatch');
             }
-            await this.handleFileEnd(msg.fileId);
+            await this.handleFileEnd(msg.fileId, msg.sha256);
             break;
           }
 
@@ -1183,7 +1157,7 @@ export class FileReceiver {
     }
   }
 
-  private async handleFileEnd(fileId: string) {
+  private async handleFileEnd(fileId: string, endSha256?: string) {
     const tFileEndStart = performance.now();
     console.log(`[TRANSFER][RECV][FILE_END] START fileId=${fileId}`);
     this.transitionTo('verifying');
@@ -1197,6 +1171,13 @@ export class FileReceiver {
     if (!manifestEntry) {
       throw new Error(`FILE_END received for unknown file ID '${fileId}'`);
     }
+
+    // Determine the expected SHA-256:
+    // If sender computed hash dynamically while streaming chunks, use endSha256 from FILE_END.
+    // Otherwise fallback to the manifest pre-computed sha256.
+    const expectedSha256 = (endSha256 && /^[a-f0-9]{64}$/i.test(endSha256))
+      ? endSha256.toLowerCase()
+      : manifestEntry.sha256.toLowerCase();
 
     console.log(`[TRANSFER][RECV][FILE_END] checking missing chunks`);
     console.log(`[TRANSFER][RECV][FILE_END] expectedChunks=${manifestEntry.totalChunks}`);
@@ -1239,7 +1220,7 @@ export class FileReceiver {
       const result = await this.storage.verifyAndFinalizeFile(
         this.activeTransferId,
         fileId,
-        manifestEntry.sha256,
+        expectedSha256,
         (processed, total) => {
           if (total > 0) {
             this.updateProgress('verifying');
@@ -1249,7 +1230,7 @@ export class FileReceiver {
 
       if (!result.match) {
         throw new Error(
-          `SHA-256 mismatch for file '${manifestEntry.name}' (calculated ${result.calculatedSha256}, expected ${manifestEntry.sha256})`
+          `SHA-256 mismatch for file '${manifestEntry.name}' (calculated ${result.calculatedSha256}, expected ${expectedSha256})`
         );
       }
 

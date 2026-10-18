@@ -1,2 +1,48 @@
-<!doctype html><html lang="en"><head><meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="referrer" content="no-referrer" /><title>JustShare</title></head><body><div id="root"></div><script type="module" src="/src/main.tsx"></script></body></html>
+<!doctype html>
+<html class="h-full" lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta content="width=device-width, initial-scale=1.0, viewport-fit=cover" name="viewport" />
+    <meta name="referrer" content="no-referrer" />
+    <title>JustShare — Send+ File Transfer</title>
+    <!-- Tailwind CSS CDN with forms and container queries -->
+    <script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+    <!-- Google Fonts: Instrument Serif & Plus Jakarta Sans -->
+    <link href="https://fonts.googleapis.com" rel="preconnect" />
+    <link crossorigin="" href="https://fonts.gstatic.com" rel="preconnect" />
+    <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&amp;family=Plus+Jakarta+Sans:wght@400;500;600;700&amp;display=swap" rel="stylesheet" />
+    <script data-purpose="tailwind-config">
+      tailwind.config = {
+        theme: {
+          extend: {
+            fontFamily: {
+              serif: ['"Instrument Serif"', 'Georgia', 'serif'],
+              sans: ['"Plus Jakarta Sans"', 'sans-serif'],
+            },
+            colors: {
+              brand: {
+                orange: '#f95721',
+                'orange-dark': '#e04511',
+                'orange-light': '#fff3ef',
+                charcoal: '#141416',
+                surface: '#F4F4F6',
+                card: '#FFFFFF',
+                border: '#E4E4E7',
+              }
+            },
+            boxShadow: {
+              'soft': '0 8px 30px rgba(0, 0, 0, 0.04)',
+              'float': '0 20px 40px -15px rgba(249, 87, 33, 0.25)',
+              'glass': '0 8px 32px 0 rgba(31, 38, 135, 0.07)',
+            }
+          }
+        }
+      }
+    </script>
+  </head>
+  <body class="font-sans text-neutral-800 antialiased flex flex-col justify-between selection:bg-brand-orange selection:text-white relative bg-grid-pattern min-h-screen">
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
 

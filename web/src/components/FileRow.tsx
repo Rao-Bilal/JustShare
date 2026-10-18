@@ -1,5 +1,6 @@
 import { formatBytes } from '../services/format';
 import { truncateMiddle } from '../services/errorMapper';
+import { getFileIconComponent } from './Icons';
 
 export interface FileRowProps {
   name: string;
@@ -21,9 +22,14 @@ export function FileRow({
 
   return (
     <div className="file-row">
-      <span className="file-row-name" title={fullPath}>
-        {displayTitle}
-      </span>
+      <div className="file-row-left">
+        <span className="file-row-icon" aria-hidden="true">
+          {getFileIconComponent(name, 18)}
+        </span>
+        <span className="file-row-name" title={fullPath}>
+          {displayTitle}
+        </span>
+      </div>
       <div className="file-row-meta">
         <span className="tabular-numbers">{formatBytes(size)}</span>
         {onRemove && (

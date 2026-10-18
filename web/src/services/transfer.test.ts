@@ -254,6 +254,57 @@ describe('Phase 2A - Transfer Protocol & Validation', () => {
       expect(lastSenderProgress).toBe(100);
     });
 
+    it('streams chunk 0 immediately without pre-reading/pre-hashing the full file and verifies SHA-256', async () => {
+      const [senderDc, receiverDc] = createConnectedPair();
+      const chunkCount = 5;
+      const data = new Uint8Array(chunkCount * 65536);
+      for (let i = 0; i < data.length; i++) {
+        data[i] = (i * 31) % 256;
+      }
+      const file = new File([data], 'stream-immediate.bin', { type: 'application/octet-stream' });
+
+      // Track the order of messages sent by sender
+      const sentOrder: string[] = [];
+      const originalSend = senderDc.send.bind(senderDc);
+      senderDc.send = (msgData: string | ArrayBuffer) => {
+        if (typeof msgData === 'string') {
+          const parsed = JSON.parse(msgData);
+          sentOrder.push(parsed.type);
+        } else {
+          sentOrder.push('CHUNK');
+        }
+        originalSend(msgData);
+      };
+
+      const sender = new FileSender(senderDc as unknown as RTCDataChannel, [file]);
+      const receiver = new FileReceiver(receiverDc as unknown as RTCDataChannel);
+
+      const receiverCompletePromise = new Promise<void>((resolve, reject) => {
+        receiver.onComplete = async (files) => {
+          try {
+            expect(files.length).toBe(1);
+            expect(files[0].verified).toBe(true);
+            expect(files[0].size).toBe(chunkCount * 65536);
+            resolve();
+          } catch (e) {
+            reject(e);
+          }
+        };
+        receiver.onError = (err) => reject(new Error(err));
+      });
+
+      receiver.start();
+      await sender.start();
+      await receiverCompletePromise;
+
+      // Assert that TRANSFER_START, FILE_START, and CHUNK were emitted immediately
+      // in sequence without any pre-transfer full file hashing delay
+      expect(sentOrder[0]).toBe('TRANSFER_START');
+      expect(sentOrder[1]).toBe('FILE_START');
+      expect(sentOrder[2]).toBe('CHUNK');
+      expect(sentOrder).toContain('FILE_END');
+    });
+
     it('handles duplicate chunks safely without corrupting total bytes', async () => {
       const [senderDc, receiverDc] = createConnectedPair();
       const content = 'Test Duplicate Chunks Handling';

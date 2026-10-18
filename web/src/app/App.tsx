@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { createSession, getSession, joinSession, updateSessionState } from '../services/api';
-import { getOrCreateDevice, supportsDirectoryUpload } from '../services/device';
-import { formatBytes, formatEta, formatSpeed } from '../services/format';
+import { formatBytes } from '../services/format';
 import { SignalingClient } from '../services/signaling';
 import { createTransferStorage, TransferStorage } from '../services/storage';
 import { FileReceiver, FileSender } from '../services/transfer';
@@ -9,10 +8,9 @@ import { WebRTCConnection } from '../services/webrtc';
 import { AppScreen, DeviceInfo, FileInfo, SessionInfo, SessionState, TransferProgress } from '../types';
 import { decidePeerLeftAction } from '../services/peerLeft';
 import { determineInitialUrlAction } from '../services/pairingUrl';
-import { mapTechnicalError, formatDuration, truncateMiddle } from '../services/errorMapper';
+import { mapTechnicalError } from '../services/errorMapper';
 import { COPY } from '../copy';
 
-import { QRCodeDisplay } from '../components/QRCodeDisplay';
 import { NearbyDiscovery } from '../components/NearbyDiscovery';
 import { QrScanner } from '../components/QrScanner';
 import { Button } from '../components/Button';
@@ -20,10 +18,14 @@ import { Card } from '../components/Card';
 import { Stepper } from '../components/Stepper';
 import { CodeInput } from '../components/CodeInput';
 import { FileRow } from '../components/FileRow';
-import { ProgressBar } from '../components/ProgressBar';
-import { StatusBadge } from '../components/StatusBadge';
-import { ErrorPanel } from '../components/ErrorPanel';
 import { ConfirmDialog } from '../components/ConfirmDialog';
+import { DeviceEditModal } from '../components/DeviceEditModal';
+import { ShareManagementModal } from '../components/ShareManagementModal';
+import { FileManagerDashboard, HistoryItem } from '../components/FileManagerDashboard';
+import { renameDevice } from '../services/device';
+
+import { TransferScreen } from '../components/TransferScreen';
+import { mapScreenToMainView } from '../services/transferState';
 
 export function App() {
   const [device, setDevice] = useState<{ device_id: string; display_name: string; token: string } | null>(null);
@@ -41,18 +43,29 @@ export function App() {
   const [completedFiles, setCompletedFiles] = useState<{ name: string; blob: Blob; verified: boolean }[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [receiveMode, setReceiveMode] = useState<'code' | 'qr' | 'nearby'>('code');
+  const [mobilePanel, setMobilePanel] = useState<'send' | 'receive'>('send');
+  const [isTechDetailsOpen, setIsTechDetailsOpen] = useState(false);
+  const [nearbyNotice, setNearbyNotice] = useState<string | null>(null);
+
+  // Device Edit Modal state
+  const [isEditNameOpen, setIsEditNameOpen] = useState(false);
 
   // Cancel confirmation & countdown states
   const [showCancelConfirm, setShowCancelConfirm] = useState(false);
-  const [copiedCode, setCopiedCode] = useState(false);
   const [transferDurationSecs, setTransferDurationSecs] = useState<number | null>(null);
   const transferStartTimeRef = useRef<number | null>(null);
 
   // Expiration countdown
   const [expirySecondsLeft, setExpirySecondsLeft] = useState<number | null>(null);
 
-  // Storage space warning
+  // Storage space warning & quota
   const [storageWarning, setStorageWarning] = useState<string | null>(null);
+  const [storageEstimate, setStorageEstimate] = useState<{ used: number; quota: number } | null>(null);
+
+  // Header Nav Tab & File Manager Dashboard
+  const [activeHeaderTab, setActiveHeaderTab] = useState<'transfer' | 'dashboard'>('transfer');
+  const [historyItems, setHistoryItems] = useState<HistoryItem[]>([]);
+  const [isHeroDragging, setIsHeroDragging] = useState(false);
 
   const sigRef = useRef<SignalingClient | null>(null);
   const rtcRef = useRef<WebRTCConnection | null>(null);
@@ -127,6 +140,14 @@ export function App() {
         console.warn('Failed to initialize transfer storage:', err);
       });
 
+    if (navigator.storage && navigator.storage.estimate) {
+      navigator.storage.estimate().then((est) => {
+        if (est.quota !== undefined && est.usage !== undefined) {
+          setStorageEstimate({ used: est.usage, quota: est.quota });
+        }
+      }).catch(() => {});
+    }
+
     const initialUrlAction = determineInitialUrlAction(window.location.hash);
     if (initialUrlAction.action !== 'none') {
       window.history.replaceState(null, document.title, window.location.pathname + window.location.search);
@@ -195,6 +216,11 @@ export function App() {
     setTransferDurationSecs(null);
     transferStartTimeRef.current = null;
     setStorageWarning(null);
+  };
+
+  const handleSaveDeviceName = async (newName: string) => {
+    const updated = await renameDevice(newName);
+    setDeviceState(updated);
   };
 
   const handlePeerLeft = () => {
@@ -378,6 +404,17 @@ export function App() {
             if (transferStartTimeRef.current) {
               setTransferDurationSecs((Date.now() - transferStartTimeRef.current) / 1000);
             }
+            // Record in dashboard history
+            const newHistoryEntries: HistoryItem[] = curFiles.map((file, idx) => ({
+              id: `sent_${Date.now()}_${idx}`,
+              name: file.webkitRelativePath || file.name,
+              size: file.size,
+              direction: 'sent',
+              timestamp: Date.now(),
+              peerName: peerDeviceRef.current?.display_name,
+              verified: true,
+            }));
+            setHistoryItems((prev) => [...newHistoryEntries, ...prev]);
             setScreenState('completed');
           };
           sender.onError = (e) => {
@@ -604,6 +641,18 @@ export function App() {
           setTransferDurationSecs((Date.now() - transferStartTimeRef.current) / 1000);
         }
         setCompletedFiles(files);
+        // Record in dashboard history
+        const newHistoryEntries: HistoryItem[] = files.map((file, idx) => ({
+          id: `recv_${Date.now()}_${idx}`,
+          name: file.name,
+          size: file.blob.size,
+          direction: 'received',
+          timestamp: Date.now(),
+          peerName: peerDeviceRef.current?.display_name,
+          verified: file.verified,
+          blob: file.blob,
+        }));
+        setHistoryItems((prev) => [...newHistoryEntries, ...prev]);
         setScreenState('completed');
         updateSessionState(curDevice.token, curSession.session_id, 'COMPLETED').catch(() => {});
       };
@@ -654,32 +703,51 @@ export function App() {
     setScreenState('cancelled');
   };
 
-  const handleCopyPairingCode = async () => {
-    if (!session?.pairing_code) return;
-    try {
-      await navigator.clipboard.writeText(session.pairing_code);
-      setCopiedCode(true);
-      setTimeout(() => setCopiedCode(false), 2000);
-    } catch {
-      // ignore
-    }
-  };
-
   const totalStagedSize = selectedFiles.reduce((acc, f) => acc + f.size, 0);
 
   return (
     <>
-      <header className="app-header">
-        <button type="button" className="brand-button" onClick={goHome} aria-label="JustShare Home">
-          <span>{COPY.header.brand}</span>
-        </button>
-
-        <div className="header-right">
-          {device && (
-            <div className="device-chip-static" title={device.display_name}>
-              <span className="device-chip-dot" aria-hidden="true" />
-              <span>{device.display_name}</span>
+      {/* BEGIN: MainHeader */}
+      <header className="w-full max-w-[1440px] mx-auto px-4 sm:px-6 lg:px-8 pt-4 sm:pt-6 pb-2 flex items-center justify-between" data-purpose="site-navigation">
+        {/* Brand Logo */}
+        <div className="flex items-center gap-3">
+          <button type="button" className="flex items-center gap-2 group focus:outline-none bg-transparent border-0 cursor-pointer p-0 text-left" onClick={goHome}>
+            <div className="w-7 h-7 rounded-lg bg-brand-charcoal text-white flex items-center justify-center font-bold text-sm tracking-tight shadow-sm group-hover:scale-105 transition-transform">
+              JS
             </div>
+            <span className="text-xl font-bold tracking-tight text-neutral-900">JustShare</span>
+          </button>
+        </div>
+
+        {/* Navigation Links (Desktop) */}
+        <nav className="hidden md:flex items-center gap-8 text-sm font-medium text-neutral-600">
+          <a className="hover:text-neutral-900 transition-colors text-neutral-600 no-underline" href="#how-it-works">
+            {COPY.home.howItWorksTitle}
+          </a>
+        </nav>
+
+        {/* Right Device Identity Pill */}
+        <div className="flex items-center gap-3">
+          {device && (
+            <button
+              type="button"
+              className="frosted-glass px-3.5 py-1.5 rounded-full shadow-sm flex items-center gap-2 text-xs font-medium text-neutral-700 hover:border-neutral-300 transition-all cursor-pointer group border border-neutral-200"
+              title="Click to rename this device"
+              onClick={() => setIsEditNameOpen(true)}
+              aria-label={`This device: ${device.display_name}. Click to rename.`}
+            >
+              <span className="relative flex h-2 w-2">
+                <span className="animate-ping-subtle absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
+              </span>
+              <span>{COPY.header.thisDevice}:</span>
+              <span className="font-semibold text-neutral-900 group-hover:text-brand-orange transition-colors">
+                {device.display_name}
+              </span>
+              <svg className="w-3.5 h-3.5 text-neutral-400 group-hover:rotate-180 transition-transform duration-200" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path d="M19 9l-7 7-7-7" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2"></path>
+              </svg>
+            </button>
           )}
           {screen !== 'home' && (
             <Button variant="link" onClick={goHome}>
@@ -688,6 +756,7 @@ export function App() {
           )}
         </div>
       </header>
+      {/* END: MainHeader */}
 
       <main className="app-main">
         {/* Hidden file pickers */}
@@ -720,137 +789,384 @@ export function App() {
         )}
 
         {/* =========================================================================
-            SCREEN 1: HOME
+            DASHBOARD / FILE MANAGER VIEW (When tab selected)
             ========================================================================= */}
-        {screen === 'home' && (
+        {activeHeaderTab === 'dashboard' ? (
           <div className="screen-wrapper">
-            <div className="home-hero">
-              <h1>{COPY.home.title}</h1>
-              <p className="home-hero-subtitle">{COPY.home.subtitle}</p>
-            </div>
-
-            <div className="home-action-panels">
-              {/* PRIMARY ACTION: Send */}
-              <Card className="primary-send-panel">
-                <h2 className="card-title">{COPY.home.sendCardTitle}</h2>
-                <p className="card-desc">{COPY.home.sendCardDesc}</p>
-                <Button variant="primary" onClick={startSending}>
-                  {COPY.home.sendButton}
-                </Button>
-              </Card>
-
-              {/* SECONDARY ACTION: Receive */}
-              <Card secondary>
-                <h3 className="card-title">{COPY.home.receiveCardTitle}</h3>
-                <p className="card-desc">{COPY.home.receiveCardDesc}</p>
-                <Button variant="secondary" onClick={() => startReceiving('code')}>
-                  {COPY.home.receiveButton}
-                </Button>
-              </Card>
-
-              {/* NEARBY DISCOVERY ACTION */}
-              <Card secondary>
-                <h3 className="card-title">{COPY.home.nearbyTitle}</h3>
-                <p className="card-desc">{COPY.home.nearbyDesc}</p>
-                <Button variant="secondary" onClick={() => startReceiving('nearby')}>
-                  {COPY.home.nearbyButton}
-                </Button>
-              </Card>
-            </div>
-
-            {/* HOW IT WORKS (3 numbered steps with UI concepts) */}
-            <section className="how-it-works-section" aria-labelledby="how-it-works-title">
-              <h3 id="how-it-works-title">{COPY.home.howItWorksTitle}</h3>
-              <div className="step-row">
-                <span className="step-num">1</span>
-                <div className="step-content">
-                  <h4>{COPY.home.step1Title}</h4>
-                  <p>{COPY.home.step1Desc}</p>
-                </div>
-              </div>
-              <div className="step-row">
-                <span className="step-num">2</span>
-                <div className="step-content">
-                  <h4>{COPY.home.step2Title}</h4>
-                  <p>{COPY.home.step2Desc}</p>
-                </div>
-              </div>
-              <div className="step-row">
-                <span className="step-num">3</span>
-                <div className="step-content">
-                  <h4>{COPY.home.step3Title}</h4>
-                  <p>{COPY.home.step3Desc}</p>
-                </div>
-              </div>
-            </section>
-
-            {/* VERIFIABLE PROOF FACTS */}
-            <div className="proof-list">
-              <div className="proof-item">
-                <span className="proof-bullet">✓</span>
-                <span>{COPY.home.proofDirect}</span>
-              </div>
-              <div className="proof-item">
-                <span className="proof-bullet">✓</span>
-                <span>{COPY.home.proofHash}</span>
-              </div>
-              <div className="proof-item">
-                <span className="proof-bullet">✓</span>
-                <span>{COPY.home.proofNoAccount}</span>
-              </div>
-            </div>
+            <FileManagerDashboard
+              history={historyItems}
+              onClearHistory={() => setHistoryItems([])}
+              onSendNew={() => {
+                setActiveHeaderTab('transfer');
+                startSending();
+              }}
+              onReceiveNew={() => {
+                setActiveHeaderTab('transfer');
+                startReceiving('code');
+              }}
+              storageEstimate={storageEstimate}
+            />
           </div>
-        )}
-
-        {/* =========================================================================
-            SCREEN 2: SEND (Waiting or Paired)
-            ========================================================================= */}
-        {screen === 'send' && session && (
-          <div className="screen-wrapper">
-            <Stepper currentStep={peerDevice ? 2 : 1} />
-
-            {!peerDevice ? (
-              /* State 2A: Waiting for receiver */
-              <Card className="pairing-container">
-                <h2>{COPY.send.waitingHeadline}</h2>
-                <p>{COPY.send.waitingInstruction}</p>
-
-                <div className="pairing-code-large">
-                  {session.pairing_code.split('').map((d, i) => (
-                    <div key={i} className="code-box-display">
-                      {d}
+        ) : (
+          <>
+            {/* =========================================================================
+                SCREEN 1: HOME (Send+ Dual-Zone Workspace + Vermilion Spotlight Card)
+                ========================================================================= */}
+            {screen === 'home' && (
+              <div className="w-full">
+                {/* Top Headline Section */}
+                <div className="mb-4 sm:mb-6 flex flex-col md:flex-row md:items-end justify-between gap-3">
+                  <div>
+                    <div className="flex items-baseline gap-2">
+                      <h1 className="text-5xl sm:text-6xl lg:text-7xl font-serif tracking-tight text-neutral-950 font-normal leading-none select-none">
+                        Send<span className="text-3xl md:text-4xl text-neutral-400 font-sans font-light align-super ml-0.5">+</span>
+                      </h1>
+                      <span className="text-neutral-500 text-sm hidden sm:inline-block ml-3 font-normal max-w-sm">
+                        {COPY.home.tagline}
+                      </span>
                     </div>
-                  ))}
+                  </div>
+                  {/* Mobile-only Segmented Control (Actually switches panels on <768px) */}
+                  <div className="flex p-1 bg-neutral-200/70 rounded-xl max-w-fit md:hidden text-xs font-semibold">
+                    <button
+                      className={`px-4 py-2 rounded-lg border-0 cursor-pointer transition-all ${
+                        mobilePanel === 'send'
+                          ? 'bg-white shadow-sm text-neutral-900 font-bold'
+                          : 'bg-transparent text-neutral-600'
+                      }`}
+                      type="button"
+                      onClick={() => setMobilePanel('send')}
+                    >
+                      {COPY.home.sendTab}
+                    </button>
+                    <button
+                      className={`px-4 py-2 rounded-lg border-0 cursor-pointer transition-all ${
+                        mobilePanel === 'receive'
+                          ? 'bg-white shadow-sm text-neutral-900 font-bold'
+                          : 'bg-transparent text-neutral-600'
+                      }`}
+                      type="button"
+                      onClick={() => setMobilePanel('receive')}
+                    >
+                      {COPY.home.receiveTab}
+                    </button>
+                  </div>
                 </div>
 
-                <Button variant="secondary" onClick={handleCopyPairingCode}>
-                  {copiedCode ? COPY.send.codeCopied : COPY.send.copyCode}
-                </Button>
+                {/* Primary Layout Grid: Split Transfer Panel + Spotlight Card */}
+                <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 sm:gap-6 items-stretch">
+                  {/* LEFT & CENTER: Structured Dual-Zone Workspace */}
+                  <div className="lg:col-span-7 flex flex-col">
+                    {/* Master Glass Card */}
+                    <div className="frosted-glass rounded-3xl p-5 sm:p-7 shadow-glass border border-white/90 relative overflow-hidden flex flex-col justify-between h-full">
+                      {/* Upper Action Split */}
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-6 lg:gap-7 relative">
+                        {/* ZONE 1: SEND FILES (Visible on desktop/tablet, or on mobile when mobilePanel === 'send') */}
+                        <section
+                          className={`flex flex-col justify-between ${
+                            mobilePanel === 'receive' ? 'hidden md:flex' : 'flex'
+                          }`}
+                          data-purpose="send-action-zone"
+                        >
+                          <div>
+                            {/* Zone Header */}
+                            <div className="flex items-center justify-between mb-3">
+                              <div className="flex items-center gap-2">
+                                <span className="w-2 h-2 rounded-full bg-brand-orange"></span>
+                                <h2 className="text-base font-bold text-neutral-900 tracking-tight">
+                                  {COPY.home.sendCardTitle}
+                                </h2>
+                              </div>
+                            </div>
 
-                <div className="qr-box-container">
-                  <QRCodeDisplay pairingCode={session.pairing_code} />
-                </div>
+                            {/* Drag & Drop Zone Box */}
+                            <div
+                              className={`border-2 border-dashed rounded-2xl p-5 text-center cursor-pointer group flex flex-col items-center justify-center min-h-[145px] transition-all ${
+                                isHeroDragging
+                                  ? 'border-brand-orange bg-orange-50/60'
+                                  : 'border-neutral-300 hover:border-brand-orange/80 bg-white/50 hover:bg-orange-50/30'
+                              }`}
+                              id="drop-zone"
+                              tabIndex={0}
+                              role="button"
+                              aria-label="Drop files here or click to browse"
+                              onClick={() => fileInputRef.current?.click()}
+                              onDragOver={(e) => {
+                                e.preventDefault();
+                                setIsHeroDragging(true);
+                              }}
+                              onDragLeave={() => setIsHeroDragging(false)}
+                              onDrop={(e) => {
+                                e.preventDefault();
+                                setIsHeroDragging(false);
+                                if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+                                  handleFileSelect(e.dataTransfer.files);
+                                  startSending();
+                                }
+                              }}
+                              onKeyDown={(e) => {
+                                if (e.key === 'Enter' || e.key === ' ') {
+                                  e.preventDefault();
+                                  fileInputRef.current?.click();
+                                }
+                              }}
+                            >
+                              <div className="w-10 h-10 rounded-full bg-neutral-100 group-hover:bg-brand-orange/10 flex items-center justify-center text-neutral-600 group-hover:text-brand-orange transition-colors mb-2">
+                                <svg className="w-5 h-5 transition-transform group-hover:-translate-y-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                  <path d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2"></path>
+                                </svg>
+                              </div>
+                              <p className="text-sm font-semibold text-neutral-800 group-hover:text-brand-orange transition-colors">
+                                {COPY.home.dropPrompt}
+                              </p>
+                              <p className="text-xs text-neutral-600 mt-0.5">{COPY.home.dropSub}</p>
+                            </div>
 
-                <div className="expiry-text">
-                  {expirySecondsLeft !== null && expirySecondsLeft > 0 ? (
-                    COPY.send.expiresIn(expirySecondsLeft)
-                  ) : expirySecondsLeft === 0 ? (
-                    <div>
-                      <span>{COPY.send.codeExpired} </span>
-                      <Button variant="link" onClick={startSending}>
-                        {COPY.send.generateNewCode}
-                      </Button>
+                            {/* Action Button Group */}
+                            <div className="grid grid-cols-2 gap-2 mt-3">
+                              <button
+                                className="w-full bg-brand-charcoal hover:bg-neutral-800 active:scale-[0.98] text-white text-xs font-semibold py-2.5 px-3 rounded-xl transition-all shadow-sm flex items-center justify-center gap-1.5 border-0 cursor-pointer min-h-[44px]"
+                                onClick={() => fileInputRef.current?.click()}
+                                type="button"
+                              >
+                                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                  <path d="M12 4v16m8-8H4" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2"></path>
+                                </svg>
+                                {COPY.home.chooseFilesBtn}
+                              </button>
+                              {supportsDirectoryUpload() ? (
+                                <button
+                                  className="w-full bg-white hover:bg-neutral-50 active:scale-[0.98] border border-neutral-300 text-neutral-700 text-xs font-semibold py-2.5 px-3 rounded-xl transition-all flex items-center justify-center gap-1.5 cursor-pointer min-h-[44px]"
+                                  onClick={() => folderInputRef.current?.click()}
+                                  type="button"
+                                >
+                                  <svg className="w-3.5 h-3.5 text-neutral-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2"></path>
+                                  </svg>
+                                  {COPY.home.chooseFolderBtn}
+                                </button>
+                              ) : (
+                                <button
+                                  className="w-full bg-white hover:bg-neutral-50 active:scale-[0.98] border border-neutral-300 text-neutral-700 text-xs font-semibold py-2.5 px-3 rounded-xl transition-all flex items-center justify-center gap-1.5 cursor-pointer min-h-[44px]"
+                                  onClick={startSending}
+                                  type="button"
+                                >
+                                  {COPY.home.startSessionBtn}
+                                </button>
+                              )}
+                            </div>
+                          </div>
+                        </section>
+
+                        {/* Vertical Separator Divider (Visible on desktop/tablet) */}
+                        <div className="hidden md:block absolute left-1/2 top-1 bottom-1 w-[1px] bg-gradient-to-b from-transparent via-neutral-200 to-transparent"></div>
+
+                        {/* ZONE 2: RECEIVE FILES (Visible on desktop/tablet, or on mobile when mobilePanel === 'receive') */}
+                        <section
+                          className={`flex flex-col justify-between pt-4 md:pt-0 border-t md:border-t-0 border-neutral-200/80 ${
+                            mobilePanel === 'send' ? 'hidden md:flex' : 'flex'
+                          }`}
+                          data-purpose="receive-action-zone"
+                        >
+                          <div>
+                            {/* Zone Header */}
+                            <div className="flex items-center justify-between mb-3">
+                              <div className="flex items-center gap-2">
+                                <span className="w-2 h-2 rounded-full bg-emerald-500"></span>
+                                <h2 className="text-base font-bold text-neutral-900 tracking-tight">
+                                  {COPY.home.receiveCardTitle}
+                                </h2>
+                              </div>
+                            </div>
+
+                            <label className="block text-xs font-medium text-neutral-600 mb-2">
+                              {COPY.home.enterCodeLabel}
+                            </label>
+
+                            {/* Code Input Display Container */}
+                            <div className="relative mb-3">
+                              <CodeInput
+                                value={pairingInput}
+                                onChange={(val) => {
+                                  setPairingInput(val);
+                                  setError(null);
+                                }}
+                                onSubmit={(code) => submitPairingCode(code)}
+                                disabled={joining}
+                                error={error ? mapTechnicalError(error).headline : null}
+                              />
+                            </div>
+
+                            {/* Action Button Group for Receiving */}
+                            <div className="flex flex-col gap-2">
+                              <button
+                                className="w-full bg-brand-charcoal hover:bg-neutral-800 active:scale-[0.98] text-white text-xs font-semibold py-2.5 px-4 rounded-xl transition-all shadow-sm flex items-center justify-center gap-2 border-0 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed min-h-[44px]"
+                                type="button"
+                                disabled={joining || pairingInput.length !== 6}
+                                onClick={() => submitPairingCode(pairingInput)}
+                              >
+                                <span>{joining ? COPY.home.connectingBtn : COPY.home.connectBtn}</span>
+                                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                  <path d="M14 5l7 7m0 0l-7 7m7-7H3" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2"></path>
+                                </svg>
+                              </button>
+                              <button
+                                className="w-full bg-white hover:bg-neutral-50 active:scale-[0.98] border border-neutral-300 text-neutral-700 text-xs font-semibold py-2 px-3 rounded-xl transition-all flex items-center justify-center gap-1.5 cursor-pointer min-h-[44px]"
+                                type="button"
+                                onClick={() => startReceiving('qr')}
+                              >
+                                <svg className="w-3.5 h-3.5 text-neutral-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                  <path d="M12 4v1m6 11h2m-6 0h-2v4m0-11v3m0 0h.01M12 12h4.01M16 20h4M4 12h4m12 0h.01M5 8h2a1 1 0 001-1V5a1 1 0 00-1-1H5a1 1 0 00-1 1v2a1 1 0 001 1zm12 0h2a1 1 0 001-1V5a1 1 0 00-1-1h-2a1 1 0 00-1 1v2a1 1 0 001 1zM5 20h2a1 1 0 001-1v-2a1 1 0 00-1-1H5a1 1 0 00-1 1v2a1 1 0 001 1z" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2"></path>
+                                </svg>
+                                <span>{COPY.home.scanQrBtn}</span>
+                              </button>
+                            </div>
+                          </div>
+                        </section>
+                      </div>
+
+                      {/* BOTTOM SECTION OF WORKSPACE: Nearby Devices Bar */}
+                      <div className="mt-6 pt-5 border-t border-neutral-200/90 flex flex-col sm:flex-row sm:items-center justify-between gap-3" data-purpose="nearby-device-discovery">
+                        <div className="flex items-center gap-2 text-xs font-semibold text-neutral-700">
+                          <span className="flex h-2 w-2 relative">
+                            <span className="animate-ping-subtle absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-75"></span>
+                            <span className="relative inline-flex rounded-full h-2 w-2 bg-blue-500"></span>
+                          </span>
+                          <span>{COPY.home.nearbyTitle}:</span>
+                        </div>
+                        {/* Discovered Devices / Direct Navigation */}
+                        <div className="flex flex-wrap items-center gap-2">
+                          <button
+                            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-white hover:bg-neutral-50 border border-neutral-300 text-xs font-medium text-neutral-800 transition-all shadow-sm hover:shadow active:scale-95 group cursor-pointer min-h-[44px]"
+                            type="button"
+                            onClick={() => {
+                              if (selectedFiles.length === 0) {
+                                setNearbyNotice(COPY.home.nearbyNeedFilesHint);
+                                setTimeout(() => setNearbyNotice(null), 4000);
+                              }
+                              startReceiving('nearby');
+                            }}
+                          >
+                            <span className="w-2 h-2 rounded-full bg-brand-orange ring-2 ring-orange-200"></span>
+                            <span>{COPY.home.nearbyBtn}</span>
+                            <span className="text-[11px] text-neutral-500 font-normal group-hover:text-neutral-700">Scan →</span>
+                          </button>
+                        </div>
+                      </div>
+                      {nearbyNotice && (
+                        <p className="text-xs text-neutral-600 mt-2 bg-neutral-100 p-2 rounded-lg" role="status">
+                          {nearbyNotice}
+                        </p>
+                      )}
                     </div>
-                  ) : null}
+                  </div>
+                  {/* END LEFT & CENTER */}
+
+                  {/* RIGHT COLUMN: Signature Orange Spotlight Card */}
+                  <div className="lg:col-span-5 flex flex-col">
+                    <div className="bg-gradient-to-br from-[#f85a23] to-[#e6460f] rounded-3xl p-5 sm:p-7 text-white shadow-float flex flex-col justify-between relative overflow-hidden h-full">
+                      {/* Ambient blur accents */}
+                      <div className="absolute -top-16 -right-16 w-48 h-48 bg-white/10 rounded-full blur-2xl pointer-events-none"></div>
+                      <div className="absolute -bottom-12 -left-12 w-48 h-48 bg-black/10 rounded-full blur-xl pointer-events-none"></div>
+
+                      <div className="relative z-10 flex flex-col justify-between h-full gap-4">
+                        <div>
+                          <h2 className="text-xl sm:text-2xl lg:text-3xl font-serif tracking-normal font-normal text-white leading-tight">
+                            {COPY.home.orangeCardHeadline}
+                          </h2>
+                          <p className="mt-2 text-sm text-white/90 leading-relaxed font-normal">
+                            {COPY.home.orangeCardDesc}
+                          </p>
+                        </div>
+
+                        <div className="pt-2">
+                          <a
+                            className="inline-flex items-center gap-1.5 text-xs text-white underline underline-offset-4 hover:text-white/80 font-medium cursor-pointer"
+                            href="#how-it-works"
+                          >
+                            <span>{COPY.home.orangeCardLearnMore}</span>
+                            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                              <path d="M19 9l-7 7-7-7" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2"></path>
+                            </svg>
+                          </a>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                  {/* END RIGHT COLUMN */}
                 </div>
 
-                <div style={{ marginTop: '16px' }}>
-                  <Button variant="link" onClick={goHome}>
-                    Cancel session
-                  </Button>
+                {/* HOW IT WORKS ANCHOR SECTION */}
+                <div id="how-it-works" className="mt-8 sm:mt-12 frosted-glass rounded-3xl p-5 sm:p-8 shadow-sm border border-white/80">
+                  <h3 className="text-xl font-bold text-neutral-900 mb-6">{COPY.home.howItWorksTitle}</h3>
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                    <div className="flex gap-4">
+                      <span className="w-8 h-8 rounded-full bg-brand-orange/10 text-brand-orange font-bold flex items-center justify-center shrink-0">1</span>
+                      <div>
+                        <h4 className="text-sm font-bold text-neutral-900 mb-1">{COPY.home.step1Title}</h4>
+                        <p className="text-xs text-neutral-600 leading-relaxed">{COPY.home.step1Desc}</p>
+                      </div>
+                    </div>
+                    <div className="flex gap-4">
+                      <span className="w-8 h-8 rounded-full bg-brand-orange/10 text-brand-orange font-bold flex items-center justify-center shrink-0">2</span>
+                      <div>
+                        <h4 className="text-sm font-bold text-neutral-900 mb-1">{COPY.home.step2Title}</h4>
+                        <p className="text-xs text-neutral-600 leading-relaxed">{COPY.home.step2Desc}</p>
+                      </div>
+                    </div>
+                    <div className="flex gap-4">
+                      <span className="w-8 h-8 rounded-full bg-brand-orange/10 text-brand-orange font-bold flex items-center justify-center shrink-0">3</span>
+                      <div>
+                        <h4 className="text-sm font-bold text-neutral-900 mb-1">{COPY.home.step3Title}</h4>
+                        <p className="text-xs text-neutral-600 leading-relaxed">{COPY.home.step3Desc}</p>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Collapsed Technical Details Section */}
+                  <div className="mt-6 pt-4 border-t border-neutral-200/80">
+                    <button
+                      type="button"
+                      className="text-xs font-semibold text-neutral-700 hover:text-neutral-950 flex items-center gap-1.5 bg-transparent border-0 cursor-pointer p-0"
+                      onClick={() => setIsTechDetailsOpen(!isTechDetailsOpen)}
+                      aria-expanded={isTechDetailsOpen}
+                    >
+                      <svg
+                        className={`w-3.5 h-3.5 transition-transform ${isTechDetailsOpen ? 'rotate-90' : ''}`}
+                        fill="none"
+                        stroke="currentColor"
+                        viewBox="0 0 24 24"
+                      >
+                        <path d="M9 5l7 7-7 7" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2"></path>
+                      </svg>
+                      <span>{COPY.home.techDetailsToggle}</span>
+                    </button>
+                    {isTechDetailsOpen && (
+                      <p className="text-xs text-neutral-600 mt-2 leading-relaxed max-w-2xl bg-neutral-100/70 p-3 rounded-xl">
+                        {COPY.home.techDetailsDesc}
+                      </p>
+                    )}
+                  </div>
                 </div>
-              </Card>
-            ) : (
+              </div>
+            )}
+
+            {/* =========================================================================
+                SCREEN 2: SEND (Waiting or Paired)
+                ========================================================================= */}
+            {screen === 'send' && session && (
+              <div className="screen-wrapper">
+                <Stepper currentStep={peerDevice ? 2 : 1} />
+
+                {!peerDevice ? (
+                  /* State 2A: Waiting for receiver with Share Management Component */
+                  <ShareManagementModal
+                    pairingCode={session.pairing_code}
+                    expiresInSeconds={expirySecondsLeft}
+                    onGenerateNewCode={startSending}
+                    onClose={goHome}
+                  />
+                ) : (
               /* State 2B: Paired - Choose Files */
               <Card>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '16px' }}>
@@ -1039,182 +1355,89 @@ export function App() {
         )}
 
         {/* =========================================================================
-            SCREEN 4: ACTIVE TRANSFER
+            SCREEN 4, 5, FAILED, CANCELLED: DEDICATED TRANSFER SCREEN
+            (Only mounts when transfer actually starts; stays through completion/failure)
             ========================================================================= */}
-        {screen === 'transfer' && (
-          <div className="screen-wrapper">
-            <Card className="transfer-box">
-              {/* Progress State Title */}
-              <div>
-                <h2>
-                  {transferProgress?.state === 'verifying'
-                    ? COPY.transfer.stateVerifying
-                    : transferProgress?.state === 'reconnecting'
-                    ? 'Reconnecting...'
-                    : role === 'sender'
-                    ? COPY.transfer.stateSending(peerDevice?.display_name || 'receiver')
-                    : COPY.transfer.stateReceiving(peerDevice?.display_name || 'sender')}
-                </h2>
-
-                {transferProgress && (
-                  <p style={{ marginTop: '4px' }}>
-                    {COPY.transfer.fileCounter(
-                      transferProgress.currentFileIndex + 1,
-                      transferProgress.totalFiles
-                    )}
-                    : <strong title={transferProgress.currentFile}>{truncateMiddle(transferProgress.currentFile, 32)}</strong>
-                  </p>
-                )}
-              </div>
-
-              {/* Progress Bar & Indicators (Never 0 B/s or ETA 0s during hashing) */}
-              {transferProgress ? (
-                <div>
-                  <ProgressBar
-                    value={transferProgress.percentage}
-                    indeterminate={transferProgress.state === 'verifying'}
-                  />
-
-                  {transferProgress.state === 'verifying' ? (
-                    <p style={{ marginTop: '12px', fontSize: '0.875rem' }}>
-                      {COPY.transfer.stateVerifyingDesc}
-                    </p>
-                  ) : (
-                    <div className="transfer-meta-grid">
-                      <div>
-                        <span className="meta-item-label">Transferred</span>
-                        <span className="meta-item-val tabular-numbers">
-                          {formatBytes(transferProgress.bytesTransferred)} / {formatBytes(transferProgress.totalBytes)} ({transferProgress.percentage.toFixed(0)}%)
-                        </span>
-                      </div>
-                      <div>
-                        <span className="meta-item-label">Speed</span>
-                        <span className="meta-item-val tabular-numbers">
-                          {formatSpeed(transferProgress.speed)}
-                        </span>
-                      </div>
-                      <div>
-                        <span className="meta-item-label">Time Remaining</span>
-                        <span className="meta-item-val tabular-numbers">
-                          {formatEta(transferProgress.eta)}
-                        </span>
-                      </div>
-                    </div>
-                  )}
-                </div>
-              ) : (
-                <div>
-                  <ProgressBar indeterminate />
-                  <p style={{ marginTop: '8px' }}>{COPY.transfer.stateConnecting}</p>
-                </div>
-              )}
-
-              {/* Quiet destructive outline cancel button */}
-              <div style={{ marginTop: '16px' }}>
-                <Button variant="destructive" onClick={handleCancelClick}>
-                  {COPY.transfer.cancel}
-                </Button>
-              </div>
-            </Card>
-          </div>
+        {mapScreenToMainView(screen) === 'transfer' && (
+          <TransferScreen
+            screen={screen}
+            role={role}
+            peerName={peerDevice?.display_name}
+            transferProgress={transferProgress}
+            files={
+              role === 'sender'
+                ? selectedFiles.map((f) => ({
+                    name: f.name,
+                    size: f.size,
+                    relativePath: f.webkitRelativePath,
+                  }))
+                : incomingFiles.map((f) => ({
+                    name: f.name,
+                    size: f.size,
+                  }))
+            }
+            completedFiles={completedFiles}
+            transferDurationSecs={transferDurationSecs}
+            error={error}
+            onCancel={handleCancelClick}
+            onBackToHome={goHome}
+            onTryAgain={
+              screen === 'failed'
+                ? role === 'sender'
+                  ? startSending
+                  : () => startReceiving('code')
+                : undefined
+            }
+            onSendMore={() => {
+              goHome();
+              startSending();
+            }}
+            onReceiveMore={() => {
+              goHome();
+              startReceiving('code');
+            }}
+          />
         )}
-
-        {/* =========================================================================
-            SCREEN 5: COMPLETED
-            ========================================================================= */}
-        {screen === 'completed' && (
-          <div className="screen-wrapper">
-            <Card>
-              {role === 'receiver' ? (
-                <>
-                  <h2>{COPY.completed.receiverTitle}</h2>
-                  <p style={{ marginTop: '4px' }}>{COPY.completed.receiverSubtitle}</p>
-                  {transferDurationSecs !== null && (
-                    <p style={{ marginTop: '2px', fontSize: '0.875rem', color: 'var(--text-muted)' }}>
-                      {COPY.completed.timeElapsed(formatDuration(transferDurationSecs))}
-                    </p>
-                  )}
-
-                  <div className="file-list" style={{ marginTop: '20px' }}>
-                    {completedFiles.map((file, i) => (
-                      <div key={i} className="file-row">
-                        <span className="file-row-name" title={file.name}>
-                          {file.name}
-                        </span>
-                        <div className="file-row-meta">
-                          <StatusBadge status={file.verified ? 'success' : 'warning'}>
-                            {file.verified ? COPY.completed.hashVerifiedBadge : COPY.completed.hashFailedBadge}
-                          </StatusBadge>
-                          <Button
-                            variant="secondary"
-                            onClick={() => {
-                              const url = URL.createObjectURL(file.blob);
-                              const a = document.createElement('a');
-                              a.href = url;
-                              a.download = file.name;
-                              a.click();
-                              URL.revokeObjectURL(url);
-                            }}
-                          >
-                            {COPY.completed.saveFile}
-                          </Button>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-
-                  <div style={{ marginTop: '24px' }}>
-                    <Button variant="link" onClick={goHome}>
-                      {COPY.completed.receiveAnother}
-                    </Button>
-                  </div>
-                </>
-              ) : (
-                <>
-                  <h2>{COPY.completed.senderTitle(peerDevice?.display_name || 'receiver')}</h2>
-                  <p style={{ marginTop: '4px' }}>{COPY.completed.senderSubtitle}</p>
-                  {transferDurationSecs !== null && (
-                    <p style={{ marginTop: '2px', fontSize: '0.875rem', color: 'var(--text-muted)' }}>
-                      {COPY.completed.timeElapsed(formatDuration(transferDurationSecs))}
-                    </p>
-                  )}
-
-                  <div style={{ marginTop: '24px' }}>
-                    <Button variant="primary" onClick={goHome}>
-                      {COPY.completed.sendAnother}
-                    </Button>
-                  </div>
-                </>
-              )}
-            </Card>
-          </div>
-        )}
-
-        {/* =========================================================================
-            SCREEN 6: FAILED OR CANCELLED (Friendly single error message)
-            ========================================================================= */}
-        {(screen === 'failed' || screen === 'cancelled') && (
-          <div className="screen-wrapper">
-            {(() => {
-              const friendly = mapTechnicalError(error);
-              return (
-                <ErrorPanel
-                  headline={screen === 'cancelled' ? COPY.errors.transferCancelled.headline : friendly.headline}
-                  cause={screen === 'cancelled' ? COPY.errors.transferCancelled.cause : friendly.cause}
-                  nextStep={screen === 'cancelled' ? COPY.errors.transferCancelled.nextStep : friendly.nextStep}
-                  rawDetails={screen === 'failed' ? friendly.rawDetails : undefined}
-                  onTryAgain={screen === 'failed' ? (role === 'sender' ? startSending : () => startReceiving('code')) : undefined}
-                  onHome={goHome}
-                />
-              );
-            })()}
-          </div>
+          </>
         )}
       </main>
 
-      <footer className="app-footer">
-        {COPY.footer.securityNote}
+      {/* BEGIN: BottomTrustFooter (At most 3 plain language items, no fine print) */}
+      <footer className="w-full max-w-[1440px] mx-auto px-4 sm:px-6 lg:px-8 py-4 sm:py-6" data-purpose="trust-badges-bar">
+        <div className="frosted-glass rounded-2xl py-3 px-6 shadow-sm border border-white/80">
+          <div className="flex flex-wrap items-center justify-around sm:justify-between gap-y-3 gap-x-6 text-xs text-neutral-600 font-medium">
+            <div className="flex items-center gap-2">
+              <svg className="w-4 h-4 text-emerald-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2"></path>
+              </svg>
+              <span className="text-neutral-900 font-semibold">{COPY.footer.privateEncrypted}</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <svg className="w-4 h-4 text-neutral-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2"></path>
+              </svg>
+              <span className="text-neutral-900 font-semibold">{COPY.footer.noAccount}</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <svg className="w-4 h-4 text-neutral-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path d="M21 12a9 9 0 01-9 9m9-9a9 9 0 00-9-9m9 9H3m9 9a9 9 0 01-9-9m9 9c1.657 0 3-4.03 3-9s-1.343-9-3-9m0 18c-1.657 0-3-4.03-3-9s1.343-9 3-9m-9 9a9 9 0 019-9" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2"></path>
+              </svg>
+              <span className="text-neutral-900 font-semibold">{COPY.footer.worksAnyBrowser}</span>
+            </div>
+          </div>
+        </div>
       </footer>
+      {/* END: BottomTrustFooter */}
+
+      {/* Device Name Edit Modal */}
+      {device && (
+        <DeviceEditModal
+          isOpen={isEditNameOpen}
+          currentName={device.display_name}
+          onSave={handleSaveDeviceName}
+          onClose={() => setIsEditNameOpen(false)}
+        />
+      )}
 
       {/* Cancel Confirmation Dialog */}
       <ConfirmDialog
