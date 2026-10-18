@@ -708,7 +708,7 @@ export function App() {
   return (
     <>
       {/* BEGIN: MainHeader */}
-      <header className="w-full max-w-[1440px] mx-auto px-4 sm:px-6 lg:px-8 pt-4 sm:pt-6 pb-2 flex items-center justify-between" data-purpose="site-navigation">
+      <header className="w-full max-w-[1600px] mx-auto px-4 sm:px-6 lg:px-8 xl:px-12 pt-4 sm:pt-6 pb-2 flex items-center justify-between" data-purpose="site-navigation">
         {/* Brand Logo */}
         <div className="flex items-center gap-3">
           <button type="button" className="flex items-center gap-2 group focus:outline-none bg-transparent border-0 cursor-pointer p-0 text-left" onClick={goHome}>
@@ -854,13 +854,13 @@ export function App() {
                 </div>
 
                 {/* Primary Layout Grid: Split Transfer Panel + Spotlight Card */}
-                <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 sm:gap-6 items-stretch">
-                  {/* LEFT & CENTER: Structured Dual-Zone Workspace */}
-                  <div className="lg:col-span-7 flex flex-col">
+                <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 sm:gap-6 lg:gap-8 items-stretch">
+                  {/* LEFT & CENTER: Structured Dual-Zone Workspace (Send + Receive side by side) */}
+                  <div className="lg:col-span-7 xl:col-span-8 flex flex-col">
                     {/* Master Glass Card */}
-                    <div className="frosted-glass rounded-3xl p-5 sm:p-7 shadow-glass border border-white/90 relative overflow-hidden flex flex-col justify-between h-full">
+                    <div className="frosted-glass rounded-3xl p-5 sm:p-7 lg:p-8 shadow-glass border border-white/90 relative overflow-hidden flex flex-col justify-between h-full">
                       {/* Upper Action Split */}
-                      <div className="grid grid-cols-1 md:grid-cols-2 gap-6 lg:gap-7 relative">
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-6 lg:gap-8 relative">
                         {/* ZONE 1: SEND FILES (Visible on desktop/tablet, or on mobile when mobilePanel === 'send') */}
                         <section
                           className={`flex flex-col justify-between ${
@@ -1063,8 +1063,8 @@ export function App() {
                   {/* END LEFT & CENTER */}
 
                   {/* RIGHT COLUMN: Signature Orange Spotlight Card */}
-                  <div className="lg:col-span-5 flex flex-col">
-                    <div className="bg-gradient-to-br from-[#f85a23] to-[#e6460f] rounded-3xl p-5 sm:p-7 text-white shadow-float flex flex-col justify-between relative overflow-hidden h-full">
+                  <div className="lg:col-span-5 xl:col-span-4 flex flex-col">
+                    <div className="bg-gradient-to-br from-[#f85a23] to-[#e6460f] rounded-3xl p-5 sm:p-7 lg:p-8 text-white shadow-float flex flex-col justify-between relative overflow-hidden h-full">
                       {/* Ambient blur accents */}
                       <div className="absolute -top-16 -right-16 w-48 h-48 bg-white/10 rounded-full blur-2xl pointer-events-none"></div>
                       <div className="absolute -bottom-12 -left-12 w-48 h-48 bg-black/10 rounded-full blur-xl pointer-events-none"></div>
@@ -1403,7 +1403,7 @@ export function App() {
       </main>
 
       {/* BEGIN: BottomTrustFooter (At most 3 plain language items, no fine print) */}
-      <footer className="w-full max-w-[1440px] mx-auto px-4 sm:px-6 lg:px-8 py-4 sm:py-6" data-purpose="trust-badges-bar">
+      <footer className="w-full max-w-[1600px] mx-auto px-4 sm:px-6 lg:px-8 xl:px-12 py-4 sm:py-6" data-purpose="trust-badges-bar">
         <div className="frosted-glass rounded-2xl py-3 px-6 shadow-sm border border-white/80">
           <div className="flex flex-wrap items-center justify-around sm:justify-between gap-y-3 gap-x-6 text-xs text-neutral-600 font-medium">
             <div className="flex items-center gap-2">

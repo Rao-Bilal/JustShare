@@ -226,9 +226,9 @@ header.app-header {
 
 main.app-main {
   width: 100%;
-  max-width: 1440px;
+  max-width: 1600px;
   margin: 0 auto;
-  padding: var(--space-4) clamp(1rem, 3vw, 2rem) var(--space-6);
+  padding: var(--space-4) clamp(1rem, 3.5vw, 3rem) var(--space-6);
   flex: 1;
   display: flex;
   flex-direction: column;
@@ -239,6 +239,8 @@ main.app-main {
   flex-direction: column;
   gap: var(--space-6);
   width: 100%;
+  max-width: 900px;
+  margin: 0 auto;
 }
 
 /* ==========================================================================
