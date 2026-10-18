@@ -14,11 +14,12 @@ router = APIRouter()
 
 active_connections: dict[str, dict[str, WebSocket]] = {}
 
+
 @router.websocket("/{session_id}")
 async def websocket_endpoint(websocket: WebSocket, session_id: str, token: str = Query(...)):
     await websocket.accept()
     settings = get_settings()
-    
+
     try:
         payload = decode_device_token(token, settings.jwt_secret)
         device_id = payload["device_id"]
@@ -35,18 +36,18 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str, token: str =
             await websocket.send_json({"type": "error", "payload": {"code": "NOT_FOUND", "message": "Session not found"}})
             await websocket.close(code=1008)
             return
-            
+
         if str(session_obj.sender_device_id) != device_id and str(session_obj.receiver_device_id) != device_id:
             await websocket.send_json({"type": "error", "payload": {"code": "FORBIDDEN", "message": "Not a participant"}})
             await websocket.close(code=1008)
             return
         break
-        
+
     if session_id not in active_connections:
         active_connections[session_id] = {}
-        
+
     active_connections[session_id][device_id] = websocket
-    
+
     # Notify peer and self if existing peers are present
     for other_device_id, other_ws in list(active_connections[session_id].items()):
         if other_device_id != device_id:
@@ -61,26 +62,36 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str, token: str =
                     other_display_name = other.display_name if other else "Peer"
                     break
 
-                await other_ws.send_json({"type": "peer_joined", "payload": {"device_id": device_id, "display_name": display_name}})
-                await websocket.send_json({"type": "peer_joined", "payload": {"device_id": other_device_id, "display_name": other_display_name}})
+                await other_ws.send_json(
+                    {
+                        "type": "peer_joined",
+                        "payload": {"device_id": device_id, "display_name": display_name},
+                    }
+                )
+                await websocket.send_json(
+                    {
+                        "type": "peer_joined",
+                        "payload": {"device_id": other_device_id, "display_name": other_display_name},
+                    }
+                )
             except Exception:
                 pass
-    
+
     try:
         while True:
             text_data = await websocket.receive_text()
             if len(text_data) > 65536:
                 await websocket.send_json({"type": "error", "payload": {"code": "MESSAGE_TOO_LARGE", "message": "Message exceeds 64KB"}})
                 continue
-                
+
             try:
                 data = json.loads(text_data)
             except json.JSONDecodeError:
                 continue
-                
+
             msg_type = data.get("type")
             payload = data.get("payload", {})
-            
+
             if msg_type == "dev_log":
                 milestone = payload.get("milestone", "unknown")
                 sender_redacted = payload.get("senderDeviceIdRedacted", "anon")
@@ -89,7 +100,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str, token: str =
                 progress = payload.get("percent")
                 elapsed = payload.get("elapsedMs")
                 msg = payload.get("message", "")
-                
+
                 parts = [f"[REMOTE-DEV-LOG][{sender_redacted}][{milestone}]"]
                 if tx_id:
                     parts.append(f"tx={tx_id}")
@@ -101,7 +112,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str, token: str =
                     parts.append(f"elapsed={elapsed}ms")
                 if msg:
                     parts.append(f"msg=\"{msg}\"")
-                    
+
                 print(" ".join(parts), flush=True)
 
                 out_msg = {
@@ -122,7 +133,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str, token: str =
                 for other_device_id, other_ws in active_connections[session_id].items():
                     if other_device_id != device_id:
                         await other_ws.send_json(out_msg)
-                        
+
     except WebSocketDisconnect:
         if session_id in active_connections and device_id in active_connections[session_id]:
             del active_connections[session_id][device_id]
