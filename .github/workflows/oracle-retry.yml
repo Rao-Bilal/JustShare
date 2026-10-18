@@ -1,4 +1,3 @@
-
 name: Oracle A1 Capacity Retry
 
 on:
@@ -106,17 +105,15 @@ jobs:
               exit 0
             fi
 
-            # Stop on errors that retrying cannot fix.
+            # Capacity exhaustion and rate limiting: retry with a delay.
             if echo "$OUTPUT" | grep -Eqi \
-              'NotAuthenticated|InvalidAuthenticationToken|NotAuthorizedOrNotFound|InvalidParameter|Invalid value for|401|403'; then
+              'Out of host capacity|"status": 429|Too many requests'; then
+              echo "Temporary capacity/rate-limit error. Waiting ${WAIT_SECONDS}s."
+            # Real permanent errors: stop.
+            elif echo "$OUTPUT" | grep -Eqi \
+              'NotAuthenticated|InvalidAuthenticationToken|NotAuthorizedOrNotFound|InvalidParameter|LimitExceeded|"status": 40[013]'; then
               echo "Permanent authentication/configuration error. Stopping retries."
               exit "$STATUS"
-            fi
-
-            # Capacity exhaustion and rate limiting are retried with a delay.
-            if echo "$OUTPUT" | grep -Eqi \
-              'Out of host capacity|TooManyRequests|Too many requests|429|InternalError'; then
-              echo "Temporary capacity/rate-limit error. Waiting ${WAIT_SECONDS}s."
             else
               echo "Unrecognized launch error. Stopping to avoid retrying a permanent failure."
               exit "$STATUS"
@@ -132,4 +129,3 @@ jobs:
 
           echo "Retry window ended without a running JustShare instance."
           exit 1
-
