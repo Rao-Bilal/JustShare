@@ -57,6 +57,10 @@ async def create_session(
     expires_at = now + timedelta(minutes=settings.session_expiry_minutes)
     pairing_expires_at = now + timedelta(minutes=settings.pairing_code_expiry_minutes)
     
+    sender_device = (await db.execute(select(Device).where(Device.id == uuid.UUID(device_id)))).scalars().first()
+    if not sender_device:
+        raise HTTPException(status_code=404, detail="Device not found")
+
     session_obj = TransferSession(
         sender_device_id=uuid.UUID(device_id),
         pairing_code=generate_pairing_code(),
@@ -112,6 +116,8 @@ async def join_session(
     
     sender_stmt = select(Device).where(Device.id == session_obj.sender_device_id)
     sender = (await db.execute(sender_stmt)).scalars().first()
+    if not sender:
+        raise HTTPException(status_code=404, detail="Sender device not found")
     
     return SessionJoinResponse(
         session_id=str(session_obj.id),
@@ -135,6 +141,9 @@ async def get_session(
         raise HTTPException(status_code=403, detail="Not a participant")
         
     sender = (await db.execute(select(Device).where(Device.id == session_obj.sender_device_id))).scalars().first()
+    if not sender:
+        raise HTTPException(status_code=404, detail="Sender device not found")
+
     receiver = None
     if session_obj.receiver_device_id:
         receiver = (await db.execute(select(Device).where(Device.id == session_obj.receiver_device_id))).scalars().first()
