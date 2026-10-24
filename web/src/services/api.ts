@@ -162,3 +162,26 @@ export async function updateSessionState(token: string, sessionId: string, state
 
   return null;
 }
+
+export interface IceServerConfig {
+  urls: string | string[];
+  username?: string;
+  credential?: string;
+}
+
+export async function getTurnCredentials(token: string): Promise<IceServerConfig[]> {
+  try {
+    const res = await request<{ iceServers: IceServerConfig[] }>(
+      '/api/v1/turn/credentials',
+      {
+        method: 'POST',
+      },
+      token
+    );
+    return res.iceServers || [];
+  } catch (err) {
+    console.warn('[TURN] Failed to fetch TURN credentials, fallback to STUN-only:', err instanceof Error ? err.message : 'Unknown error');
+    return [];
+  }
+}
+

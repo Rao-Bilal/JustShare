@@ -231,4 +231,37 @@ export async function updateSessionState(
   }
 }
 
+export interface IceServerConfig {
+  urls: string | string[];
+  username?: string;
+  credential?: string;
+}
+
+/**
+ * Fetches short-lived TURN credentials from Cloudflare.
+ * POST /api/v1/turn/credentials
+ */
+export async function getTurnCredentials(
+  token: string,
+  timeoutMs = DEFAULT_TIMEOUT_MS
+): Promise<IceServerConfig[]> {
+  try {
+    const res = await request<{ iceServers: IceServerConfig[] }>(
+      '/turn/credentials',
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+      },
+      timeoutMs
+    );
+    return res.data?.iceServers || [];
+  } catch (err) {
+    console.warn('[TURN] Failed to fetch TURN credentials, fallback to STUN-only:', err instanceof Error ? err.message : 'Unknown error');
+    return [];
+  }
+}
+
+
 

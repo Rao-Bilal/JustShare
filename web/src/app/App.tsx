@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { createSession, getSession, joinSession, updateSessionState } from '../services/api';
+import { createSession, getSession, getTurnCredentials, joinSession, updateSessionState } from '../services/api';
 import { formatBytes } from '../services/format';
 import { SignalingClient } from '../services/signaling';
 import { createTransferStorage, TransferStorage } from '../services/storage';
@@ -374,7 +374,8 @@ export function App() {
 
       if (activeRole === 'sender') {
         const curFiles = selectedFilesRef.current;
-        const rtc = new WebRTCConnection(sig, true);
+        const turnServers = await getTurnCredentials(curDevice.token);
+        const rtc = new WebRTCConnection(sig, true, turnServers);
         rtcRef.current = rtc;
         rtc.onConnectionStateChange = handleConnectionStateChange;
         rtc.onDataChannelClose = () => {
@@ -473,7 +474,8 @@ export function App() {
         });
         sig.on('peer_left', () => handlePeerLeft());
 
-        const rtc = new WebRTCConnection(sig, false);
+        const turnServers = await getTurnCredentials(curDevice.token);
+        const rtc = new WebRTCConnection(sig, false, turnServers);
         rtcRef.current = rtc;
         rtc.onConnectionStateChange = handleConnectionStateChange;
         rtc.onDataChannelClose = () => {
@@ -641,7 +643,7 @@ export function App() {
     setScreenState('send');
   };
 
-  const startWebRTCSender = () => {
+  const startWebRTCSender = async () => {
     const curSig = sigRef.current;
     const curSession = sessionRef.current;
     const curDevice = deviceRef.current;
@@ -654,7 +656,8 @@ export function App() {
     }
 
     try {
-      const rtc = new WebRTCConnection(curSig, true);
+      const turnServers = await getTurnCredentials(curDevice.token);
+      const rtc = new WebRTCConnection(curSig, true, turnServers);
       rtcRef.current = rtc;
 
       curSig.on('signal', (msg: unknown) => {
@@ -898,7 +901,7 @@ export function App() {
     }
   };
 
-  const acceptTransfer = () => {
+  const acceptTransfer = async () => {
     const curSig = sigRef.current;
     const curSession = sessionRef.current;
     const curDevice = deviceRef.current;
@@ -912,7 +915,8 @@ export function App() {
 
     updateSessionState(curDevice.token, curSession.session_id, 'CONNECTING').catch(() => {});
 
-    const rtc = new WebRTCConnection(curSig, false);
+    const turnServers = await getTurnCredentials(curDevice.token);
+    const rtc = new WebRTCConnection(curSig, false, turnServers);
     rtcRef.current = rtc;
 
     rtc.onConnectionStateChange = handleConnectionStateChange;

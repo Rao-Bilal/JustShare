@@ -20,6 +20,9 @@ class Settings(BaseSettings):
     use_sqlite: bool = True
     sqlite_path: str = "justshare_dev.db"
 
+    cloudflare_turn_key_id: str | None = None
+    cloudflare_turn_api_token: str | None = None
+
     @field_validator("cors_origins", mode="before")
     @classmethod
     def split_cors_origins(cls, value: object) -> object:

@@ -21,7 +21,7 @@ import { theme } from '../src/theme';
 import { getOrCreateDevice } from '../src/services/device';
 import { StoredDevice } from '../src/services/storage';
 import { getConfig } from '../src/config';
-import { createSession, joinSession, SessionResponse } from '../src/services/api';
+import { createSession, getTurnCredentials, joinSession, SessionResponse } from '../src/services/api';
 import { SignalingClient } from '../src/services/signaling';
 import { MobileWebRTCConnection } from '../src/services/webrtc';
 import { MobileFileSender, MobileFileReceiver } from '../src/services/transfer';
@@ -198,13 +198,14 @@ export default function HomeScreen() {
 
   // Start WebRTC DataChannel file sender upon peer approval
   const startWebRTCSender = useCallback(
-    (sig: SignalingClient, sessionId: string, filesToSend: NativeFile[]) => {
+    async (sig: SignalingClient, sessionId: string, filesToSend: NativeFile[]) => {
       if (!device) return;
       if (webrtcConn) {
         webrtcConn.close();
       }
       setTransferStatusText('Connecting WebRTC...');
-      const conn = new MobileWebRTCConnection(sig, true, device.deviceId);
+      const turnServers = await getTurnCredentials(device.token);
+      const conn = new MobileWebRTCConnection(sig, true, device.deviceId, turnServers);
 
       conn.onConnectionStateChange = (state) => {
         setTransferStatusText(`P2P: ${state}`);
@@ -495,7 +496,7 @@ export default function HomeScreen() {
   };
 
   // Receiver accepts incoming files (Strict Receiver Guard)
-  const handleAcceptIncomingTransfer = () => {
+  const handleAcceptIncomingTransfer = async () => {
     if (activeRole !== 'receiver') return;
     if (!signaling || !device || !incomingTransferRequest) return;
     if (isAcceptingRef.current) return;
@@ -511,7 +512,8 @@ export default function HomeScreen() {
     });
 
     setTransferStatusText('Connecting WebRTC Receiver...');
-    const conn = new MobileWebRTCConnection(signaling, false, device.deviceId);
+    const turnServers = await getTurnCredentials(device.token);
+    const conn = new MobileWebRTCConnection(signaling, false, device.deviceId, turnServers);
 
     conn.onConnectionStateChange = (state) => {
       setTransferStatusText(`P2P: ${state}`);

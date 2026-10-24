@@ -1,5 +1,31 @@
 import { SignalingClient } from './signaling';
 
+export const DEFAULT_STUN_SERVERS: RTCIceServer[] = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun1.l.google.com:19302' },
+  { urls: 'stun:stun2.l.google.com:19302' },
+  { urls: 'stun:stun.services.mozilla.com' },
+];
+
+export function sanitizeIceServers(turnServers: RTCIceServer[] = []): RTCIceServer[] {
+  const filteredTurnServers: RTCIceServer[] = [];
+
+  for (const server of turnServers) {
+    if (!server.urls) continue;
+    const urlList = Array.isArray(server.urls) ? server.urls : [server.urls];
+    // Filter out port 53 TURN URLs
+    const safeUrls = urlList.filter((url) => !url.includes(':53') || url.includes(':5349'));
+    if (safeUrls.length > 0) {
+      filteredTurnServers.push({
+        ...server,
+        urls: safeUrls.length === 1 ? safeUrls[0] : safeUrls,
+      });
+    }
+  }
+
+  return [...DEFAULT_STUN_SERVERS, ...filteredTurnServers];
+}
+
 export class WebRTCConnection {
   private pc: RTCPeerConnection;
   private dataChannel: RTCDataChannel | null = null;
@@ -10,18 +36,15 @@ export class WebRTCConnection {
   public onDataChannelClose: (() => void) | null = null;
   private roleTag: string;
 
-  constructor(signaling: SignalingClient, isSender: boolean) {
+  constructor(signaling: SignalingClient, isSender: boolean, customIceServers?: RTCIceServer[]) {
     this.signaling = signaling;
     this.roleTag = isSender ? 'SEND' : 'RECEIVE';
     console.log(`[WEBRTC][${this.roleTag}] RTCPeerConnection created (isSender=${isSender})`);
 
+    const iceServers = customIceServers ? sanitizeIceServers(customIceServers) : DEFAULT_STUN_SERVERS;
+
     this.pc = new RTCPeerConnection({
-      iceServers: [
-        { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'stun:stun1.l.google.com:19302' },
-        { urls: 'stun:stun2.l.google.com:19302' },
-        { urls: 'stun:stun.services.mozilla.com' },
-      ],
+      iceServers,
     });
 
     this.pc.onicecandidate = (event) => {
