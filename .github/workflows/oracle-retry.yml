@@ -86,7 +86,7 @@ jobs:
               --availability-domain "lbSZ:AP-MUMBAI-1-AD-1" \
               --display-name "justshare-server" \
               --shape "VM.Standard.A1.Flex" \
-              --shape-config '{"ocpus":2,"memoryInGBs":12}' \
+              --shape-config '{"ocpus":1,"memoryInGBs":6}' \
               --image-id "ocid1.image.oc1.ap-mumbai-1.aaaaaaaa2jurqb3jm7hlpqw3au35loaqjkcozbyh7znn4jnfu5zbrgfulwia" \
               --subnet-id "ocid1.subnet.oc1.ap-mumbai-1.aaaaaaaaoskuzhy2z5afejah454cwisgrd2hgfdowi2ijb3p7bryo7gxg22a" \
               --assign-public-ip true \
