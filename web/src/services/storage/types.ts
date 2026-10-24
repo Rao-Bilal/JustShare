@@ -34,6 +34,8 @@ export interface TransferStorage {
 
   initFile(transferId: string, file: ManifestFileEntry): Promise<void>;
   writeChunk(transferId: string, fileId: string, index: number, data: Uint8Array): Promise<void>;
+  writeChunksBatch?(transferId: string, fileId: string, chunks: { index: number; data: Uint8Array }[]): Promise<void>;
+  flush?(): Promise<void>;
   hasChunk(transferId: string, fileId: string, index: number): Promise<boolean>;
   getReceivedChunks(transferId: string, fileId: string): Promise<number[]>;
   getMissingChunks(transferId: string, fileId: string, totalChunks: number): Promise<number[]>;

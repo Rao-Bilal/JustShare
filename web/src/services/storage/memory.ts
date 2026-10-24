@@ -35,7 +35,7 @@ export class MemoryTransferStorage implements TransferStorage {
         name: f.name,
         size: f.size,
         totalChunks: f.totalChunks,
-        chunkSize: 65536,
+        chunkSize: f.totalChunks > 0 ? Math.ceil(f.size / f.totalChunks) : 262144,
         sha256: f.sha256,
         mimeType: f.mimeType,
         completed: false,
@@ -82,7 +82,7 @@ export class MemoryTransferStorage implements TransferStorage {
         name: file.name,
         size: file.size,
         totalChunks: file.totalChunks,
-        chunkSize: 65536,
+        chunkSize: file.totalChunks > 0 ? Math.ceil(file.size / file.totalChunks) : 262144,
         sha256: file.sha256,
         mimeType: file.mimeType,
         completed: false,
@@ -110,6 +110,16 @@ export class MemoryTransferStorage implements TransferStorage {
       file.receivedChunksCount += 1;
       file.updatedAt = Date.now();
       transfer.updatedAt = Date.now();
+    }
+  }
+
+  async writeChunksBatch(
+    transferId: string,
+    fileId: string,
+    chunks: { index: number; data: Uint8Array }[]
+  ): Promise<void> {
+    for (const chunk of chunks) {
+      await this.writeChunk(transferId, fileId, chunk.index, chunk.data);
     }
   }
 

@@ -168,9 +168,9 @@ p {
 
 header.app-header {
   width: 100%;
-  max-width: 800px;
+  max-width: 1200px;
   margin: 0 auto;
-  padding: var(--space-4) var(--space-4) 0;
+  padding: var(--space-4) clamp(1rem, 2.5vw, 2rem) 0;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -226,9 +226,9 @@ header.app-header {
 
 main.app-main {
   width: 100%;
-  max-width: 1600px;
+  max-width: 1200px;
   margin: 0 auto;
-  padding: var(--space-4) clamp(1rem, 3.5vw, 3rem) var(--space-6);
+  padding: var(--space-4) clamp(1rem, 2.5vw, 2rem) var(--space-6);
   flex: 1;
   display: flex;
   flex-direction: column;
@@ -1928,8 +1928,356 @@ select {
   }
   .animate-ping,
   .animate-ping-subtle,
-  .animate-pulse {
+  .animate-pulse,
+  .radar-sweep-beam,
+  .radar-center-pulse,
+  .radar-blip-glow {
     animation: none !important;
   }
 }
+
+/* ==========================================================================
+   Tactical Radar Scope & Sweep Animation
+   ========================================================================== */
+
+.radar-tactical-viewport {
+  position: relative;
+  width: 100%;
+  background: radial-gradient(circle at center, #052214 0%, #02120a 60%, #010a06 100%);
+  border: 1px solid #0f4c2c;
+  box-shadow: 0 0 25px rgba(16, 185, 129, 0.15), inset 0 0 20px rgba(0, 0, 0, 0.8);
+  border-radius: 1.25rem;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 1rem;
+  color: #10b981;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+.radar-top-hud {
+  width: 100%;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  padding-bottom: 0.75rem;
+  border-bottom: 1px solid rgba(16, 185, 129, 0.2);
+  color: #34d399;
+}
+
+.radar-hud-left {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.radar-status-dot {
+  width: 7px;
+  height: 7px;
+  background-color: #10b981;
+  border-radius: 50%;
+  box-shadow: 0 0 8px #10b981;
+  animation: radarStatusBlink 1.4s infinite ease-in-out;
+}
+
+@keyframes radarStatusBlink {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.4; transform: scale(0.85); }
+}
+
+.radar-hud-right {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.65rem;
+  color: #6ee7b7;
+}
+
+.radar-hud-sep {
+  opacity: 0.4;
+}
+
+.radar-scope-container {
+  position: relative;
+  width: 100%;
+  max-width: 250px;
+  aspect-ratio: 1 / 1;
+  margin: 0.75rem auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.radar-circular-screen {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  border-radius: 50%;
+  border: 2px solid rgba(16, 185, 129, 0.45);
+  box-shadow: 0 0 20px rgba(16, 185, 129, 0.2), inset 0 0 35px rgba(16, 185, 129, 0.25);
+  overflow: hidden;
+  background: radial-gradient(circle at center, rgba(6, 78, 59, 0.3) 0%, rgba(2, 44, 34, 0.6) 70%, rgba(1, 20, 15, 0.95) 100%);
+}
+
+/* Concentric rings */
+.radar-range-ring {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  border-radius: 50%;
+  border: 1px dashed rgba(16, 185, 129, 0.35);
+  pointer-events: none;
+}
+
+.ring-level-1 { width: 25%; height: 25%; }
+.ring-level-2 { width: 50%; height: 50%; }
+.ring-level-3 { width: 75%; height: 75%; }
+.ring-level-4 { width: 95%; height: 95%; border-style: solid; border-color: rgba(16, 185, 129, 0.4); }
+
+/* Crosshair axes */
+.radar-axis {
+  position: absolute;
+  background: rgba(16, 185, 129, 0.22);
+  pointer-events: none;
+}
+
+.axis-horizontal {
+  top: 50%;
+  left: 0;
+  width: 100%;
+  height: 1px;
+}
+
+.axis-vertical {
+  top: 0;
+  left: 50%;
+  width: 1px;
+  height: 100%;
+}
+
+.axis-diagonal-1 {
+  top: 50%;
+  left: 0;
+  width: 100%;
+  height: 1px;
+  transform: rotate(45deg);
+  opacity: 0.6;
+}
+
+.axis-diagonal-2 {
+  top: 50%;
+  left: 0;
+  width: 100%;
+  height: 1px;
+  transform: rotate(-45deg);
+  opacity: 0.6;
+}
+
+/* Heading markers */
+.radar-heading {
+  position: absolute;
+  font-size: 0.55rem;
+  font-weight: 700;
+  color: rgba(52, 211, 153, 0.7);
+  letter-spacing: 0.05em;
+  pointer-events: none;
+  z-index: 2;
+}
+
+.heading-n { top: 6px; left: 50%; transform: translateX(-50%); }
+.heading-s { bottom: 6px; left: 50%; transform: translateX(-50%); }
+.heading-e { right: 8px; top: 50%; transform: translateY(-50%); }
+.heading-w { left: 8px; top: 50%; transform: translateY(-50%); }
+
+/* Rotating radar sweep beam */
+.radar-sweep-beam {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  border-radius: 50%;
+  pointer-events: none;
+  z-index: 3;
+  background: conic-gradient(
+    from 0deg at 50% 50%,
+    rgba(16, 185, 129, 0.5) 0deg,
+    rgba(16, 185, 129, 0.25) 25deg,
+    rgba(16, 185, 129, 0.05) 55deg,
+    transparent 70deg,
+    transparent 360deg
+  );
+  animation: radarSweep 3.2s linear infinite;
+  transform-origin: 50% 50%;
+}
+
+@keyframes radarSweep {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* Own Ship / Center Marker */
+.radar-center-host {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 6;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  pointer-events: none;
+}
+
+.radar-center-core {
+  width: 22px;
+  height: 22px;
+  background: #064e3b;
+  border: 2px solid #34d399;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 0 10px #10b981;
+}
+
+.radar-center-label {
+  font-size: 0.55rem;
+  font-weight: 800;
+  color: #ecfdf5;
+}
+
+.radar-center-pulse {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 32px;
+  height: 32px;
+  border: 1px solid rgba(52, 211, 153, 0.8);
+  border-radius: 50%;
+  animation: radarPing 2s cubic-bezier(0, 0, 0.2, 1) infinite;
+}
+
+@keyframes radarPing {
+  0% { width: 14px; height: 14px; opacity: 1; }
+  100% { width: 50px; height: 50px; opacity: 0; }
+}
+
+/* Blip Targets */
+.radar-blip-target {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  z-index: 5;
+  background: none;
+  border: none;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 4px;
+  transition: transform 0.2s ease;
+}
+
+.radar-blip-target:hover {
+  transform: translate(-50%, -50%) scale(1.18);
+  z-index: 10;
+}
+
+.radar-blip-dot {
+  width: 10px;
+  height: 10px;
+  background-color: #34d399;
+  border-radius: 50%;
+  box-shadow: 0 0 8px #10b981, 0 0 14px #34d399;
+}
+
+.radar-blip-glow {
+  position: absolute;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: rgba(52, 211, 153, 0.35);
+  animation: radarBlipGlow 1.8s infinite ease-out;
+}
+
+@keyframes radarBlipGlow {
+  0% { transform: scale(0.6); opacity: 0.9; }
+  100% { transform: scale(1.8); opacity: 0; }
+}
+
+.radar-blip-tag {
+  margin-top: 4px;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  background: rgba(1, 20, 15, 0.9);
+  border: 1px solid rgba(52, 211, 153, 0.6);
+  border-radius: 4px;
+  padding: 2px 5px;
+  font-size: 0.6rem;
+  font-weight: 700;
+  color: #ecfdf5;
+  white-space: nowrap;
+  pointer-events: none;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.5);
+}
+
+.radar-blip-name {
+  max-width: 80px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.radar-blip-target.is-connecting .radar-blip-dot {
+  background-color: #fbbf24;
+  box-shadow: 0 0 12px #f59e0b;
+}
+
+.radar-blip-target.is-connecting .radar-blip-tag {
+  border-color: #fbbf24;
+  color: #fef3c7;
+}
+
+/* Radar Bottom HUD Bar */
+.radar-bottom-hud {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid rgba(16, 185, 129, 0.2);
+  font-size: 0.68rem;
+}
+
+.radar-hud-devices-count {
+  color: #6ee7b7;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+}
+
+.radar-hud-status-line {
+  color: #a7f3d0;
+  font-size: 0.65rem;
+  min-height: 1.2em;
+}
+
+.radar-searching-flicker {
+  animation: radarFlicker 2s infinite ease-in-out;
+}
+
+@keyframes radarFlicker {
+  0%, 100% { opacity: 0.85; }
+  50% { opacity: 0.35; }
+}
+
 

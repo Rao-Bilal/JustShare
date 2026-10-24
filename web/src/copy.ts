@@ -23,6 +23,9 @@ export const COPY = {
     orangeCardDesc: 'Private and encrypted. Your files go directly between your devices.',
     orangeCardLearnMore: 'How it works',
     howItWorksTitle: 'How it works',
+    resumeInterruptedPrompt: 'A previous transfer was interrupted. Reconnect to resume where you left off.',
+    resumeInterruptedBtn: 'Resume transfer',
+    dismissResumeBtn: 'Dismiss',
     step1Title: '1. Connect your devices',
     step1Desc: 'Open JustShare on both devices, then scan the QR code or enter the code.',
     step2Title: '2. Choose files',
@@ -100,7 +103,10 @@ export const COPY = {
     doneReceivingTitle: (count: number) => `Done. ${count} file${count === 1 ? '' : 's'} received`,
     doneSubtitle: 'All files arrived complete and unchanged.',
     timeElapsed: (duration: string) => `Completed in ${duration}`,
-    tryAgain: 'Try again',
+    tryAgain: 'Start over',
+    resumeTransfer: 'Resume transfer',
+    resuming: 'Resuming transfer...',
+    reconnectCountdown: (seconds: number) => `Resume available for ${seconds}s`,
   },
   completed: {
     receiverTitle: 'Transfer complete',
@@ -130,6 +136,11 @@ export const COPY = {
       headline: 'Code not found',
       cause: 'The 6-digit code was not recognized or already ended.',
       nextStep: 'Check the code on the sender screen and try again.',
+    },
+    ownSession: {
+      headline: 'Cannot connect to self',
+      cause: 'You entered a pairing code created by this same device / browser window.',
+      nextStep: 'Enter this code on a different device or in an incognito window.',
     },
     sessionFull: {
       headline: 'Code already in use',

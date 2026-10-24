@@ -13,3 +13,5 @@ web/dist/
 web/coverage/
 web/*.tsbuildinfo
 *.log
+
+backend/build/

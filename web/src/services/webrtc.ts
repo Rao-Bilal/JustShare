@@ -7,6 +7,7 @@ export class WebRTCConnection {
   private pendingCandidates: RTCIceCandidateInit[] = [];
   private _onDataChannel: ((dc: RTCDataChannel) => void) | null = null;
   public onConnectionStateChange: ((state: string) => void) | null = null;
+  public onDataChannelClose: (() => void) | null = null;
   private roleTag: string;
 
   constructor(signaling: SignalingClient, isSender: boolean) {
@@ -25,7 +26,7 @@ export class WebRTCConnection {
 
     this.pc.onicecandidate = (event) => {
       if (event.candidate) {
-        console.log(`[WEBRTC][${this.roleTag}] Local ICE candidate generated`);
+        console.log(`[WEBRTC][${this.roleTag}] Local ICE candidate: type=${event.candidate.type} protocol=${event.candidate.protocol} address=${event.candidate.address}`);
         this.signaling.send({
           type: 'signal',
           payload: {
@@ -36,8 +37,24 @@ export class WebRTCConnection {
       }
     };
 
-    this.pc.onconnectionstatechange = () => {
+    this.pc.onconnectionstatechange = async () => {
       console.log(`[WEBRTC][${this.roleTag}] connectionState changed to: ${this.pc.connectionState}`);
+      if (this.pc.connectionState === 'connected') {
+        try {
+          const stats = await this.pc.getStats();
+          stats.forEach((report) => {
+            if (report.type === 'candidate-pair' && report.state === 'succeeded') {
+              const localCand = stats.get(report.localCandidateId);
+              const remoteCand = stats.get(report.remoteCandidateId);
+              console.log(
+                `[WEBRTC][${this.roleTag}][SELECTED_PAIR] local=${localCand?.candidateType || localCand?.type}@${localCand?.ip || localCand?.address}:${localCand?.port} <-> remote=${remoteCand?.candidateType || remoteCand?.type}@${remoteCand?.ip || remoteCand?.address}:${remoteCand?.port}`
+              );
+            }
+          });
+        } catch {
+          // ignore stats errors
+        }
+      }
       if (this.onConnectionStateChange) {
         this.onConnectionStateChange(this.pc.connectionState);
       }
@@ -77,9 +94,15 @@ export class WebRTCConnection {
     };
     dc.onclose = () => {
       console.log(`[WEBRTC][${this.roleTag}] DataChannel state=closed`);
+      if (this.onDataChannelClose) {
+        this.onDataChannelClose();
+      }
     };
     dc.onerror = (event) => {
       console.error(`[WEBRTC][${this.roleTag}] DataChannel error`, event);
+      if (this.onDataChannelClose) {
+        this.onDataChannelClose();
+      }
     };
   }
 

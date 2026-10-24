@@ -95,7 +95,7 @@ export class IndexedDBTransferStorage implements TransferStorage {
         name: f.name,
         size: f.size,
         totalChunks: f.totalChunks,
-        chunkSize: 65536,
+        chunkSize: f.totalChunks > 0 ? Math.ceil(f.size / f.totalChunks) : 262144,
         sha256: f.sha256,
         mimeType: f.mimeType,
         completed: false,
@@ -201,7 +201,7 @@ export class IndexedDBTransferStorage implements TransferStorage {
           name: file.name,
           size: file.size,
           totalChunks: file.totalChunks,
-          chunkSize: 65536,
+          chunkSize: file.totalChunks > 0 ? Math.ceil(file.size / file.totalChunks) : 262144,
           sha256: file.sha256,
           mimeType: file.mimeType,
           completed: false,
@@ -227,35 +227,28 @@ export class IndexedDBTransferStorage implements TransferStorage {
   }
 
   async writeChunk(transferId: string, fileId: string, index: number, data: Uint8Array): Promise<void> {
+    return this.writeChunksBatch(transferId, fileId, [{ index, data }]);
+  }
+
+  async writeChunksBatch(
+    transferId: string,
+    fileId: string,
+    chunks: { index: number; data: Uint8Array }[]
+  ): Promise<void> {
+    if (chunks.length === 0) return;
     const db = await this.getDB();
-    const tx = db.transaction(['chunks', 'files'], 'readwrite');
+    const tx = db.transaction(['chunks'], 'readwrite');
     const chunksStore = tx.objectStore('chunks');
-    const filesStore = tx.objectStore('files');
 
-    const chunkKey = [transferId, fileId, index];
-    const checkReq = chunksStore.get(chunkKey);
-
-    checkReq.onsuccess = () => {
-      if (!checkReq.result) {
-        chunksStore.put({
-          transferId,
-          fileId,
-          index,
-          data,
-          byteLength: data.byteLength,
-        });
-
-        const fileReq = filesStore.get([transferId, fileId]);
-        fileReq.onsuccess = () => {
-          if (fileReq.result) {
-            const rec = fileReq.result;
-            rec.metadata.receivedChunksCount += 1;
-            rec.metadata.updatedAt = Date.now();
-            filesStore.put(rec);
-          }
-        };
-      }
-    };
+    for (const chunk of chunks) {
+      chunksStore.put({
+        transferId,
+        fileId,
+        index: chunk.index,
+        data: chunk.data,
+        byteLength: chunk.data.byteLength,
+      });
+    }
 
     await new Promise<void>((resolve, reject) => {
       tx.oncomplete = () => resolve();

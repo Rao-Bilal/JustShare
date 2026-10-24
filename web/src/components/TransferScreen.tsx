@@ -18,6 +18,8 @@ export interface TransferScreenProps {
   error: string | null;
   onCancel: () => void;
   onBackToHome: () => void;
+  onResumeTransfer?: () => void;
+  isResumable?: boolean;
   onTryAgain?: () => void;
   onSendMore?: () => void;
   onReceiveMore?: () => void;
@@ -34,6 +36,8 @@ export function TransferScreen({
   error,
   onCancel,
   onBackToHome,
+  onResumeTransfer,
+  isResumable = false,
   onTryAgain,
   onSendMore,
   onReceiveMore,
@@ -294,10 +298,19 @@ export function TransferScreen({
 
           {isFailedOrCancelled && (
             <div className="failed-actions-group">
-              {onTryAgain && (
+              {isResumable && onResumeTransfer && (
                 <button
                   type="button"
                   className="btn btn-primary transfer-action-btn"
+                  onClick={onResumeTransfer}
+                >
+                  {COPY.transfer.resumeTransfer}
+                </button>
+              )}
+              {onTryAgain && (
+                <button
+                  type="button"
+                  className={isResumable ? 'btn btn-secondary transfer-action-btn' : 'btn btn-primary transfer-action-btn'}
                   onClick={onTryAgain}
                 >
                   {COPY.transfer.tryAgain}

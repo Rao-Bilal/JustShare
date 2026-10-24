@@ -7,6 +7,7 @@ export interface FileRowProps {
   size: number;
   relativePath?: string;
   onRemove?: () => void;
+  onPreview?: () => void;
   showMiddleTruncate?: boolean;
 }
 
@@ -15,6 +16,7 @@ export function FileRow({
   size,
   relativePath,
   onRemove,
+  onPreview,
   showMiddleTruncate = true,
 }: FileRowProps) {
   const fullPath = relativePath || name;
@@ -32,6 +34,16 @@ export function FileRow({
       </div>
       <div className="file-row-meta">
         <span className="tabular-numbers">{formatBytes(size)}</span>
+        {onPreview && (
+          <button
+            type="button"
+            className="btn-preview-file text-neutral-600 hover:text-neutral-900 text-xs px-2 py-1 rounded bg-neutral-100 hover:bg-neutral-200 cursor-pointer border-0"
+            onClick={onPreview}
+            aria-label={`Preview ${fullPath}`}
+          >
+            Preview
+          </button>
+        )}
         {onRemove && (
           <button
             type="button"

@@ -155,22 +155,32 @@ export class OPFSTransferStorage implements TransferStorage {
   }
 
   async writeChunk(transferId: string, fileId: string, index: number, data: Uint8Array): Promise<void> {
+    return this.writeChunksBatch(transferId, fileId, [{ index, data }]);
+  }
+
+  async writeChunksBatch(
+    transferId: string,
+    fileId: string,
+    chunks: { index: number; data: Uint8Array }[]
+  ): Promise<void> {
     const fDir = await this.getFileDir(transferId, fileId, true);
     if (!fDir) throw new Error('File directory not found');
 
-    const chunkFileName = `chunk_${index}.bin`;
-    const chunkHandle = await fDir.getFileHandle(chunkFileName, { create: true });
-    const writable = await chunkHandle.createWritable();
-    await writable.write(data.buffer as ArrayBuffer);
-    await writable.close();
+    for (const chunk of chunks) {
+      const chunkFileName = `chunk_${chunk.index}.bin`;
+      const chunkHandle = await fDir.getFileHandle(chunkFileName, { create: true });
+      const writable = await chunkHandle.createWritable();
+      await writable.write(chunk.data.buffer as ArrayBuffer);
+      await writable.close();
+    }
 
-    // Update metadata
+    // Update metadata once per batch
     try {
       const metaHandle = await fDir.getFileHandle('meta.json', { create: false });
       const metaFile = await metaHandle.getFile();
       const metaText = await metaFile.text();
       const meta: StoredFileInfo = JSON.parse(metaText);
-      meta.receivedChunksCount += 1;
+      meta.receivedChunksCount += chunks.length;
       meta.updatedAt = Date.now();
 
       const metaWritable = await metaHandle.createWritable();

@@ -3,11 +3,19 @@ import { QRCodeDisplay } from './QRCodeDisplay';
 import { Button } from './Button';
 import { IconCopy, IconCheck, IconLock, IconClock, IconQrCode, IconMail, IconShare, IconShield } from './Icons';
 
+import { formatBytes } from '../services/format';
+import { FileRow } from './FileRow';
+
 interface ShareManagementModalProps {
   pairingCode: string;
   expiresInSeconds?: number | null;
   onGenerateNewCode?: () => void;
   onClose?: () => void;
+  stagedFiles?: File[];
+  totalStagedSize?: number;
+  onRemoveFile?: (index: number) => void;
+  onPreviewFile?: (file: File) => void;
+  onAddMoreFiles?: () => void;
 }
 
 export function ShareManagementModal({
@@ -15,6 +23,11 @@ export function ShareManagementModal({
   expiresInSeconds,
   onGenerateNewCode,
   onClose,
+  stagedFiles = [],
+  totalStagedSize = 0,
+  onRemoveFile,
+  onPreviewFile,
+  onAddMoreFiles,
 }: ShareManagementModalProps) {
   const [copied, setCopied] = useState(false);
   const [activeTab, setActiveTab] = useState<'link' | 'qr'>('link');
@@ -61,10 +74,7 @@ export function ShareManagementModal({
             <IconShare size={20} />
           </div>
           <div>
-            <h3>Share & Access Control</h3>
-            <p className="share-header-desc">
-              Direct peer-to-peer connection with end-to-end WebRTC security
-            </p>
+            <h3>Connect Device</h3>
           </div>
         </div>
         {onClose && (
@@ -74,22 +84,6 @@ export function ShareManagementModal({
         )}
       </div>
 
-      {/* Trust Badges */}
-      <div className="trust-badges-row">
-        <div className="trust-badge">
-          <IconShield size={14} />
-          <span>Zero-Knowledge</span>
-        </div>
-        <div className="trust-badge">
-          <IconLock size={14} />
-          <span>DTLS-SRTP 256-bit</span>
-        </div>
-        <div className="trust-badge">
-          <IconClock size={14} />
-          <span>Ephemerally Cached</span>
-        </div>
-      </div>
-
       {/* Share Tab Switcher */}
       <div className="share-mode-toggle">
         <button
@@ -97,7 +91,7 @@ export function ShareManagementModal({
           className={`share-mode-btn ${activeTab === 'link' ? 'active' : ''}`}
           onClick={() => setActiveTab('link')}
         >
-          Quick Link & Code
+          6-Digit Code
         </button>
         <button
           type="button"
@@ -110,31 +104,11 @@ export function ShareManagementModal({
 
       {activeTab === 'link' ? (
         <div className="share-link-section">
-          {/* One-Click Direct Link */}
-          <div className="share-input-group">
-            <label className="share-input-label">Direct Shareable Link</label>
-            <div className="share-copy-box">
-              <input
-                type="text"
-                readOnly
-                value={shareUrl}
-                className="share-url-input"
-                aria-label="Direct Share Link"
-              />
-              <Button
-                variant="primary"
-                className="btn-copy-link"
-                onClick={handleCopyLink}
-                icon={copied ? <IconCheck size={16} /> : <IconCopy size={16} />}
-              >
-                {copied ? 'Copied!' : 'Copy Link'}
-              </Button>
-            </div>
-          </div>
-
           {/* 6-Digit Pairing Code Display */}
           <div className="share-code-group">
-            <label className="share-input-label">6-Digit Pairing Code</label>
+            <p className="text-xs text-neutral-500 mb-1">
+              Enter this 6-digit code on the receiving device to connect:
+            </p>
             <div className="pairing-code-large">
               {pairingCode.split('').map((digit, idx) => (
                 <div key={idx} className="code-box-display">
@@ -172,6 +146,61 @@ export function ShareManagementModal({
           </div>
         </div>
       )}
+
+      {/* Staged Files to Send */}
+      <div className="share-staged-files-section mt-5 pt-4 border-t border-neutral-200">
+        <div className="flex items-center justify-between mb-3">
+          <div className="flex items-center gap-2">
+            <h4 className="text-sm font-bold text-neutral-800">Files to Send</h4>
+            <span className="text-xs px-2 py-0.5 rounded-full bg-neutral-200 text-neutral-700 font-semibold">
+              {stagedFiles.length}
+            </span>
+          </div>
+          {onAddMoreFiles && (
+            <button
+              type="button"
+              className="text-xs text-orange-600 hover:text-orange-700 font-semibold cursor-pointer border-0 bg-transparent"
+              onClick={onAddMoreFiles}
+            >
+              + Add more files
+            </button>
+          )}
+        </div>
+
+        {stagedFiles.length > 0 ? (
+          <div>
+            <div className="file-list max-h-48 overflow-y-auto pr-1 flex flex-col gap-2">
+              {stagedFiles.map((file, idx) => (
+                <FileRow
+                  key={`${file.name}_${idx}`}
+                  name={file.name}
+                  size={file.size}
+                  relativePath={file.webkitRelativePath}
+                  onRemove={onRemoveFile ? () => onRemoveFile(idx) : undefined}
+                  onPreview={onPreviewFile ? () => onPreviewFile(file) : undefined}
+                />
+              ))}
+            </div>
+            <div className="flex items-center justify-between mt-3 text-xs text-neutral-500 font-medium">
+              <span>Total size: <strong className="text-neutral-800">{formatBytes(totalStagedSize)}</strong></span>
+              <span>Waiting for recipient to connect...</span>
+            </div>
+          </div>
+        ) : (
+          <div className="p-4 bg-neutral-50 border border-neutral-200/80 rounded-xl text-center">
+            <p className="text-xs text-neutral-500">No files selected yet.</p>
+            {onAddMoreFiles && (
+              <button
+                type="button"
+                className="mt-2 text-xs font-semibold text-orange-600 hover:underline cursor-pointer border-0 bg-transparent"
+                onClick={onAddMoreFiles}
+              >
+                + Choose files to send
+              </button>
+            )}
+          </div>
+        )}
+      </div>
 
       {/* Security & Access Controls */}
       <div className="share-security-options">

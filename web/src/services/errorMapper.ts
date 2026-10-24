@@ -30,6 +30,13 @@ export function mapTechnicalError(rawError?: string | null): FriendlyError {
     };
   }
 
+  if (err.includes('own session') || err.includes('cannot join own')) {
+    return {
+      ...COPY.errors.ownSession,
+      rawDetails: rawError,
+    };
+  }
+
   if (err.includes('not found') || err.includes('invalid') || err.includes('404')) {
     return {
       ...COPY.errors.sessionNotFound,

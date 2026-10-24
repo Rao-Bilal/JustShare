@@ -133,9 +133,9 @@ describe('Phase 2A - Transfer Protocol & Validation', () => {
       const manifest = {
         transferId: 'tx-123',
         totalFiles: 1,
-        totalSize: 100000,
+        totalSize: 500000,
         files: [
-          { id: 'f-1', name: 'a.txt', size: 100000, totalChunks: 1, sha256: validHash }, // 100k needs 2 chunks of 64k
+          { id: 'f-1', name: 'a.txt', size: 500000, totalChunks: 1, sha256: validHash }, // 500k needs 2 chunks of 256k
         ],
       };
       expect(() => validateManifest(manifest)).toThrow('invalid totalChunks');
