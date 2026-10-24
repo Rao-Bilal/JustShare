@@ -144,7 +144,7 @@ async def test_get_session_valid(async_client: AsyncClient):
 
 
 @pytest.mark.asyncio
-async def test_create_session_with_nonexistent_device(async_client: AsyncClient):
+async def test_create_session_with_nonexistent_device_self_heals(async_client: AsyncClient):
     import uuid
 
     from app.core.config import get_settings
@@ -154,9 +154,10 @@ async def test_create_session_with_nonexistent_device(async_client: AsyncClient)
     fake_device_id = str(uuid.uuid4())
     fake_token = create_device_token(fake_device_id, settings.jwt_secret)
 
+    # Valid JWT from a wiped/restarted DB should self-heal device and create session cleanly
     res = await async_client.post("/api/v1/sessions", json={}, headers={"Authorization": f"Bearer {fake_token}"})
-    assert res.status_code == 404
-    assert res.json()["detail"] == "Device not found"
+    assert res.status_code == 201
+    assert "session_id" in res.json()
 
 
 @pytest.mark.asyncio

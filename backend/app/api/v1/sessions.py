@@ -59,7 +59,10 @@ async def create_session(
     
     sender_device = (await db.execute(select(Device).where(Device.id == uuid.UUID(device_id)))).scalars().first()
     if not sender_device:
-        raise HTTPException(status_code=404, detail="Device not found")
+        sender_device = Device(id=uuid.UUID(device_id), display_name="Connected Device")
+        db.add(sender_device)
+        await db.commit()
+        await db.refresh(sender_device)
 
     session_obj = TransferSession(
         sender_device_id=uuid.UUID(device_id),
