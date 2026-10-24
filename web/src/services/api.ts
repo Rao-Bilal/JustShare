@@ -1,4 +1,6 @@
-const API_BASE = '';
+import { apiBase } from './backend';
+
+const API_BASE = apiBase();
 
 async function request<T>(path: string, options: RequestInit = {}, token?: string): Promise<T> {
   const headers: Record<string, string> = {

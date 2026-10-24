@@ -1,3 +1,6 @@
+
+import { wsBase } from './backend';
+
 export interface NearbyPeerInfo {
   ephemeral_id: string;
   display_name: string;
@@ -29,17 +32,14 @@ export class NearbySignalingClient {
     this.token = token;
     this.isExplicitlyClosed = false;
 
-    const isHttps = typeof window !== 'undefined' && window.location?.protocol === 'https:';
-    const protocol = isHttps ? 'wss:' : 'ws:';
-    const host = typeof window !== 'undefined' && window.location?.host ? window.location.host : 'localhost';
-    const url = `${protocol}//${host}/ws/v1/nearby?token=${encodeURIComponent(token)}`;
-
+    const url = `${wsBase()}/ws/v1/nearby?token=${encodeURIComponent(token)}`;
 
     this.ws = new WebSocket(url);
 
     this.ws.onopen = () => {
       this.emit('open', {});
-      // Start 20s keep-alive ping
+
+      // Start 20-second keep-alive ping.
       if (typeof window !== 'undefined') {
         this.pingInterval = window.setInterval(() => {
           this.send('ping', {});
@@ -58,10 +58,11 @@ export class NearbySignalingClient {
     };
 
     this.ws.onclose = () => {
-      if (this.pingInterval) {
+      if (this.pingInterval !== null) {
         clearInterval(this.pingInterval);
         this.pingInterval = null;
       }
+
       this.emit('close', {});
     };
 
@@ -100,11 +101,13 @@ export class NearbySignalingClient {
     if (!this.listeners.has(type)) {
       this.listeners.set(type, []);
     }
+
     this.listeners.get(type)!.push(callback);
   }
 
   off(type: string, callback: NearbyCallback): void {
     const callbacks = this.listeners.get(type);
+
     if (callbacks) {
       this.listeners.set(
         type,
@@ -120,14 +123,17 @@ export class NearbySignalingClient {
 
   disconnect(): void {
     this.isExplicitlyClosed = true;
-    if (this.pingInterval) {
+
+    if (this.pingInterval !== null) {
       clearInterval(this.pingInterval);
       this.pingInterval = null;
     }
+
     if (this.ws) {
       this.ws.close();
       this.ws = null;
     }
+
     this.listeners.clear();
   }
 }

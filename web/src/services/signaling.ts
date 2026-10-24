@@ -1,3 +1,6 @@
+
+import { wsBase } from './backend';
+
 export type SignalCallback = (data: unknown) => void;
 
 export class SignalingClient {
@@ -6,23 +9,30 @@ export class SignalingClient {
   private sendQueue: object[] = [];
 
   connect(sessionId: string, token: string): void {
-    if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
+    if (
+      this.ws &&
+      (this.ws.readyState === WebSocket.OPEN ||
+        this.ws.readyState === WebSocket.CONNECTING)
+    ) {
       return;
     }
 
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const host = window.location.host;
-    const url = `${protocol}//${host}/ws/v1/signal/${sessionId}?token=${encodeURIComponent(token)}`;
+    const url = `${wsBase()}/ws/v1/signal/${sessionId}?token=${encodeURIComponent(token)}`;
 
     this.ws = new WebSocket(url);
 
     this.ws.onopen = () => {
       console.log('[SIGNAL] WebSocket connected');
-      // Flush any queued messages
-      while (this.sendQueue.length > 0 && this.ws?.readyState === WebSocket.OPEN) {
+
+      // Flush any queued messages.
+      while (
+        this.sendQueue.length > 0 &&
+        this.ws?.readyState === WebSocket.OPEN
+      ) {
         const message = this.sendQueue.shift()!;
         this.send(message);
       }
+
       const callbacks = this.listeners.get('open') || [];
       callbacks.forEach((cb) => cb({}));
     };
@@ -30,11 +40,19 @@ export class SignalingClient {
     this.ws.onmessage = (event) => {
       try {
         const msg = JSON.parse(event.data);
-        if (msg.type === 'signal' && msg.payload && msg.payload.signal_type) {
-          console.log(`[SIGNAL] Received message type: ${msg.type} (${msg.payload.signal_type})`);
+
+        if (
+          msg.type === 'signal' &&
+          msg.payload &&
+          msg.payload.signal_type
+        ) {
+          console.log(
+            `[SIGNAL] Received message type: ${msg.type} (${msg.payload.signal_type})`
+          );
         } else {
           console.log(`[SIGNAL] Received message type: ${msg.type}`);
         }
+
         const callbacks = this.listeners.get(msg.type) || [];
         callbacks.forEach((cb) => cb(msg));
       } catch (err) {
@@ -44,12 +62,14 @@ export class SignalingClient {
 
     this.ws.onclose = (event) => {
       console.log(`[SIGNAL] WebSocket closed (code=${event.code})`);
+
       const callbacks = this.listeners.get('close') || [];
       callbacks.forEach((cb) => cb(event));
     };
 
     this.ws.onerror = (err) => {
       console.error('[SIGNAL] WebSocket error', err);
+
       const callbacks = this.listeners.get('error') || [];
       callbacks.forEach((cb) => cb(err));
     };
@@ -57,15 +77,28 @@ export class SignalingClient {
 
   send(message: object): void {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      const msgObj = message as { type?: string; payload?: { signal_type?: string } };
-      if (msgObj.type === 'signal' && msgObj.payload && msgObj.payload.signal_type) {
-        console.log(`[SIGNAL] Sending message type: ${msgObj.type} (${msgObj.payload.signal_type})`);
+      const msgObj = message as {
+        type?: string;
+        payload?: { signal_type?: string };
+      };
+
+      if (
+        msgObj.type === 'signal' &&
+        msgObj.payload &&
+        msgObj.payload.signal_type
+      ) {
+        console.log(
+          `[SIGNAL] Sending message type: ${msgObj.type} (${msgObj.payload.signal_type})`
+        );
       } else {
         console.log(`[SIGNAL] Sending message type: ${msgObj.type}`);
       }
+
       this.ws.send(JSON.stringify(message));
     } else {
-      console.log('[SIGNAL] WebSocket not open yet. Queuing message to send on open.');
+      console.log(
+        '[SIGNAL] WebSocket not open yet. Queuing message to send on open.'
+      );
       this.sendQueue.push(message);
     }
   }
@@ -76,6 +109,7 @@ export class SignalingClient {
 
   async waitForOpen(timeoutMs: number = 10000): Promise<void> {
     if (this.isOpen()) return;
+
     return new Promise<void>((resolve, reject) => {
       const timer = setTimeout(() => {
         cleanup();
@@ -107,11 +141,13 @@ export class SignalingClient {
     if (!this.listeners.has(type)) {
       this.listeners.set(type, []);
     }
+
     this.listeners.get(type)!.push(callback);
   }
 
   off(type: string, callback: SignalCallback): void {
     const callbacks = this.listeners.get(type);
+
     if (callbacks) {
       this.listeners.set(
         type,
@@ -125,6 +161,7 @@ export class SignalingClient {
       this.ws.close();
       this.ws = null;
     }
+
     this.sendQueue = [];
     this.listeners.clear();
   }
